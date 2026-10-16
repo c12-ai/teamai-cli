@@ -152,7 +152,10 @@ describe('OMP rules directory is user-owned', () => {
         additionalRoles: [],
       } as unknown as LocalConfig;
 
-      await new RulesHandler().pullAllRules(teamConfig, localConfig);
+      // The removed rule's copy is on record as delivered; the personal one is not (c12 fork).
+      const previous: DeliveredHashes = {};
+      await recordDelivered(previous, path.join(homeDir, '.omp/agent/rules', 'gone.md'));
+      await new RulesHandler().pullAllRules(teamConfig, localConfig, undefined, [], openLedger(previous));
 
       expect(await fse.pathExists(path.join(homeDir, '.omp/agent/rules/gone.md'))).toBe(false);
       expect(await fse.readFile(path.join(homeDir, '.omp/agent/rules/personal.md'), 'utf8')).toBe('Personal rule.');

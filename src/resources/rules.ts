@@ -846,6 +846,9 @@ export class RulesHandler extends ResourceHandler {
         if (EXCLUDED_RULE_NAMES.has(ruleName)) continue;
         if (!deliveredStems.has(ruleName)) {
           const fullPath = path.join(destDir, localFile);
+          // A file teamai has no record of writing is the member's own rule,
+          // or another tool's: never teamai's to remove (c12 fork).
+          if (ledger?.previous?.[fullPath] === undefined) continue;
           // A copy the member changed since teamai delivered it stays (#822);
           // the tombstone cleanup names one of a rule the team removed.
           if (await removedCopyChanged(ledger?.previous, fullPath)) {

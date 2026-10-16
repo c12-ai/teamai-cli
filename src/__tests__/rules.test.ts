@@ -38,7 +38,20 @@ vi.mock('../utils/logger.js', () => ({
 
 import { RulesHandler, inlinedRulesText } from '../resources/rules.js';
 import { loadStateForScope } from '../config.js';
+import { listFilesRecursive } from '../utils/fs.js';
 import { openLedger, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
+
+/**
+ * A ledger recording every file now under `dirs` as delivered by teamai: the
+ * stale sweep removes only copies on that record (c12 fork).
+ */
+async function ledgerDelivering(...dirs: string[]) {
+  const previous: DeliveredHashes = {};
+  for (const dir of dirs) {
+    for (const file of await listFilesRecursive(dir)) await recordDelivered(previous, path.join(dir, file));
+  }
+  return openLedger(previous);
+}
 import type { TeamaiConfig, LocalConfig, State } from '../types.js';
 
 describe('RulesHandler.scanLocalForPush — modified rule detection', () => {
@@ -712,7 +725,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'coding-style.md'), 'stale content');
     await fse.writeFile(path.join(localRulesDir, 'hooks.md'), 'stale content');
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
 
     // tencent_standard.md should be updated
     expect(await fse.pathExists(path.join(localRulesDir, 'tencent_standard.md'))).toBe(true);
@@ -883,7 +896,7 @@ scope: 'user',
       placedRules: { 'my-rule': 'rules/fe-know/my-rule.md' },
     } as State);
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
 
     expect(await fse.pathExists(path.join(localRulesDir, 'my-rule.md'))).toBe(false);
   });
@@ -902,7 +915,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'python/coding-style.md'), 'stale');
     await fse.writeFile(path.join(localRulesDir, 'python/security.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
 
     expect(await fse.pathExists(path.join(localRulesDir, 'python/tencent_standard.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'python/coding-style.md'))).toBe(false);
@@ -923,7 +936,7 @@ scope: 'user',
     await fse.ensureDir(path.join(localRulesDir, 'python'));
     await fse.writeFile(path.join(localRulesDir, 'python/old-rule.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
 
     expect(await fse.pathExists(path.join(localRulesDir, 'common/agents.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'python/old-rule.md'))).toBe(false);
@@ -950,7 +963,8 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.claude-internal/rules', 'keep.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.claude-internal/rules', 'stale.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [],
+      await ledgerDelivering(path.join(homeDir, '.claude/rules'), path.join(homeDir, '.claude-internal/rules')));
 
     // Both tool dirs should have stale.md removed
     expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'stale.md'))).toBe(false);
@@ -984,7 +998,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'teamai-recall.md'), 'recall rule content');
     await fse.writeFile(path.join(localRulesDir, 'old-user-rule.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
 
     expect(await fse.pathExists(path.join(localRulesDir, 'team-rule.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'teamai-recall.md'))).toBe(true);
@@ -1529,7 +1543,7 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
       '---\nalwaysApply: true\n---\n\norphan',
     );
 
-    await handler.pullAllRules(teamConfig, localConfig);
+    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(path.join(homeDir, '.cursor/rules')));
 
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/orphan.mdc'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/keep.mdc'))).toBe(true);

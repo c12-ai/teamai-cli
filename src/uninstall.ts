@@ -714,6 +714,22 @@ async function buildRemovalPlan(
     );
   }
 
+  // A skill, rule or agent that only shares a team name goes only when pull
+  // recorded delivering it: one teamai never wrote is the member's (c12 fork).
+  // Built-ins and HTTP-distributed copies (local-agent manifest) keep the name match.
+  if (!await pathExists(localAgentManifestPath)) {
+    const { isRecorded } = await import('./resources/delivered-copies.js');
+    const delivered = await deliveredHashes(localConfig);
+    for (const res of perTool.values()) {
+      res.skillDirs = res.skillDirs.filter(({ dir }) => isRecorded(delivered, dir)
+        || BUILTIN_SKILL_NAMES.has(path.basename(dir)) || LEGACY_BUILTIN_SKILL_NAMES.has(path.basename(dir)));
+      res.ruleFiles = res.ruleFiles.filter((file) => isRecorded(delivered, file)
+        || BUILTIN_RULE_NAMES.has(ruleStemFromFilename(path.basename(file)) ?? ''));
+      res.agentFiles = res.agentFiles.filter((file) => isRecorded(delivered, file)
+        || BUILTIN_AGENT_NAMES.has(agentStemFromFilename(path.basename(file)) ?? ''));
+    }
+  }
+
   // OpenCode's instructions entry is teamai's only when pull recorded adding
   // it, whatever the context file holds now. No release before #945 added
   // this entry, so there are no unrecorded teamai entries to migrate.

@@ -17,6 +17,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 
 vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
+  getHeadRev: vi.fn(),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -46,7 +47,8 @@ vi.mock('../update.js', () => ({
 }));
 
 import { pull } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig } from '../config.js';
+import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
+import { getHeadRev } from '../utils/git.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
@@ -88,6 +90,9 @@ describe('pull agents cleanup after role change', () => {
   }
 
   beforeEach(async () => {
+    vi.mocked(loadStateForScope).mockReset().mockResolvedValue({ lastPull: null } as never);
+    vi.mocked(saveStateForScope).mockReset();
+    vi.mocked(getHeadRev).mockReset();
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-agents-cleanup-'));
     homeDir = path.join(tmpDir, 'home');
     repoPath = path.join(tmpDir, 'team-repo');
@@ -152,10 +157,17 @@ describe('pull agents cleanup after role change', () => {
   it('removes an old Codex render when the active same-stem source is legacy Markdown', async () => {
     await fse.outputFile(path.join(repoPath, 'agents/frontend/reviewer.yaml'), 'name: reviewer\ndescription: Old\ninstructions: Review old.\n');
     await fse.outputFile(path.join(repoPath, 'agents/devops/reviewer.md'), '# Active legacy agent\n');
+    // State persists at a team revision, as on disk: the delivery record is
+    // what lets the second pull replace the copy the first wrote (c12 fork).
+    let stored: Record<string, unknown> = { lastPull: null };
+    vi.mocked(loadStateForScope).mockImplementation(async () => structuredClone(stored) as never);
+    vi.mocked(saveStateForScope).mockImplementation(async (state) => { stored = structuredClone(state) as Record<string, unknown>; });
+    vi.mocked(getHeadRev).mockResolvedValue('rev-1');
     await pull({});
     const codexCopy = path.join(homeDir, '.codex/agents/reviewer.toml');
     expect(await fse.pathExists(codexCopy)).toBe(true);
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    stored.lastPullRev = null; // as `teamai roles` does
     await pull({});
     expect(await fse.pathExists(codexCopy)).toBe(false);
     expect(await fse.readFile(path.join(homeDir, '.claude/agents/reviewer.md'), 'utf8')).toBe('# Active legacy agent\n');

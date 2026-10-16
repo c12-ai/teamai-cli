@@ -26,7 +26,7 @@ import { skillsDirForTool } from './resources/skills.js';
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
-  forgetDelivered, judgeCopy, openLedger, removedCopyChanged, reportKept, type DeliveredHashes, type DeliveryLedger,
+  forgetDelivered, isRecorded, judgeCopy, openLedger, removedCopyChanged, reportKept, type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import type { AgentModelRecords, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
@@ -378,8 +378,10 @@ async function reportWouldKeep(
   const received = items.map((item) => item.name);
   for (const item of items) {
     for (const target of await handler.deliveryTargets(freshConfig, localConfig, item, received)) {
-      if ((await judgeCopy(ledger.previous, item, target)).kind === 'keep') {
-        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: you changed it since teamai delivered it.`);
+      const verdict = await judgeCopy(ledger.previous, item, target);
+      if (verdict.kind === 'keep') {
+        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: `
+          + (verdict.foreign ? 'teamai did not deliver it.' : 'you changed it since teamai delivered it.'));
       }
     }
   }
@@ -541,6 +543,8 @@ async function cleanupTombstonedResources(
           // does not reach it. A copy without the blocks is reclaimed by rules sync.
           if (type === 'rules' && name === TEAMAI_CONTEXT_RULE_NAME) continue;
           if (liveFlatStems.has(name)) continue;
+          // A copy teamai has no record of writing is not its to remove (c12 fork).
+          if (!isRecorded(ledger.previous, localPath)) continue;
           // Even an upstream (tombstone) removal must not blow away a local
           // repo's stash/unpushed history inside a skill directory. Keep
           // + warn; the user can delete it manually once backed up.

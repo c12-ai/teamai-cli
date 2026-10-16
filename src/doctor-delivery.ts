@@ -179,7 +179,9 @@ async function differingCopyLabel(
   const { judgeCopy, recordedUnchanged } = await import('./resources/delivered-copies.js');
   const previous = await deliveredHashes(localConfig);
   const verdict = await judgeCopy(previous, item, target);
-  if (verdict.kind === 'keep') return CHANGED_BY_YOU;
+  // A copy teamai did not deliver is not the member's edit of one: it is
+  // reported as a differing copy, which pull leaves (c12 fork).
+  if (verdict.kind === 'keep' && !verdict.foreign) return CHANGED_BY_YOU;
   return recordedLabel !== undefined && await recordedUnchanged(previous, target.dest) ? recordedLabel : olderLabel;
 }
 
@@ -341,7 +343,8 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
             : '')
           + (restore
             ? 'Run `teamai pull --force`: a plain pull skips a scope whose team repo has not changed, '
-              + 'so it cannot restore a missing copy or one teamai has no record of writing. '
+              + 'so it cannot restore a missing copy. A copy teamai has no record of writing is left as is: '
+              + 'rename or remove it first. '
             : '')
           + (delivery.problems.has(RECORDED_OLDER_RULE)
             ? 'Run `teamai pull` to rewrite a copy that still holds what teamai recorded writing: it re-renders '
@@ -690,7 +693,8 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
         ...(modelChanged ? ['A plain `teamai pull` redeploys an agent whose model changed.'] : []),
         ...(restoredByForce
           ? [`${modelChanged ? 'For the rest, run' : 'Run'} \`teamai pull --force\`: a plain pull skips a scope whose team repo `
-            + 'has not changed, so it cannot restore this.']
+            + 'has not changed, so it cannot restore this. A copy teamai has no record of writing is left as is: '
+            + 'rename or remove it first.']
           : []),
       ].join(' ') + changedByYouFix(delivery),
     };
