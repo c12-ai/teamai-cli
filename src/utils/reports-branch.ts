@@ -128,6 +128,7 @@ export async function commitAndPushReports(
   files: string[],
   options: { pushIfUnchanged?: boolean } = {},
 ): Promise<boolean> {
+  if (!await reportsEnabled(localConfig)) return false;
   return isPublished(await reportsBranch.commitAndPush(localConfig, message, files, options));
 }
 
@@ -137,7 +138,25 @@ export async function updateReports(
   write: (worktree: string) => Promise<ReportsWrite | null>,
   options: { pushIfUnchanged?: boolean } = {},
 ): Promise<boolean> {
+  if (!await reportsEnabled(localConfig)) {
+    log.debug('reports: not written, the team repo does not set `usageReport: true`');
+    return false;
+  }
   return isPublished(await reportsBranch.update(localConfig, write, options));
+}
+
+/**
+ * Whether the team repo opts in to reports: `usageReport: true` in its
+ * teamai.yaml. Without it nothing is committed to or pushed on the reports
+ * branch, member registration included (c12 fork).
+ */
+async function reportsEnabled(localConfig: LocalConfig): Promise<boolean> {
+  const { loadTeamConfig } = await import('../config.js');
+  try {
+    return (await loadTeamConfig(localConfig.repo.localPath))?.usageReport === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

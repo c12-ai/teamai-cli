@@ -2523,11 +2523,12 @@ It does not provide durable per-target deduplication for partial multi-repo
 reports. The 5-second wait limit does not cancel Git or force the CLI process
 to exit while a subprocess is still running.
 
-Teams that pull from a read-only remote (or simply don't want stat commits)
-can turn this off in `teamai.yaml`:
+In this fork (c12-ai/teamai-cli) reporting is off by default: nothing,
+member registration included, is committed to or pushed on the
+`teamai-reports` branch unless the team opts in in `teamai.yaml`:
 
 ```yaml
-usageReport: false
+usageReport: true
 ```
 
 Pull keeps each scope's usage file to its newest 5,000 events, dropping the

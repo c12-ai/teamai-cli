@@ -2344,11 +2344,11 @@ clone 解析到它自己的项目或 user scope，而不是外层项目）；没
 被终止，统计仍可能重复；也不提供多仓库部分成功时的持久化逐目标去重。
 5 秒限制只结束等待，不取消 Git，也不强制仍有子进程运行的 CLI 退出。
 
-默认情况下，`teamai pull` 会把会话/使用统计提交进团队仓。从只读远端拉取（或
-不想要统计提交）的团队可在 `teamai.yaml` 中关闭：
+本 fork（c12-ai/teamai-cli）默认关闭上报：除非团队在 `teamai.yaml` 中显式开启，
+否则不会向 `teamai-reports` 分支提交或推送任何内容（包括成员注册）：
 
 ```yaml
-usageReport: false
+usageReport: true
 ```
 
 Pull 在上报步骤之后把每个 scope 的使用文件限制为最新 5,000 条事件，丢弃更早的

@@ -97,6 +97,7 @@ describe('real CLI reports writer sync (#561)', () => {
       team: 'acme',
       repo: origin,
       provider: 'git',
+      usageReport: true,
     }));
     git(['init', '-q', '-b', 'main'], seed, env);
     git(['add', '.'], seed, env);

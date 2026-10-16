@@ -309,9 +309,10 @@ export const TeamaiConfigSchema = z.object({
    * can override via `updatePolicy` in local config. Undefined = team has no
    * opinion (preserves legacy behavior). */
   autoUpdate: z.boolean().optional(),
-  /** Report session/usage stats back into the team repo on pull. Off = the
-   * team repo never receives stat commits (e.g. read-only pull setups).
-   * Default: on. */
+  /** Write reports (member registration, sessions, usage stats, votes) to the
+   * team repo's `teamai-reports` branch. Off = the team repo never receives
+   * report commits or pushes (e.g. read-only pull setups).
+   * Default: off (c12 fork): only `usageReport: true` enables it. */
   usageReport: z.boolean().optional(),
   /** Run `git submodule update --init` on pull so skills distributed as git
    * submodules are populated and kept current. Off by default. */
