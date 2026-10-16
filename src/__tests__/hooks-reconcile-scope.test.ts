@@ -106,6 +106,16 @@ describe('reconcileTeamHooksForConfig — pull/init core path', () => {
       spy.mockRestore();
     }
   });
+  // c12 fork guard: a user-scope install must never write into a project repo's git config.
+  it('installs no git hook in user scope, even with a project root at hand', async () => {
+    const spy = vi.spyOn(gitHook, 'installGitHook');
+    try {
+      await reconcileTeamHooksForConfig(teamConfig, { ...localConfig(), scope: 'user' });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
   it('still installs the agent hooks when the Git hook cannot be installed', async () => {
     const spy = vi.spyOn(gitHook, 'installGitHook').mockRejectedValueOnce(new Error('EACCES: hooks directory'));
     try {
