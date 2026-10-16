@@ -46,7 +46,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { pull, cleanupInactiveNamespaceSkills, checkoutKey } from '../pull.js';
-import { fileHash } from '../utils/fs.js';
+import { fileHash, listFilesRecursive } from '../utils/fs.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
@@ -178,6 +178,24 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.remove(tmpDir);
   });
 
+  /**
+   * State on which each file at `paths` (every file under a directory) is
+   * what teamai delivered: tombstone cleanup removes only those (c12 fork).
+   */
+  const deliveredState = async (paths: string[], extra: Record<string, unknown> = {}): Promise<void> => {
+    const delivered: Record<string, string> = {};
+    for (const p of paths) {
+      const files = (await fse.stat(p)).isDirectory() ? (await listFilesRecursive(p)).map((rel) => path.join(p, rel)) : [p];
+      for (const file of files) delivered[file] = (await fileHash(file))!;
+    }
+    const key = await checkoutKey(homeDir);
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      ...extra,
+      lastPullByWorkspace: { [key]: { rev: 'old', targets: [], delivered } },
+    }) as unknown as Awaited<ReturnType<typeof loadStateForScope>>);
+  };
+
   it('should clean up local rule files that are tombstoned', async () => {
     // Tombstone for "old-rule"
     await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'old-rule\n');
@@ -186,6 +204,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.writeFile(path.join(homeDir, '.claude/rules', 'old-rule.md'), '# Old');
     await fse.writeFile(path.join(homeDir, '.codex/rules', 'old-rule.md'), '# Old');
 
+    await deliveredState([path.join(homeDir, '.claude/rules', 'old-rule.md'), path.join(homeDir, '.codex/rules', 'old-rule.md')]);
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'old-rule.md'))).toBe(false);
@@ -229,6 +248,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.ensureDir(path.join(homeDir, '.codex/skills/old-skill'));
     await fse.writeFile(path.join(homeDir, '.codex/skills/old-skill/SKILL.md'), '# Old');
 
+    await deliveredState([path.join(homeDir, '.claude/skills/old-skill'), path.join(homeDir, '.codex/skills/old-skill')]);
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/skills/old-skill'))).toBe(false);
@@ -272,6 +292,12 @@ describe('pull role-aware sync and cleanup', () => {
     }
   };
 
+  const agentRenders = (): string[] => [
+    path.join(homeDir, '.claude/agents', 'foo.md'),
+    path.join(homeDir, '.codex/agents', 'foo.toml'),
+    path.join(homeDir, '.kiro/agents', 'foo.json'),
+  ];
+
   const expectAgentRendersGone = async (): Promise<void> => {
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'foo.md'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.codex/agents', 'foo.toml'))).toBe(false);
@@ -284,6 +310,7 @@ describe('pull role-aware sync and cleanup', () => {
     useAgentToolPaths();
     await seedTombstonedAgent();
 
+    await deliveredState(agentRenders());
     await pull({});
 
     await expectAgentRendersGone();
@@ -295,11 +322,7 @@ describe('pull role-aware sync and cleanup', () => {
     // and its stored rev never moves again, so the fast path must clean too.
     useAgentToolPaths();
     await seedTombstonedAgent();
-    vi.mocked(loadStateForScope).mockImplementation(async () => ({
-      lastPull: null,
-      lastPullRev: HEAD_REV,
-      lastPullTargets: ['claude', 'codex', 'kiro'],
-    }) as Awaited<ReturnType<typeof loadStateForScope>>);
+    await deliveredState(agentRenders(), { lastPullRev: HEAD_REV, lastPullTargets: ['claude', 'codex', 'kiro'] });
 
     await pull({});
 

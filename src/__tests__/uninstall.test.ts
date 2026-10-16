@@ -47,19 +47,47 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { uninstall } from '../uninstall.js';
+import { uninstall as uninstallCli } from '../uninstall.js';
 import { log } from '../utils/logger.js';
 import { EnvHandler } from '../resources/env.js';
 import { deployBuiltinRules } from '../builtin-rules.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { checkoutKey } from '../pull.js';
-import { fileHash } from '../utils/fs.js';
+import { fileHash, listFilesRecursive } from '../utils/fs.js';
 import { TeamaiConfigSchema, getDataHome, managedMcpManifestKey, managedMcpManifestPath } from '../types.js';
 import { ModelProfileSchema, resolveProfile } from '../models/profile.js';
 import { switchModelProfile } from '../models/switch.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 // ─── Helpers ───────────────────────────────────────────
+
+/**
+ * Uninstall removes a team-named skill, rule or agent only on the delivery
+ * record (c12 fork). These fixtures write the copies by hand, as a pull would,
+ * so every file under the test's temp dir goes on the record first.
+ */
+let recordRoot: string | undefined;
+async function uninstall(opts: Parameters<typeof uninstallCli>[0]): ReturnType<typeof uninstallCli> {
+  const resolved = await Promise.resolve().then(() => mockAutoDetectInit()).catch(() => null) as { localConfig?: LocalConfig } | null | undefined;
+  const localConfig = resolved?.localConfig;
+  if (localConfig && recordRoot) {
+    const delivered: Record<string, string> = {};
+    for (const rel of await listFilesRecursive(recordRoot)) {
+      const file = path.join(recordRoot, rel);
+      const hash = await fileHash(file);
+      if (hash !== null) delivered[file] = hash;
+    }
+    const key = await checkoutKey(localConfig.scope === 'project' && localConfig.projectRoot ? localConfig.projectRoot : process.env.HOME!);
+    const state = await loadStateForScope(localConfig);
+    const record = state.lastPullByWorkspace?.[key] ?? { rev: 'r', targets: [] };
+    // A test that wrote its own record means exactly that record.
+    if (record.delivered === undefined) {
+      state.lastPullByWorkspace = { ...state.lastPullByWorkspace, [key]: { ...record, delivered } };
+      await saveStateForScope(state, localConfig);
+    }
+  }
+  return uninstallCli(opts);
+}
 
 const TEAMAI_RULES_START = '<!-- [teamai:rules:start] -->';
 const TEAMAI_RULES_END = '<!-- [teamai:rules:end] -->';
@@ -212,6 +240,7 @@ describe('uninstall', () => {
 
   beforeEach(async () => {
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-uninstall-test-'));
+    recordRoot = tmpDir;
     mockAutoDetectInit.mockReset();
     mockReconcileHooks.mockReset();
     mockSaveLocalConfig.mockReset();
@@ -276,6 +305,29 @@ describe('uninstall', () => {
 
     // ~/.teamai/ removed
     expect(await fse.pathExists(teamaiHome)).toBe(false);
+  });
+
+  // c12 fork: a same-named skill, rule or agent pull never delivered is the
+  // member's (pull leaves it), so uninstall must leave it too.
+  it('keeps a team-named skill, rule and agent that teamai has no record of delivering', async () => {
+    const { homeDir, repoPath } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    await fse.outputFile(path.join(repoPath, 'agents', 'team-agent.md'), '# Team agent');
+    await fse.outputFile(path.join(homeDir, '.claude', 'agents', 'team-agent.md'), '# My own agent');
+    const delivered = path.join(homeDir, '.claude', 'skills', 'team-skill', 'SKILL.md');
+    const localConfig = makeLocalConfig(homeDir, repoPath);
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig: makeTeamConfig() });
+    // Only the team skill is on record; the same-named rule and agent are the member's.
+    const state = await loadStateForScope(localConfig);
+    state.lastPullByWorkspace = { [await checkoutKey(homeDir)]: { rev: 'r', targets: ['claude'], delivered: { [delivered]: (await fileHash(delivered))! } } };
+    await saveStateForScope(state, localConfig);
+
+    await uninstallCli({ force: true });
+
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'team-skill'))).toBe(false);
+    expect(await fse.readFile(path.join(homeDir, '.claude', 'rules', 'team-rule.md'), 'utf8')).toBe('# Team Rule');
+    expect(await fse.readFile(path.join(homeDir, '.claude', 'agents', 'team-agent.md'), 'utf8')).toBe('# My own agent');
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'my-own-skill'))).toBe(true);
   });
 
   // Regression (#693 review): the Windows fix in #682 changed which profile
@@ -1068,7 +1120,7 @@ describe('uninstall', () => {
       await fse.writeFile(legacy('team-rule.md'), '# Team Rule\nMy own note.\n');
       await fse.writeFile(legacy('teamai-recall.md'), '# Recall Rule, as I rewrote it');
 
-      await uninstall({ force: true });
+      await uninstallCli({ force: true });
 
       expect(await fse.readFile(legacy('team-rule.md'), 'utf8')).toBe('# Team Rule\nMy own note.\n');
       expect(await fse.readFile(legacy('teamai-recall.md'), 'utf8')).toBe('# Recall Rule, as I rewrote it');
@@ -1087,7 +1139,7 @@ describe('uninstall', () => {
       await fse.writeFile(legacy('retired.md'), edited);
       vi.mocked(log.warn).mockClear();
 
-      await uninstall({ force: true, ...(selective ? { agent: 'codex' } : {}) });
+      await uninstallCli({ force: true, ...(selective ? { agent: 'codex' } : {}) });
 
       expect(await fse.readFile(legacy('retired.md'), 'utf8')).toBe(edited);
       const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
@@ -1248,7 +1300,7 @@ describe('uninstall', () => {
       teamConfig: makeTeamConfig({ toolPaths: { omp: defaults.omp } }),
     });
 
-    await uninstall({ force: true });
+    await uninstallCli({ force: true });
 
     expect(await fse.pathExists(path.join(ompRules, 'fe.style.md'))).toBe(false);
     expect(await fse.readFile(path.join(ompRules, 'my-own.rule.md'), 'utf8')).toBe('Mine.\n');
@@ -1449,7 +1501,7 @@ describe('uninstall', () => {
       await fse.outputFile(path.join(tmpDir, 'team-repo', 'rules', 'other.md'), 'Other rule.\n');
       await fse.outputFile(legacy('other.md'), 'Other rule.\nMy own note.\n');
 
-      await uninstall({ force: true, agent: 'workbuddy' });
+      await uninstallCli({ force: true, agent: 'workbuddy' });
 
       expect(await fse.pathExists(legacy('team-rule.md'))).toBe(false);
       expect(await fse.readFile(legacy('other.md'), 'utf8')).toBe('Other rule.\nMy own note.\n');

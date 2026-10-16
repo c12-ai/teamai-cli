@@ -28,7 +28,7 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Report Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
     GIT_COMMITTER_NAME: 'Report Test', GIT_COMMITTER_EMAIL: 'test@example.invalid', FORCE_COLOR: '0' };
-  fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'report-test', repo: remote, provider, ...team }));
+  fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'report-test', repo: remote, provider, usageReport: true, ...team }));
   git(['init', '-q', '-b', 'main'], seed, env);
   git(['add', '.'], seed, env);
   git(['commit', '-q', '-m', 'fixture'], seed, env);

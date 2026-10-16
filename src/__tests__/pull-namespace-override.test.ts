@@ -56,7 +56,7 @@ vi.mock('../update.js', () => ({
 
 import crypto from 'node:crypto';
 import { checkoutKey, pull } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
+import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import { StateSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
 
@@ -98,8 +98,11 @@ describe('pull: an active namespace item replaces the root item of the same name
     };
   }
 
+  let stored: Record<string, unknown> = { lastPull: null };
   const as = (roles: string[] | null, extra: Partial<LocalConfig> = {}): void => {
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor(roles, extra));
+    // As `teamai roles` does: a role change forces the next pull to sync in full.
+    stored.lastPullRev = null;
   };
   const read = (rel: string): Promise<string> => fse.readFile(path.join(homeDir, rel), 'utf8');
   const exists = (rel: string): Promise<boolean> => fse.pathExists(path.join(homeDir, rel));
@@ -107,6 +110,14 @@ describe('pull: an active namespace item replaces the root item of the same name
   const logged = (level: 'info' | 'warn' | 'error', pattern: RegExp): boolean => (
     vi.mocked(log[level]).mock.calls.some((args) => pattern.test(args.map(String).join(' ')))
   );
+
+  // A team repo at a revision: pull keeps its delivery record only then (c12 fork).
+  const commitTeam = (): void => {
+    const git = (...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repoPath, encoding: 'utf8' });
+    git('init', '-q');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'team');
+  };
 
   beforeEach(async () => {
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-ns-override-'));
@@ -120,6 +131,11 @@ describe('pull: an active namespace item replaces the root item of the same name
 
     vi.stubEnv('HOME', homeDir);
     vi.stubEnv('HERMES_HOME', path.join(homeDir, '.hermes'));
+    // State persists between pulls, as on disk: the delivery record is what
+    // lets a later pull replace a copy an earlier one wrote (c12 fork).
+    stored = { lastPull: null };
+    vi.mocked(loadStateForScope).mockImplementation(async () => structuredClone(stored) as never);
+    vi.mocked(saveStateForScope).mockImplementation(async (state) => { stored = structuredClone(state) as Record<string, unknown>; });
 
     const teamConfig: TeamaiConfig = {
       team: 'test',
@@ -155,6 +171,7 @@ describe('pull: an active namespace item replaces the root item of the same name
       await team('agents/reviewer.yaml', 'name: reviewer\ndescription: Shared\ninstructions: Review for everyone.\n');
       await team('agents/frontend/reviewer.yaml', 'name: reviewer\ndescription: Front\ninstructions: Review the front end.\n');
 
+      commitTeam();
       await pull({});
       expect(await read('.claude/agents/reviewer.md')).toContain('Review the front end.');
 
@@ -214,6 +231,7 @@ describe('pull: an active namespace item replaces the root item of the same name
     });
 
     it('suppresses the root rule, in tool dirs and in the Hermes block, while the namespace is active', async () => {
+      commitTeam();
       await pull({});
 
       expect(await read('.claude/rules/frontend/style.md')).toBe('# Front style\n');
@@ -419,6 +437,7 @@ describe('pull: an active namespace item replaces the root item of the same name
 
     it('replaces a root skill received through a tag with the active namespace skill, whole', async () => {
       as(['devops'], { subscribedTags: ['ui'] });
+      commitTeam();
       await pull({});
       expect(await read('.claude/skills/review/SKILL.md')).toContain('Shared review');
       expect(await read('.claude/skills/review/checklist.md')).toBe('root-only checklist\n');

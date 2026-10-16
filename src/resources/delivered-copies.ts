@@ -1,9 +1,13 @@
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import fse from 'fs-extra';
 import type { AgentModelRecords, DeliveryTarget, ResourceItem } from '../types.js';
 import { fileHash, listFilesRecursive } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * What teamai last wrote at each skill, rule and agent file it delivered into
@@ -28,7 +32,7 @@ export interface DeliveredFile {
 
 export type CopyVerdict =
   | { kind: 'write' }
-  | { kind: 'keep'; teamChanged: boolean };
+  | { kind: 'keep'; teamChanged: boolean; foreign?: true };
 
 /** Push does not count a skill's CONTRIBUTORS as a change, so neither does this. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -52,7 +56,7 @@ export interface DeliveryLedger {
   readonly previous: DeliveredHashes | undefined;
   /** What the pull leaves on record: `previous` with its writes and removals applied. */
   readonly hashes: DeliveredHashes;
-  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean }[];
+  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean; foreign?: true }[];
   /**
    * The model each agent copy received (#830): the record the pull started
    * from until it writes that copy, then what it wrote. A copy pull kept or
@@ -117,15 +121,58 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 
 /** What pull does with `target`'s copy of `item`. Read-only. */
 export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<CopyVerdict> {
+  const next = await nextHashes(previous ?? {}, item, target);
+  // Something at the destination teamai has no record of writing, and that
+  // the team repo never held, is the member's or another tool's: pull never
+  // overwrites it (c12 fork).
+  if (await isForeignCopy(previous, item, target, next)) return { kind: 'keep', teamChanged: false, foreign: true };
   if (previous === undefined) return { kind: 'write' };
-  return classifyCopy(await withDisk(previous, await nextHashes(previous, item, target)));
+  return classifyCopy(await withDisk(previous, next));
+}
+
+/** Whether teamai has a record of writing `dest`, the file or any file under the skill directory. */
+export function isRecorded(previous: DeliveredHashes | undefined, dest: string): boolean {
+  return recordedUnder(previous ?? {}, dest).length > 0;
+}
+
+/**
+ * Whether `target.dest` holds a copy teamai did not deliver: it exists,
+ * nothing under it is on record, and a file of it is neither what pull would
+ * write nor bytes the team repo held at that path (a copy an older pull
+ * delivered, or one the member pushed, is the team's).
+ */
+async function isForeignCopy(
+  previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget, next: Map<string, string | null>,
+): Promise<boolean> {
+  if (isRecorded(previous, target.dest) || !await fse.pathExists(target.dest)) return false;
+  for (const [file, hash] of next) {
+    const disk = await fileHash(file);
+    if (disk === hash) continue;
+    if (disk === null) return true;
+    const teamFile = item.type === 'skills' ? path.join(item.sourcePath, path.relative(target.dest, file)) : item.sourcePath;
+    if (!await inTeamHistory(teamFile, file)) return true;
+  }
+  return false;
+}
+
+/** Whether `file`'s bytes are a version of `teamFile` in its repo's history. False when that cannot be told. */
+async function inTeamHistory(teamFile: string, file: string): Promise<boolean> {
+  const cwd = path.dirname(teamFile);
+  try {
+    const blob = (await execFileAsync('git', ['hash-object', '--', file], { cwd })).stdout.trim();
+    const { stdout } = await execFileAsync('git', ['log', '--all', '--format=', '--raw', '--no-abbrev', '--', path.basename(teamFile)],
+      { cwd, maxBuffer: 16 * 1024 * 1024 });
+    return stdout.split('\n').some((line) => line.startsWith(':') && line.split(/\s+/)[3] === blob);
+  } catch {
+    return false;
+  }
 }
 
 /** Whether pull leaves `target`'s copy as the member changed it; a kept copy is named by reportKept. */
 export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   const verdict = await judgeCopy(ledger.previous, item, target);
   if (verdict.kind === 'write') return false;
-  ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged });
+  ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged, ...verdict.foreign ? { foreign: true as const } : {} });
   return true;
 }
 
@@ -189,10 +236,15 @@ export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
  */
 export function reportKept(ledger: DeliveryLedger, scopeLabel: string): void {
   const named = new Set<string>();
-  for (const { dest, teamRelPath, teamChanged } of ledger.kept.splice(0)) {
+  for (const { dest, teamRelPath, teamChanged, foreign } of ledger.kept.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);
-    if (teamChanged) {
+    if (foreign) {
+      log.warn(
+        `[${scopeLabel}] Skipped ${dest}: teamai did not deliver it, so it is left as is and ${teamRelPath} is not installed there. `
+        + 'Rename or remove it, then run `teamai pull --force` to receive the team version.',
+      );
+    } else if (teamChanged) {
       log.warn(
         // The change may be the team's or the member's own model alias override.
         `[${scopeLabel}] Kept ${dest}: you changed it, and the version teamai would deploy there (${teamRelPath}) has changed since. `

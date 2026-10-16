@@ -53,7 +53,7 @@ function fixture() {
     fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
     fs.mkdirSync(seed, { recursive: true });
     at('init', '-q', '-b', 'main');
-    fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'scope-test', repo: teamRemote, provider: 'git' }));
+    fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'scope-test', repo: teamRemote, provider: 'git', usageReport: true }));
     at('add', 'teamai.yaml');
     at('commit', '-qm', 'fixture');
     at('clone', '-q', '--bare', seed, teamRemote);

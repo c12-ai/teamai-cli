@@ -81,7 +81,7 @@ describe('E2E self-mode: business repo working tree is never reset', () => {
     fs.writeFileSync(path.join(cacheRoot, 'app.js'), 'garbage\n');
     fs.writeFileSync(
       path.join(cacheRoot, 'teamai.yaml'),
-      'team: original\nsources:\n  - name: beta-source\n    repo: https://source.test/root/beta-source.git\n',
+      'team: original\nrepo: origin\nusageReport: true\nsources:\n  - name: beta-source\n    repo: https://source.test/root/beta-source.git\n',
     );
     fs.mkdirSync(path.join(cacheRoot, 'members'), { recursive: true });
     fs.writeFileSync(path.join(cacheRoot, 'members', 'stale.yaml'), 'username: stale\n');

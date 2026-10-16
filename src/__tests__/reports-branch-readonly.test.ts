@@ -55,6 +55,11 @@ function mockCheckoutOfBusinessRepo(): void {
   mocks.repoGit.revparse.mockImplementation(answer);
 }
 
+// The team repo opts in to reports (`usageReport: true`).
+vi.mock('../config.js', () => ({
+  loadTeamConfig: vi.fn().mockResolvedValue({ usageReport: true }),
+}));
+
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn(),
   releaseLock: vi.fn(),

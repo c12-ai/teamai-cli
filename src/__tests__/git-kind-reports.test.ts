@@ -45,7 +45,7 @@ async function seedBareOrigin(base = tmp): Promise<{ origin: string; clone: stri
   const seedGit = simpleGit(seed);
   await seedGit.init(['--initial-branch=main']);
   await configureGit(seed);
-  fs.writeFileSync(path.join(seed, 'teamai.yaml'), 'team: acme\n');
+  fs.writeFileSync(path.join(seed, 'teamai.yaml'), 'team: acme\nrepo: origin\nusageReport: true\n');
   fs.mkdirSync(path.join(seed, 'skills'), { recursive: true });
   fs.writeFileSync(path.join(seed, 'skills', '.gitkeep'), '');
   await seedGit.add(['.']);
@@ -163,7 +163,7 @@ describe('git-kind reports branch', () => {
     await configureGit(clone);
     await git.addRemote('origin', origin);
 
-    fs.writeFileSync(path.join(clone, 'teamai.yaml'), 'team: acme\n');
+    fs.writeFileSync(path.join(clone, 'teamai.yaml'), 'team: acme\nrepo: origin\nusageReport: true\n');
     for (const dir of ['skills', 'rules', 'docs', 'env', 'members']) {
       fs.mkdirSync(path.join(clone, dir), { recursive: true });
       fs.writeFileSync(path.join(clone, dir, '.gitkeep'), '');
@@ -458,7 +458,7 @@ describe('git-kind reports: inherited member root (#735)', () => {
   function writeLocalConfig(clone: string, origin: string, username: string): void {
     // The seed's bare `team:` line lacks the required `repo` key; give the
     // clone a teamai.yaml the config loader accepts.
-    fs.writeFileSync(path.join(clone, 'teamai.yaml'), `team: acme\nrepo: ${origin}\nprovider: git\n`);
+    fs.writeFileSync(path.join(clone, 'teamai.yaml'), `team: acme\nrepo: ${origin}\nprovider: git\nusageReport: true\n`);
     const home = process.env.HOME!;
     fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
     fs.writeFileSync(
@@ -538,6 +538,7 @@ describe('self-mode reports: shared stash', () => {
     const { origin, clone } = await seedBareOrigin();
     const teamaiDir = path.join(clone, '.teamai');
     fs.mkdirSync(teamaiDir, { recursive: true });
+    fs.writeFileSync(path.join(teamaiDir, 'teamai.yaml'), `team: acme\nrepo: ${origin}\nusageReport: true\n`);
     const alice: LocalConfig = {
       repo: { localPath: teamaiDir, remote: origin, kind: 'self', businessRepoRoot: clone },
       username: 'alice',
@@ -583,6 +584,7 @@ describe('self-mode reports: shared stash', () => {
     const { origin, clone } = await seedBareOrigin();
     const teamaiDir = path.join(clone, '.teamai');
     fs.mkdirSync(teamaiDir, { recursive: true });
+    fs.writeFileSync(path.join(teamaiDir, 'teamai.yaml'), `team: acme\nrepo: ${origin}\nusageReport: true\n`);
     const alice: LocalConfig = {
       repo: { localPath: teamaiDir, remote: origin, kind: 'self', businessRepoRoot: clone },
       username: 'alice',
