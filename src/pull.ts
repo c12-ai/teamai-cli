@@ -532,8 +532,7 @@ async function cleanupTombstonedResources(
         const localPath = path.join(baseDir, dir, `${stem}${ruleFileExtensionForTool(tool)}`);
         if (ledger.previous?.[localPath] === undefined || !await pathExists(localPath)) continue;
         if (await removedCopyChanged(ledger.previous, localPath)) {
-          log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed the rule it is a copy of, but you changed this copy. Delete it when you no longer need it.`);
-          continue;
+          log.warn(`[${scopeLabel}] Removed ${localPath}: no longer in the team repo (local edits discarded)`);
         }
         await remove(localPath);
         forgetDelivered(ledger.hashes, localPath);
@@ -559,8 +558,7 @@ async function cleanupTombstonedResources(
             continue;
           }
           if (await removedCopyChanged(ledger.previous, localPath)) {
-            log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed ${name}, but you changed this copy. Delete it when you no longer need it.`);
-            continue;
+            log.warn(`[${scopeLabel}] Removed ${localPath}: no longer in the team repo (local edits discarded)`);
           }
           await remove(localPath);
           forgetDelivered(ledger.hashes, localPath);

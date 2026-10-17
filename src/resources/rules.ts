@@ -844,13 +844,11 @@ export class RulesHandler extends ResourceHandler {
           // A file teamai has no record of writing is the member's own rule,
           // or another tool's: never teamai's to remove (c12 fork).
           if (ledger?.previous?.[fullPath] === undefined) continue;
-          // A copy the member changed since teamai delivered it stays (#822);
-          // the tombstone cleanup names one of a rule the team removed.
-          if (await removedCopyChanged(ledger?.previous, fullPath)) {
-            if (!tombstones.has(ruleName)) {
-              log.warn(`Kept ${fullPath}: teamai no longer delivers ${ruleName} here, but you changed this copy. Delete it when you no longer need it.`);
-            }
-            continue;
+          // The team version always wins (c12 fork): a copy the member
+          // changed is removed too, with one warning (the tombstone cleanup
+          // names one of a rule the team removed).
+          if (!tombstones.has(ruleName) && await removedCopyChanged(ledger?.previous, fullPath)) {
+            log.warn(`Removed ${fullPath}: no longer in the team repo (local edits discarded)`);
           }
           await remove(fullPath);
           if (ledger) forgetDelivered(ledger.hashes, fullPath);

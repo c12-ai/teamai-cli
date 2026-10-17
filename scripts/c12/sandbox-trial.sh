@@ -237,5 +237,29 @@ run rename-pull-after pull --force
 check "foreign files still untouched after the rename" foreign_untouched
 run rename-uninstall uninstall --force
 
+# --- 8. A team removal reaches an edited copy -----------------------------------
+PROJECT_D="$SANDBOX/project-d"
+mkdir -p "$PROJECT_D/.claude"
+git -C "$PROJECT_D" init -q
+cd "$PROJECT_D"
+mkdir -p "$TEAM_SRC/skills/gone-skill"
+printf -- '---\nname: gone-skill\ndescription: Soon removed\n---\nTeam version of gone-skill.\n' > "$TEAM_SRC/skills/gone-skill/SKILL.md"
+git -C "$TEAM_SRC" add -A
+git -C "$TEAM_SRC" commit -q -m "add gone-skill"
+git -C "$TEAM_SRC" push -q origin HEAD:main
+TEAMAI_PROJECT_ONLY=1 run rm-init init "$TEAM_URL" --provider git --agent claude
+check "gone-skill delivered (positive control)" test -f "$PROJECT_D/.claude/skills/gone-skill/SKILL.md"
+echo "my local edit" >> "$PROJECT_D/.claude/skills/gone-skill/SKILL.md"
+git -C "$TEAM_SRC" rm -q -r skills/gone-skill
+printf 'gone-skill\n' >> "$TEAM_SRC/skills/.removed"
+git -C "$TEAM_SRC" add -A
+git -C "$TEAM_SRC" commit -q -m "remove gone-skill"
+git -C "$TEAM_SRC" push -q origin HEAD:main
+TEAMAI_PROJECT_ONLY=1 run rm-pull pull
+echo "== team removal of an edited copy =="
+check "edited copy of the removed skill is gone" test ! -e "$PROJECT_D/.claude/skills/gone-skill"
+check "pull names the removed copy once" test "$(grep -c "Removed .*gone-skill: no longer in the team repo (local edits discarded)" "$SANDBOX/logs/rm-pull.log")" = 1
+TEAMAI_PROJECT_ONLY=1 run rm-uninstall uninstall --force
+
 echo
 if [ "$FAILS" -eq 0 ]; then echo "ALL CHECKS PASSED (logs: $SANDBOX/logs)"; else echo "$FAILS CHECK(S) FAILED (logs: $SANDBOX/logs)"; exit 1; fi

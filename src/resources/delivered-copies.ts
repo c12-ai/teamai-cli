@@ -218,7 +218,8 @@ export async function replaceCopy(ledger: DeliveryLedger, item: ResourceItem, ta
 
 /**
  * Whether the copy at `dest` of a resource the team removed has changed since
- * teamai delivered it. Without a record it has not, and is removed as before.
+ * teamai delivered it. Pull removes it either way (c12 fork) and names a
+ * changed one. Without a record it has not changed.
  */
 export async function removedCopyChanged(previous: DeliveredHashes | undefined, dest: string): Promise<boolean> {
   if (previous === undefined) return false;
