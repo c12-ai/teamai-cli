@@ -5,6 +5,7 @@
 #   2. uninstall leaves them as they were, and removes what teamai delivered
 #   3. nothing reaches the teamai-reports branch without `usageReport: true`
 #   4. a user-scope install puts no git hook in the project repo
+#   5. `init --branch` tracks a non-default team branch (checkout, config, pull)
 # Usage: scripts/c12/sandbox-trial.sh [empty-sandbox-dir]
 # Nothing outside the sandbox is written; no network remote is used.
 set -euo pipefail
@@ -158,6 +159,35 @@ echo "== workspace scope =="
 check "committed project rules not deleted" test -z "$(git -C "$PROJECT_B" status --porcelain --untracked-files=no)"
 run ws-uninstall uninstall --force
 check "committed project rules intact after uninstall" test -z "$(git -C "$PROJECT_B" status --porcelain --untracked-files=no)"
+
+# --- 5. init --branch tracks a non-default team branch -----------------------
+git -C "$TEAM_SRC" checkout -q -b trial-branch
+mkdir -p "$TEAM_SRC/skills/branch-only"
+printf -- '---\nname: branch-only\ndescription: Branch skill\n---\nOnly on trial-branch.\n' > "$TEAM_SRC/skills/branch-only/SKILL.md"
+git -C "$TEAM_SRC" add -A
+git -C "$TEAM_SRC" commit -q -m "branch-only skill"
+git -C "$TEAM_SRC" push -q origin trial-branch
+cd "$PROJECT"
+run branch-init init "$TEAM_URL" --provider git --scope user --agent claude --branch trial-branch
+echo "== user scope: init --branch =="
+check "branch saved in the local config" grep -q 'branch: trial-branch' "$HOME/.teamai/config.yaml"
+check "team clone checked out on the branch" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = trial-branch
+check "branch-only skill delivered" test -f "$HOME/.claude/skills/branch-only/SKILL.md"
+mkdir -p "$TEAM_SRC/skills/branch-later"
+printf -- '---\nname: branch-later\ndescription: Later branch skill\n---\nLater on trial-branch.\n' > "$TEAM_SRC/skills/branch-later/SKILL.md"
+git -C "$TEAM_SRC" add -A
+git -C "$TEAM_SRC" commit -q -m "later branch skill"
+git -C "$TEAM_SRC" push -q origin trial-branch
+git -C "$HOME/.teamai/team-repo" checkout -q main
+run branch-pull pull --force
+check "pull returns the clone to the branch" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = trial-branch
+check "pull delivers the branch's new skill" test -f "$HOME/.claude/skills/branch-later/SKILL.md"
+check "foreign files still untouched with --branch" foreign_untouched
+run branch-reinit init "$TEAM_URL" --provider git --scope user --agent claude --force
+check "re-init without --branch drops the saved branch" sh -c "! grep -q 'branch:' '$HOME/.teamai/config.yaml'"
+check "re-init without --branch returns the clone to main" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = main
+run branch-uninstall uninstall --force
+check "foreign files still untouched after the --branch uninstall" foreign_untouched
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "ALL CHECKS PASSED (logs: $SANDBOX/logs)"; else echo "$FAILS CHECK(S) FAILED (logs: $SANDBOX/logs)"; exit 1; fi

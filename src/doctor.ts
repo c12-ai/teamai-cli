@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
 import { log, setStderrOnly } from './utils/logger.js';
+import { tracksTeamBranch } from './utils/git.js';
 import type { GlobalOptions } from './types.js';
 import {
   COPILOT_TOOL_ID,
@@ -533,6 +534,12 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       },
       fix: 'Check teamai.yaml in team repo for syntax errors',
     },
+    ...(localConfig.repo.branch ? [{
+      name: `Team repo tracks branch ${localConfig.repo.branch}`,
+      source: 'local' as const,
+      check: async () => tracksTeamBranch(localConfig.repo.localPath, localConfig.repo.branch!),
+      fix: 'Run `teamai pull` to switch the team repo back to it',
+    }] : []),
     {
       // A contribution is kept locally when it cannot be published. Without
       // this check a member whose pushes are rejected queues notes forever and
