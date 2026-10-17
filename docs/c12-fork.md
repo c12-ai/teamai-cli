@@ -16,7 +16,9 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    then edited is overwritten the same way, with one warning per path:
    `Overwrote local edits in <path> with the team version`. The team version
    always wins, so a team update reaches every member. A copy of a resource
-   the team removed is still kept when the member changed it. Members' own
+   the team removed is removed too, even when the member changed it, with one
+   warning: `Removed <path>: no longer in the team repo (local edits
+   discarded)`. Members' own
    entries must not share a name with a team one. (`judgeCopy`,
    `replaceCopy` and `reportKept` in `src/resources/delivered-copies.ts`.)
 2. **No removal of files teamai did not deliver.** The stale-rule sweep, the
