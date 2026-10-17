@@ -69,7 +69,9 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    record still exists. If a delivered copy was deleted meanwhile (say by the
    project's own `git pull`), pull logs `[<scope>] N delivered file(s)
    missing; syncing` and runs the full sync, which puts the team version back
-   without `--force`. An edited copy is not missing. (`countMissingDelivered`
+   without `--force`. An edited copy is not missing. A complete full sync drops recorded files
+   still absent afterwards (a destination teamai no longer writes), so they
+   do not force a full sync on every pull. (`countMissingDelivered`
    in `src/pull.ts`.)
 
 ## Checks

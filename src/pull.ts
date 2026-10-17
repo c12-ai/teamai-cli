@@ -1848,6 +1848,15 @@ async function pullForScope(
       state[targetsField] = syncedTargets;
     }
     const complete = !docsSyncFailed && !submodulesFailed && !agentModelsHeld;
+    // Everything this pull delivers is on disk now: a recorded file still
+    // absent is a destination teamai no longer writes (say a tracked
+    // `.agents/skills` the project removed), and would send every later pull
+    // down the full sync.
+    if (complete) {
+      for (const file of Object.keys(ledger.hashes)) {
+        if (!await pathExists(file)) delete ledger.hashes[file];
+      }
+    }
     if (recordKey && deliveredRev && (!complete || revisionField === 'lastInheritedPullRev')) {
       // An inherited pull moves HOME's skills, rules and agents, not the rest,
       // and an incomplete one keeps its marker for a retry, yet both delivered
