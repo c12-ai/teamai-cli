@@ -32,7 +32,7 @@ export interface DeliveredFile {
 
 export type CopyVerdict =
   | { kind: 'write' }
-  | { kind: 'keep'; teamChanged: boolean; foreign?: true };
+  | { kind: 'keep'; teamChanged: boolean; foreign?: true; project?: true };
 
 /** Push does not count a skill's CONTRIBUTORS as a change, so neither does this. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -56,7 +56,7 @@ export interface DeliveryLedger {
   readonly previous: DeliveredHashes | undefined;
   /** What the pull leaves on record: `previous` with its writes and removals applied. */
   readonly hashes: DeliveredHashes;
-  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean; foreign?: true }[];
+  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean; foreign?: true; project?: true }[];
   /**
    * The model each agent copy received (#830): the record the pull started
    * from until it writes that copy, then what it wrote. A copy pull kept or
@@ -121,6 +121,10 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 
 /** What pull does with `target`'s copy of `item`. Read-only. */
 export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<CopyVerdict> {
+  // A symlink, even a dangling one, or a path git tracks is the project's own
+  // entry (a committed link into `.agents/skills`, say): pull never replaces it
+  // or writes into it, whatever it holds (c12 fork).
+  if (await isProjectEntry(target.dest)) return { kind: 'keep', teamChanged: false, foreign: true, project: true };
   const next = await nextHashes(previous ?? {}, item, target);
   // Something at the destination teamai has no record of writing, and that
   // the team repo never held, is the member's or another tool's: pull never
@@ -128,6 +132,19 @@ export async function judgeCopy(previous: DeliveredHashes | undefined, item: Res
   if (await isForeignCopy(previous, item, target, next)) return { kind: 'keep', teamChanged: false, foreign: true };
   if (previous === undefined) return { kind: 'write' };
   return classifyCopy(await withDisk(previous, next));
+}
+
+/** Whether `dest` is a symlink, or git tracks it or any file under it. */
+export async function isProjectEntry(dest: string): Promise<boolean> {
+  if ((await fse.lstat(dest).catch(() => null))?.isSymbolicLink()) return true;
+  try {
+    const { stdout } = await execFileAsync('git', ['--literal-pathspecs', 'ls-files', '-z', '--', path.basename(dest)],
+      { cwd: path.dirname(dest) });
+    return stdout.length > 0;
+  } catch {
+    // Outside a git work tree, or the directory does not exist yet.
+    return false;
+  }
 }
 
 /** Whether teamai has a record of writing `dest`, the file or any file under the skill directory. */
@@ -172,7 +189,10 @@ async function inTeamHistory(teamFile: string, file: string): Promise<boolean> {
 export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   const verdict = await judgeCopy(ledger.previous, item, target);
   if (verdict.kind === 'write') return false;
-  ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged, ...verdict.foreign ? { foreign: true as const } : {} });
+  ledger.kept.push({
+    dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged,
+    ...verdict.foreign ? { foreign: true as const } : {}, ...verdict.project ? { project: true as const } : {},
+  });
   return true;
 }
 
@@ -236,10 +256,12 @@ export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
  */
 export function reportKept(ledger: DeliveryLedger, scopeLabel: string): void {
   const named = new Set<string>();
-  for (const { dest, teamRelPath, teamChanged, foreign } of ledger.kept.splice(0)) {
+  for (const { dest, teamRelPath, teamChanged, foreign, project } of ledger.kept.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);
-    if (foreign) {
+    if (project) {
+      log.warn(`[${scopeLabel}] Skipped ${dest}: it is a symlink or git tracks it, so it is the project's own and ${teamRelPath} is not installed there.`);
+    } else if (foreign) {
       log.warn(
         `[${scopeLabel}] Skipped ${dest}: teamai did not deliver it, so it is left as is and ${teamRelPath} is not installed there. `
         + 'Rename or remove it, then run `teamai pull --force` to receive the team version.',

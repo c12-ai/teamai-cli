@@ -209,6 +209,35 @@ describe.skipIf(process.platform === 'win32')('teamai init --branch (C12 fork)',
     expect(git(['rev-parse', '--abbrev-ref', 'origin/HEAD'], teamRepo())).toBe('origin/main');
   }, 120_000);
 
+  it('a renamed team branch: pull names the fix, init --branch <new name> follows it', async () => {
+    // A remote of its own, since this test renames a branch on it.
+    const renamed = path.join(sandbox, `renamed-${Math.random().toString(36).slice(2)}.git`);
+    git(['clone', '-q', '--bare', remote, renamed], sandbox);
+    git(['config', '--global', '--replace-all', `url.${renamed}.insteadOf`, `${TEAM_URL}.git`], sandbox, { HOME: home, USERPROFILE: home });
+    git(['config', '--global', '--add', `url.${renamed}.insteadOf`, TEAM_URL], sandbox, { HOME: home, USERPROFILE: home });
+    git(['config', '--global', '--unset-all', `url.${remote}.insteadOf`], sandbox, { HOME: home, USERPROFILE: home });
+    const init = await runCLI(['init', TEAM_URL, '--branch', BRANCH, '--scope', 'user', '--role', 'dev', '--agent', 'claude', '--force']);
+    expect(init.code, init.output).toBe(0);
+
+    git(['push', '-q', renamed, `refs/heads/${BRANCH}:refs/heads/${BRANCH}-renamed`, `:refs/heads/${BRANCH}`], seed);
+    git(['checkout', '-q', BRANCH], seed);
+    writeFile(seed, 'skills/after-rename/SKILL.md', skill('after-rename'));
+    git(['add', '-A'], seed);
+    git(['commit', '-q', '-m', 'after rename'], seed);
+    git(['push', '-q', renamed, `HEAD:refs/heads/${BRANCH}-renamed`], seed);
+
+    const pull = await runCLI(['pull']);
+    expect(pull.output).toMatch(new RegExp(`no branch ${BRANCH}: it was renamed or deleted`));
+    expect(delivered('after-rename'), pull.output).toBe(false);
+
+    const follow = await runCLI(['init', TEAM_URL, '--branch', `${BRANCH}-renamed`, '--scope', 'user', '--role', 'dev', '--agent', 'claude', '--force']);
+    expect(follow.code, follow.output).toBe(0);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], teamRepo())).toBe(`${BRANCH}-renamed`);
+    expect(delivered('after-rename'), follow.output).toBe(true);
+    const after = await runCLI(['pull']);
+    expect(after.code, after.output).toBe(0);
+  }, 120_000);
+
   it('init --branch fails loudly when the branch does not exist', async () => {
     const result = await runCLI(['init', TEAM_URL, '--branch', 'no-such-branch', '--scope', 'user', '--role', 'dev', '--agent', 'claude', '--force']);
     expect(result.code, result.output).toBe(1);

@@ -351,11 +351,7 @@ export async function pullRepo(localPath: string, abort?: AbortSignal): Promise<
   const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
 
   try {
-    const result = await git.pull(['--ff-only']);
-    if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
-      return 'already up to date';
-    }
-    return `${result.summary.changes} file(s) changed`;
+    return await fastForward(git, branch);
   } catch (err) {
     // ff-only failed. A hard reset to origin is the only recovery, but it is
     // destructive — only safe on a dedicated team-repo clone. On a business-repo
@@ -366,7 +362,7 @@ export async function pullRepo(localPath: string, abort?: AbortSignal): Promise<
     }
     const reason = err instanceof Error ? err.message : String(err);
     log.debug(`ff-only pull failed (${branch}), attempting fetch + hard reset: ${reason}`);
-    await git.fetch(['origin', branch]);
+    await (branch === 'HEAD' ? git.fetch(['origin', branch]) : fetchBranch(git, originBranch(branch)));
 
     let ahead = 0;
     try {
@@ -412,13 +408,77 @@ const defaultBranchCache = new Map<string, string>();
  */
 export async function pullRepoFastForward(localPath: string): Promise<string> {
   const git = createGit(localPath);
-  const result = await git.pull(['--ff-only']);
-  if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
-    return 'already up to date';
-  }
-  return `${result.summary.changes} file(s) changed`;
+  return fastForward(git, (await git.revparse(['--abbrev-ref', 'HEAD'])).trim());
 }
 
+/**
+ * Fast-forward the checked-out `branch` to its upstream (origin/<branch> when
+ * none is configured), fetched alone by explicit refspec and merged by name
+ * (c12 fork). `git pull` merges whatever FETCH_HEAD and `branch.<name>.merge`
+ * list, and fails with "Cannot fast-forward to multiple branches" when two
+ * teamai processes fetch the clone at once. A detached HEAD pulls as before.
+ */
+async function fastForward(git: SimpleGit, branch: string): Promise<string> {
+  if (branch === 'HEAD') {
+    const result = await git.pull(['--ff-only']);
+    if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
+      return 'already up to date';
+    }
+    return `${result.summary.changes} file(s) changed`;
+  }
+  const upstream = await upstreamOf(git, branch);
+  await fetchBranch(git, upstream);
+  const before = (await git.revparse(['HEAD'])).trim();
+  await git.raw(['merge', '--ff-only', upstream.tracking]);
+  const after = (await git.revparse(['HEAD'])).trim();
+  if (before === after) return 'already up to date';
+  const changed = (await git.raw(['diff', '--name-only', before, after])).split('\n').filter(Boolean).length;
+  return `${changed} file(s) changed`;
+}
+
+/** A remote branch and the ref that tracks it. */
+interface Upstream {
+  remote: string;
+  /** The branch on the remote, `refs/heads/<name>`. */
+  ref: string;
+  /** Its remote-tracking ref, `refs/remotes/<remote>/<name>`. */
+  tracking: string;
+}
+
+const originBranch = (branch: string): Upstream =>
+  ({ remote: 'origin', ref: `refs/heads/${branch}`, tracking: `refs/remotes/origin/${branch}` });
+
+/** `branch`'s configured upstream on a remote, as `git pull` reads it; origin/<branch> without one. */
+async function upstreamOf(git: SimpleGit, branch: string): Promise<Upstream> {
+  try {
+    const remote = (await git.raw(['config', '--get', `branch.${branch}.remote`])).trim();
+    const ref = (await git.raw(['config', '--get-all', `branch.${branch}.merge`])).split('\n')[0].trim();
+    const tracking = (await git.raw(['rev-parse', '--symbolic-full-name', `${branch}@{upstream}`])).trim();
+    if (remote && remote !== '.' && ref.startsWith('refs/heads/') && tracking.startsWith('refs/remotes/')) return { remote, ref, tracking };
+  } catch {
+    // No upstream configured.
+  }
+  return originBranch(branch);
+}
+
+/**
+ * Fetch only `upstream.ref` into its tracking ref. A concurrent fetch can move
+ * that ref first, and git then refuses the update, so a failure is retried
+ * once; a branch the remote no longer has (renamed or deleted) fails with the fix.
+ */
+async function fetchBranch(git: SimpleGit, upstream: Upstream): Promise<void> {
+  const refspec = `+${upstream.ref}:${upstream.tracking}`;
+  try {
+    await git.fetch([upstream.remote, refspec]);
+    return;
+  } catch (err) {
+    if (/couldn't find remote ref/i.test(err instanceof Error ? err.message : String(err))) {
+      throw new Error(`The team repo has no branch ${upstream.ref.slice('refs/heads/'.length)}: it was renamed or deleted. `
+        + 'Re-run `teamai init <repo> --branch <its current name> --force` to track the branch the team uses now.');
+    }
+  }
+  await git.fetch([upstream.remote, refspec]);
+}
 
 export async function getDefaultBranch(localPath: string): Promise<string> {
   const cached = defaultBranchCache.get(localPath);
@@ -464,7 +524,7 @@ export async function getDefaultBranch(localPath: string): Promise<string> {
 export async function trackTeamBranch(localPath: string, branch?: string): Promise<string> {
   const git = createGit(localPath);
   if (branch) {
-    await git.fetch(['origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    await fetchBranch(git, originBranch(branch));
     await git.raw(['remote', 'set-head', 'origin', branch]);
   } else {
     await git.raw(['remote', 'set-head', 'origin', '--auto']);

@@ -31,12 +31,16 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: 'ci@teamai.test',
 };
 
+const TEAM_SKILL = '---\nname: team-skill\ndescription: team skill fixture\n---\n\n# team-skill\n';
+
 // What the project commits in its agent dirs, as a Trellis checkout does.
 const COMMITTED = {
   '.claude/settings.json': '{\n  "hooks": {\n    "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 .claude/hooks/session-start.py" }] }]\n  }\n}\n',
   '.claude/rules/project-rule.md': '# Project rule\n',
   '.codex/config.toml': '[agents]\nmax_depth = 1\n',
   '.codex/hooks.json': '{\n  "hooks": {}\n}\n',
+  // The team's skill, committed under .agents and linked from .claude below.
+  '.agents/skills/team-skill/SKILL.md': TEAM_SKILL,
 };
 
 let sandbox: string;
@@ -132,7 +136,7 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
       '    allowedCommands: [team-mcp]',
       '',
     ].join('\n'));
-    writeFile(seed, 'skills/team-skill/SKILL.md', '---\nname: team-skill\ndescription: team skill fixture\n---\n\n# team-skill\n');
+    writeFile(seed, 'skills/team-skill/SKILL.md', TEAM_SKILL);
     writeFile(seed, 'rules/team-rule.md', '# Team rule\n');
     writeFile(seed, 'agents/team-agent.md', '---\nname: team-agent\ndescription: team agent fixture\n---\nTeam agent.\n');
     writeFile(seed, 'hooks/hooks.yaml', [
@@ -169,6 +173,11 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
     git(['config', '--global', `url.${remote}.insteadOf`, `${TEAM_URL}.git`], sandbox, { HOME: home, USERPROFILE: home });
     git(['config', '--global', '--add', `url.${remote}.insteadOf`, TEAM_URL], sandbox, { HOME: home, USERPROFILE: home });
     for (const [file, content] of Object.entries(COMMITTED)) writeFile(project, file, content);
+    fs.mkdirSync(path.join(project, '.claude/skills'), { recursive: true });
+    fs.symlinkSync('../../.agents/skills/team-skill', path.join(project, '.claude/skills/team-skill'));
+    // A committed dangling link where the team agent would land.
+    fs.mkdirSync(path.join(project, '.claude/agents'), { recursive: true });
+    fs.symlinkSync('../../no-such-agent.md', path.join(project, '.claude/agents/team-agent.md'));
     git(['init', '-q', '-b', 'main'], project);
     git(['add', '-A'], project);
     git(['commit', '-q', '-m', 'project'], project);
@@ -188,8 +197,12 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
 
     // HOME: the host's agent dirs are byte-for-byte unchanged, nothing added.
     expect({ ...hashes(path.join(home, '.claude')), ...hashes(path.join(home, '.codex')) }).toEqual(homeAgents);
-    // Project: no committed file changed.
+    // Project: no committed file changed, the committed symlinks included,
+    // even the dangling one; each is named as skipped.
     expect(git(['status', '--porcelain', '--untracked-files=no'], project), pull.output).toBe('');
+    expect(fs.readlinkSync(path.join(project, '.claude/skills/team-skill'))).toBe('../../.agents/skills/team-skill');
+    expect(fs.readlinkSync(path.join(project, '.claude/agents/team-agent.md'))).toBe('../../no-such-agent.md');
+    expect(init.output + pull.output).toMatch(/Skipped \S*\.claude\/agents\/team-agent\.md: it is a symlink or git tracks it/);
     for (const [file, content] of Object.entries(COMMITTED)) expect(read(project, file)).toBe(content);
 
     // Built-in and team hooks: in Claude's untracked project settings file.
@@ -201,7 +214,6 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
     // Delivered resources.
     expect(fs.existsSync(path.join(project, '.claude/skills/team-skill/SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(project, '.claude/rules/team-rule.md'))).toBe(true);
-    expect(fs.existsSync(path.join(project, '.claude/agents/team-agent.md'))).toBe(true);
     // No git hook.
     expect(gitHookInstalled()).toBe(false);
 

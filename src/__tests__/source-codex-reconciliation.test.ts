@@ -205,7 +205,8 @@ describe('source Codex duplicate reconciliation', () => {
     expect(await candidates()).toEqual([]);
   });
 
-  it('preserves a configured leaf link referent when the link itself is a verified duplicate', async () => {
+  // C12 fork: a symlink is never teamai's to remove, even a verified duplicate.
+  it('preserves a configured leaf link and its referent when the link itself is a verified duplicate', async () => {
     await publish();
     await skill('.agents/skills/foo');
     const original = path.join(root, 'independent-copy');
@@ -214,7 +215,7 @@ describe('source Codex duplicate reconciliation', () => {
 
     await pullSources(config, { force: true });
 
-    expect(await fse.pathExists(path.join(home, '.codex/skills/foo'))).toBe(false);
+    expect((await fse.lstat(path.join(home, '.codex/skills/foo'))).isSymbolicLink()).toBe(true);
     expect(await fse.readFile(path.join(original, 'SKILL.md'), 'utf8')).toBe('# Source skill\n');
     expect(await candidates()).toEqual([]);
   });
