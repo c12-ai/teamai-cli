@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { projectSlug } from '../../utils/partition.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -65,6 +66,7 @@ describe('pull re-delivers a deleted delivered copy', () => {
   const claudeScript = () => path.join(claudeSkill(), 'scripts', 'run.sh');
   const claudeRule = () => path.join(projectRoot, '.claude', 'rules', 'team-rule.md');
   const claudeAgent = () => path.join(projectRoot, '.claude', 'agents', 'team-helper.md');
+  const statePath = () => path.join(home, '.teamai', 'projects', projectSlug(projectRoot), 'state.json');
   const read = (file: string) => fs.readFileSync(file, 'utf8');
 
   beforeEach(() => {
@@ -148,5 +150,23 @@ describe('pull re-delivers a deleted delivered copy', () => {
     expect(output).toContain('Already synced');
     expect(output).not.toContain('delivered file(s) missing');
     expect(read(claudeScript())).toBe('echo mine\n');
+  });
+
+  it('stops full-syncing for a recorded destination teamai no longer writes', async () => {
+    await pull();
+    // The Codex copies were once delivered to a tracked .agents/skills the project's own git pull removed.
+    const stale = path.join(projectRoot, '.agents', 'skills', 'team-skill', 'SKILL.md');
+    const state = JSON.parse(read(statePath()));
+    const record = Object.values<{ delivered: Record<string, string> }>(state.lastPullByWorkspace)[0]!;
+    record.delivered[stale] = 'a'.repeat(64);
+    fs.writeFileSync(statePath(), JSON.stringify(state));
+
+    const first = await pull();
+    expect(first).toContain('1 delivered file(s) missing; syncing');
+    expect(read(statePath())).not.toContain(stale);
+
+    const second = await pull();
+    expect(second).toContain('Already synced');
+    expect(second).not.toContain('delivered file(s) missing');
   });
 });
