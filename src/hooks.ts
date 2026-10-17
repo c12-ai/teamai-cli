@@ -24,6 +24,7 @@ import {
   CODEX_TOOL_ID,
   DEFAULT_CODEX_ROOT,
   getDataHome,
+  isProjectOnly,
   isSelfMode,
   managedMcpManifestKey,
   managedMcpManifestPath,
@@ -536,6 +537,8 @@ export async function resolveMainCheckoutHooks(
   toolPaths: Record<string, { settings?: string }>,
 ): Promise<MainCheckoutHooks | null> {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot || isSelfMode(localConfig)) return null;
+  // Project-only mode writes every hook into this checkout's own files.
+  if (isProjectOnly(localConfig)) return null;
   const { root, worktreeScoped } = await mainCheckoutOf(localConfig.projectRoot);
   if (root === canonicalProjectRoot(getUserHome())) return null;
   const files = Object.fromEntries(MAIN_CHECKOUT_TEAM_HOOK_TOOLS.flatMap((tool) => {
@@ -2374,7 +2377,7 @@ export async function reconcileTeamHooksForConfig(
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,
-    teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
+    teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig) && !isProjectOnly(localConfig)
       ? localConfig.projectRoot
       : undefined,
     installedBaseDir: localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined,
@@ -2426,6 +2429,14 @@ export async function reconcileTeamHooksForConfig(
  */
 async function installProjectGitHook(localConfig: LocalConfig, opts: { dryRun?: boolean } = {}): Promise<void> {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return;
+  if (isProjectOnly(localConfig)) {
+    // Project-only mode installs no git hook, and drops one an earlier run left.
+    if (!opts.dryRun) {
+      const { removeGitHook } = await import('./git-hook.js');
+      await removeGitHook(localConfig.projectRoot);
+    }
+    return;
+  }
   const { installGitHook } = await import('./git-hook.js');
   let result: Awaited<ReturnType<typeof installGitHook>>;
   try {

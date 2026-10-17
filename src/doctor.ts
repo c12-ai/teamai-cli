@@ -15,6 +15,7 @@ import {
   resolveHookScope,
   resolveToolBaseDir,
   isAgentExcluded,
+  isProjectOnly,
   scopedToolPaths,
   type LocalConfig,
   type TeamaiConfig,
@@ -587,7 +588,8 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
  * mentions itself. A project root outside git has no hook to report.
  */
 async function buildGitHookChecks(localConfig: LocalConfig, stage: CheckStage): Promise<Check[]> {
-  if (localConfig.scope !== 'project' || !localConfig.projectRoot) return [];
+  // Project-only mode installs no git hook (pull removes one).
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot || isProjectOnly(localConfig)) return [];
   const { gitHookStatus, describeMissingGitHook, readGitHookFailure, describeGitHookFailure } = await import('./git-hook.js');
   // A project root that no longer exists cannot be asked (git refuses the cwd).
   const status = stage === 'doctor' ? await gitHookStatus(localConfig.projectRoot).catch(() => null) : null;

@@ -30,6 +30,16 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    it. Without `--branch` nothing changes; re-running init without it returns
    the clone to the remote's default branch. The `teamai-reports` branch is
    unaffected. Git clones only (not `--http` or single-repo mode).
+6. **Project-only mode.** With `TEAMAI_PROJECT_ONLY=1`, a project-scope
+   install keeps everything it writes for the agents inside the project and
+   untracked, for a checkout shared through a container whose HOME (and its
+   `.claude`/`.codex`) belongs to the host user. Hooks, built-in and team, go
+   to `.claude/settings.local.json` instead of HOME; tools whose only project
+   hook file is committed (Codex: `.codex/hooks.json`) get no hooks. No git
+   hook is installed, and pull removes one an earlier run left. MCP sync skips
+   a project file git tracks (Codex: `.codex/config.toml`). teamai's own state
+   still lives under HOME (`~/.teamai`), so point HOME somewhere private to the
+   container. (`isProjectOnly` in `src/types.ts`.)
 
 ## Checks
 

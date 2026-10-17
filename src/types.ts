@@ -2288,6 +2288,7 @@ export function scopedToolPaths(
   teamConfig: TeamaiConfig,
   localConfig: { scope?: Scope; toolRoots?: Record<string, string> },
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
+  if (isProjectOnly(localConfig)) return projectOnlyToolPaths(teamConfig.toolPaths);
   if (localConfig.scope !== 'user') return teamConfig.toolPaths;
   const rooted = applyToolRoots(teamConfig.toolPaths, localConfig.toolRoots);
   const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
@@ -2309,6 +2310,38 @@ export function scopedToolPaths(
     // `rules: null`: no rules directory in user scope.
     if (us.rules === null) delete scoped.rules;
     out[tool] = scoped;
+  }
+  return out;
+}
+
+/**
+ * Project-only mode (c12 fork): `TEAMAI_PROJECT_ONLY=1` with a project-scope
+ * config. Everything teamai writes for the agents stays in the project's
+ * untracked files: hooks go to the project's own hook file instead of HOME,
+ * no git hook is installed, and no git-tracked file is written. For a checkout
+ * whose agent config is shared through a container while HOME belongs to the
+ * host user.
+ */
+export function isProjectOnly(localConfig: { scope?: Scope }): boolean {
+  return localConfig.scope === 'project'
+    && (process.env.TEAMAI_PROJECT_ONLY === '1' || process.env.TEAMAI_PROJECT_ONLY === 'true');
+}
+
+/**
+ * Tool paths in project-only mode. Claude Code reads the untracked
+ * `.claude/settings.local.json` next to the shared settings file, so its hooks
+ * go there. Every other tool's project hook file is one the project commits
+ * (Codex: `.codex/hooks.json`), so those tools get no hook file at all.
+ */
+function projectOnlyToolPaths(
+  toolPaths: Record<string, z.infer<typeof ToolPathsSchema>>,
+): Record<string, z.infer<typeof ToolPathsSchema>> {
+  const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    const { settings, hooks: _hooks, ...rest } = paths;
+    out[tool] = tool === CLAUDE_TOOL_ID && settings
+      ? { ...rest, settings: path.join(path.dirname(settings), 'settings.local.json') }
+      : rest;
   }
   return out;
 }
@@ -2556,7 +2589,8 @@ export function resolveHookScope(
   localConfig: LocalConfig,
 ): { baseDir: string; manifestPath: string; scope: Scope } {
   const selfWithRoot = isSelfMode(localConfig) && !!localConfig.projectRoot;
-  if (localConfig.scope === 'project' && !selfWithRoot) {
+  const projectOnly = isProjectOnly(localConfig) && !!localConfig.projectRoot;
+  if (localConfig.scope === 'project' && !selfWithRoot && !projectOnly) {
     // Hooks resolve to HOME here, so the tool paths must be resolved at *user*
     // scope too: a tool whose user-scope prefix differs from its project-scope
     // one (OpenCode, Qoder CN) would otherwise be written under the project
@@ -2612,7 +2646,7 @@ export function resolveLegacyProjectHookScope(
   localConfig: LocalConfig,
 ): { baseDir: string; manifestPath: string; scope: Scope } | null {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return null;
-  if (isSelfMode(localConfig)) return null;
+  if (isSelfMode(localConfig) || isProjectOnly(localConfig)) return null;
   if (path.resolve(localConfig.projectRoot) === path.resolve(getUserHome())) return null;
   return {
     baseDir: localConfig.projectRoot,
