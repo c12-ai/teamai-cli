@@ -22,7 +22,7 @@ const ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
 
 const TEAM_URL = 'https://github.com/acme/team';
-const BRANCH = 'bic-purification';
+const BRANCH = 'bic-argo';
 
 const GIT_ENV = {
   GIT_AUTHOR_NAME: 'TeamAI CI',
