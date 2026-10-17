@@ -197,12 +197,15 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
 
     // HOME: the host's agent dirs are byte-for-byte unchanged, nothing added.
     expect({ ...hashes(path.join(home, '.claude')), ...hashes(path.join(home, '.codex')) }).toEqual(homeAgents);
-    // Project: no committed file changed, the committed symlinks included,
-    // even the dangling one; each is named as skipped.
-    expect(git(['status', '--porcelain', '--untracked-files=no'], project), pull.output).toBe('');
-    expect(fs.readlinkSync(path.join(project, '.claude/skills/team-skill'))).toBe('../../.agents/skills/team-skill');
-    expect(fs.readlinkSync(path.join(project, '.claude/agents/team-agent.md'))).toBe('../../no-such-agent.md');
-    expect(init.output + pull.output).toMatch(/Skipped \S*\.claude\/agents\/team-agent\.md: it is a symlink or git tracks it/);
+    // Project: the team version replaces the same-named committed symlinks
+    // (even the dangling one), each named in a warning; nothing else changes.
+    expect(git(['status', '--porcelain', '--untracked-files=no'], project), pull.output).not.toMatch(/project-rule|settings\.json|config\.toml|hooks\.json/);
+    expect(fs.lstatSync(path.join(project, '.claude/skills/team-skill')).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(path.join(project, '.claude/agents/team-agent.md')).isSymbolicLink()).toBe(false);
+    expect(fs.existsSync(path.join(project, 'no-such-agent.md'))).toBe(false);
+    expect(read(project, '.agents/skills/team-skill/SKILL.md')).toBe(TEAM_SKILL);
+    expect(init.output + pull.output).toMatch(/Replaced \S*\.claude\/agents\/team-agent\.md \(a symlink\)/);
+    expect(init.output + pull.output).toMatch(/Replaced \S*\.claude\/skills\/team-skill \(a symlink\)/);
     for (const [file, content] of Object.entries(COMMITTED)) expect(read(project, file)).toBe(content);
 
     // Built-in and team hooks: in Claude's untracked project settings file.
@@ -214,6 +217,7 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
     // Delivered resources.
     expect(fs.existsSync(path.join(project, '.claude/skills/team-skill/SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(project, '.claude/rules/team-rule.md'))).toBe(true);
+    expect(fs.existsSync(path.join(project, '.claude/agents/team-agent.md'))).toBe(true);
     // No git hook.
     expect(gitHookInstalled()).toBe(false);
 

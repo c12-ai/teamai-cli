@@ -338,8 +338,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(output).toContain(`Kept ${worktreeRule}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
   });
 
-  // c12 fork: a copy with no record is not proven teamai's, so pull leaves it.
-  it('leaves an edited copy teamai has no record of, and names the step that takes the team version', async () => {
+  // c12 fork: the team version replaces a same-named copy teamai has no record of.
+  it('replaces an edited copy teamai has no record of, and names it in a warning', async () => {
     await pull();
     // The state an older CLI leaves: a checkout record without `delivered`.
     const state = JSON.parse(read(statePath())) as { lastPullByWorkspace: Record<string, { delivered?: unknown }> };
@@ -350,7 +350,7 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
 
     const upgraded = await pull();
 
-    expect(read(claudeRule())).toContain('My version.');
-    expect(upgraded).toContain(`Skipped ${claudeRule()}: teamai did not deliver it`);
+    expect(read(claudeRule())).not.toContain('My version.');
+    expect(upgraded).toContain(`Replaced ${claudeRule()} (not delivered by teamai)`);
   });
 });

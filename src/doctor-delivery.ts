@@ -179,9 +179,7 @@ async function differingCopyLabel(
   const { judgeCopy, recordedUnchanged } = await import('./resources/delivered-copies.js');
   const previous = await deliveredHashes(localConfig);
   const verdict = await judgeCopy(previous, item, target);
-  // A copy teamai did not deliver is not the member's edit of one: it is
-  // reported as a differing copy, which pull leaves (c12 fork).
-  if (verdict.kind === 'keep' && !verdict.foreign) return CHANGED_BY_YOU;
+  if (verdict.kind === 'keep') return CHANGED_BY_YOU;
   return recordedLabel !== undefined && await recordedUnchanged(previous, target.dest) ? recordedLabel : olderLabel;
 }
 

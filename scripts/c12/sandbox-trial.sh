@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Sandbox trial for the c12 fork guarantees (docs/c12-fork.md), run against the
 # built CLI (npm run build) in a throwaway HOME with a local team repo:
-#   1. same-named skills, rules and agents teamai did not deliver stay untouched
+#   1. same-named skills, rules and agents teamai did not deliver are replaced by
+#      the team version with one warning each; other files stay untouched
 #   2. uninstall leaves them as they were, and removes what teamai delivered
 #   3. nothing reaches the teamai-reports branch without `usageReport: true`
 #   4. a user-scope install puts no git hook in the project repo
 #   5. `init --branch` tracks a non-default team branch (checkout, config, pull)
-#   6. project-only mode never replaces a project's symlinks (even dangling) or
-#      git-tracked files at a delivery destination
+#   6. project-only mode replaces a same-named symlink (even dangling) with the
+#      team version, never writing through it, and warns
 #   7. a renamed team branch: pull names the fix, `init --branch <new>` follows it
 # Usage: scripts/c12/sandbox-trial.sh [empty-sandbox-dir]
 # Nothing outside the sandbox is written; no network remote is used.
@@ -92,13 +93,14 @@ printf -- '---\nname: reviewer\ndescription: Member agent\n---\nFOREIGN reviewer
 cat > "$HOME/.claude/settings.json" <<'EOF'
 {"hooks":{"UserPromptSubmit":[{"matcher":"*","hooks":[{"type":"command","command":"codegraph prompt-hook"}]}]}}
 EOF
-FOREIGN=(
+SAMENAMED=(
   "$HOME/.claude/skills/tdd/SKILL.md"
   "$HOME/.codex/skills/grill-me/SKILL.md"
   "$HOME/.claude/rules/my-rule.md"
-  "$HOME/.claude/rules/rule-8-match-codebase-conventions.md"
   "$HOME/.claude/agents/reviewer.md"
 )
+samenamed_replaced() { ! grep -qs FOREIGN "${SAMENAMED[@]}"; }
+FOREIGN=("$HOME/.claude/rules/rule-8-match-codebase-conventions.md")
 shasum -a 256 "${FOREIGN[@]}" > "$SANDBOX/foreign.sha"
 foreign_untouched() { shasum -a 256 -c --quiet "$SANDBOX/foreign.sha" > /dev/null 2>&1; }
 foreign_hook_kept() { grep -q 'codegraph prompt-hook' "$HOME/.claude/settings.json"; }
@@ -124,8 +126,9 @@ run user-pull pull --force
 echo "== user scope: init + pull =="
 check "team-only skill delivered (positive control)" test -f "$HOME/.claude/skills/team-only/SKILL.md"
 check "team rule delivered (positive control)" test -f "$HOME/.claude/rules/team-rule.md"
-check "same-named foreign skills, rules and agent untouched" foreign_untouched
-check "pull names a skipped foreign copy" grep -q "teamai did not deliver it" "$SANDBOX/logs/user-init.log" "$SANDBOX/logs/user-pull.log"
+check "same-named skills, rule and agent replaced by the team version" samenamed_replaced
+check "member-only rule untouched" foreign_untouched
+check "pull names each replaced copy" grep -q "Replaced .*(not delivered by teamai)" "$SANDBOX/logs/user-init.log" "$SANDBOX/logs/user-pull.log"
 check "foreign user hook kept in settings.json" foreign_hook_kept
 check "project tree unchanged" diff -q <(hashes "$PROJECT") "$SANDBOX/project.sha"
 check "project has no untracked or ignored files" test -z "$(git -C "$PROJECT" status --porcelain --ignored)"
@@ -136,7 +139,7 @@ check "no teamai-reports branch on the team remote" no_reports_branch
 # --- 2. Uninstall -----------------------------------------------------------
 run user-uninstall uninstall --force
 echo "== user scope: uninstall =="
-check "foreign skills, rules and agent still untouched" foreign_untouched
+check "member-only rule still untouched" foreign_untouched
 check "delivered team-only skill removed" test ! -e "$HOME/.claude/skills/team-only"
 check "delivered team rule removed" test ! -e "$HOME/.claude/rules/team-rule.md"
 check "foreign user hook kept in settings.json" foreign_hook_kept
@@ -195,7 +198,7 @@ check "foreign files still untouched after the --branch uninstall" foreign_untou
 # --- 6. Project-only mode keeps the project's symlinks and tracked files ------
 PROJECT_C="$SANDBOX/project-c"
 mkdir -p "$PROJECT_C/.agents/skills/tdd" "$PROJECT_C/.claude/skills" "$PROJECT_C/.claude/rules"
-cp "$TEAM_SRC/skills/tdd/SKILL.md" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
+printf -- '---\nname: tdd\ndescription: Project\n---\nPROJECT copy of tdd.\n' > "$PROJECT_C/.agents/skills/tdd/SKILL.md"
 ln -s ../../.agents/skills/tdd "$PROJECT_C/.claude/skills/tdd"
 ln -s ../../no-such-skill "$PROJECT_C/.claude/skills/grill-me"
 cp "$TEAM_SRC/rules/team-rule.md" "$PROJECT_C/.claude/rules/team-rule.md"
@@ -203,16 +206,17 @@ git -C "$PROJECT_C" init -q
 git -C "$PROJECT_C" add -A
 git -C "$PROJECT_C" commit -q -m "project with linked skills"
 cd "$PROJECT_C"
-TEAMAI_PROJECT_ONLY=1 run po-init init "$TEAM_URL" --provider git --agent claude,codex
+TEAMAI_PROJECT_ONLY=1 run po-init init "$TEAM_URL" --provider git --agent claude
 TEAMAI_PROJECT_ONLY=1 run po-pull pull --force
 echo "== project-only: the project's symlinks and tracked files =="
 check "team-only skill delivered (positive control)" test -f "$PROJECT_C/.claude/skills/team-only/SKILL.md"
-check "no tracked file changed or deleted" test -z "$(git -C "$PROJECT_C" status --porcelain --untracked-files=no)"
-check "linked skill is still the project's symlink" test "$(readlink "$PROJECT_C/.claude/skills/tdd")" = ../../.agents/skills/tdd
-check "dangling skill symlink kept" test "$(readlink "$PROJECT_C/.claude/skills/grill-me")" = ../../no-such-skill
-check "pull names each kept project entry" grep -q "it is a symlink or git tracks it" "$SANDBOX/logs/po-pull.log"
+check "linked skill is now the team directory, not a symlink" test ! -L "$PROJECT_C/.claude/skills/tdd" -a -f "$PROJECT_C/.claude/skills/tdd/SKILL.md"
+check "dangling skill symlink replaced" test ! -L "$PROJECT_C/.claude/skills/grill-me" -a -f "$PROJECT_C/.claude/skills/grill-me/SKILL.md"
+check "the link target was not written through" grep -q "PROJECT copy of tdd" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
+check "init names each replaced project entry" grep -q "Replaced .*(a symlink)" "$SANDBOX/logs/po-init.log"
 TEAMAI_PROJECT_ONLY=1 run po-uninstall uninstall --force
-check "uninstall leaves tracked files and symlinks" test -z "$(git -C "$PROJECT_C" status --porcelain --untracked-files=no)"
+check "uninstall removes the delivered copies" test ! -e "$PROJECT_C/.claude/skills/team-only"
+check "uninstall leaves the project's own .agents skill" grep -q "PROJECT copy of tdd" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
 
 # --- 7. A renamed team branch -------------------------------------------------
 cd "$PROJECT"
