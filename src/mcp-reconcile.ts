@@ -12,6 +12,7 @@ import {
   getMcpSharing,
   getEnvBackupPath,
   isAgentExcluded,
+  isProjectOnly,
   getDataHome,
   managedMcpManifestPath,
   managedMcpManifestKey,
@@ -309,6 +310,12 @@ export async function resolveMcpTargets(
 
     const baseDir = resolveToolBaseDir(tool, localConfig);
     const file = path.join(baseDir, rel);
+    // Project-only mode never writes a file the project commits (Codex's
+    // `.codex/config.toml`); git failing to answer counts as committed.
+    if (isProjectOnly(localConfig) && (await gitTracks(file)).kind !== 'untracked') {
+      log.debug(`Skipping MCP sync for ${tool}: ${file} is tracked by git (project-only mode)`);
+      continue;
+    }
 
     const probe = paths.skills ?? paths.settings ?? paths.agents;
     if (!probe) continue;
