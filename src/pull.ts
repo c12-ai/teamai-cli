@@ -834,6 +834,12 @@ export async function deliveredHashes(localConfig: LocalConfig, state?: State): 
   return (await deliveringCheckoutRecord(localConfig, state))?.delivered;
 }
 
+/** How many files of the delivery record `delivered` are gone from disk. */
+async function countMissingDelivered(delivered: DeliveredHashes | undefined): Promise<number> {
+  const present = await Promise.all(Object.keys(delivered ?? {}).map((file) => pathExists(file)));
+  return present.filter((exists) => !exists).length;
+}
+
 /**
  * The model and effort each agent copy in that checkout received when teamai
  * last wrote it, by stem and tool (#830). Empty when nothing is recorded.
@@ -1349,7 +1355,14 @@ async function pullForScope(
           && previousTargets.length === currentTargets.length
           && currentTargets.every((target) => syncedTargets.has(target));
 
-        if (targetSetMatches) {
+        // A delivered copy deleted since (say by the project's own `git pull`)
+        // is not "synced": the full sync below puts the team version back.
+        const missing = targetSetMatches
+          ? await countMissingDelivered(await deliveredHashes(localConfig, state))
+          : 0;
+        if (missing > 0) log.info(`[${scopeLabel}] ${missing} delivered file(s) missing; syncing`);
+
+        if (targetSetMatches && missing === 0) {
           log.success(`[${scopeLabel}] Already synced at ${currentRev}, skipping`);
           // 即使 repo 未变化，仍部署 CLI 内置资源（确保 CLI 升级后新版本 agent/rules 生效）
           const skipRecall = !isRecallEnabled(localConfig, freshConfig);
@@ -1434,7 +1447,7 @@ async function pullForScope(
           return;
         }
 
-        log.debug(`[${scopeLabel}] Repo unchanged; resource target set changed, syncing`);
+        if (!targetSetMatches) log.debug(`[${scopeLabel}] Repo unchanged; resource target set changed, syncing`);
       }
     } catch {
       // If rev check fails, proceed with full sync
