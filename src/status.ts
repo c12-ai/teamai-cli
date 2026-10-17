@@ -66,6 +66,7 @@ export async function status(options: GlobalOptions): Promise<void> {
   try {
     const gitStatus = await getRepoStatus(localConfig.repo.localPath);
     console.log(`  repo: ${localConfig.repo.remote}`);
+    if (localConfig.repo.branch) console.log(`  branch: ${localConfig.repo.branch}`);
     console.log(`  local: ${localConfig.repo.localPath}`);
     if (gitStatus.ahead > 0) console.log(`  ahead: ${gitStatus.ahead} commit(s)`);
     if (gitStatus.behind > 0) console.log(`  behind: ${gitStatus.behind} commit(s)`);

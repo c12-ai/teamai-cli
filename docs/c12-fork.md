@@ -21,12 +21,21 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    `teamai.yaml` sets `usageReport: true` (`src/utils/reports-branch.ts`).
 4. **No git hook in user scope.** Upstream already installs its git hook only
    in project scope; a test pins that.
+5. **Track a non-default team branch.** `teamai init <repo> --branch <name>`
+   checks that branch out in the team clone, points the clone's `origin/HEAD`
+   at it and saves it as `repo.branch` in the local config. Every place that
+   asks for the team's default branch (pull, the base of PRs opened by `push`,
+   knowledge PRs) reads `origin/HEAD`, so all of them follow the branch; pull
+   puts the clone back on it if something moved it, and `status`/`doctor` show
+   it. Without `--branch` nothing changes; re-running init without it returns
+   the clone to the remote's default branch. The `teamai-reports` branch is
+   unaffected. Git clones only (not `--http` or single-repo mode).
 
 ## Checks
 
 - `npm run lint`, `npx tsc --noEmit`, `npx vitest run`, `npm run test:e2e`.
 - `scripts/c12/sandbox-trial.sh` runs the built CLI in a throwaway HOME against
-  a local team repo and checks the four guarantees above end to end.
+  a local team repo and checks the guarantees above end to end.
 
 ## Upstream merges
 

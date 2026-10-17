@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward } from './utils/git.js';
+import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, trackTeamBranch } from './utils/git.js';
 import { pushRepoDirectly } from './utils/git.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
 import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
@@ -1482,12 +1482,19 @@ export async function init(options: GlobalOptions & {
   inheritUserScope?: boolean;
   self?: boolean;
   provider?: string;
+  branch?: string;
 }): Promise<void> {
   let forcedProvider: ProviderName | undefined;
   try {
     forcedProvider = resolveInitProvider(options.provider);
     if (forcedProvider && options.http) {
       throw new Error('--provider cannot be combined with --http: an HTTP team repo has no git provider.');
+    }
+    if (options.branch !== undefined && (options.http || options.self || (options.repoPositional ?? options.repo ?? '').trim() === '.')) {
+      throw new Error('--branch needs a cloned team repo: it cannot be combined with --http or single-repo mode.');
+    }
+    if (options.branch !== undefined && !options.branch.trim()) {
+      throw new Error('--branch needs a branch name.');
     }
   } catch (e) {
     log.error((e as Error).message);
@@ -1648,6 +1655,15 @@ export async function init(options: GlobalOptions & {
     if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
   };
 
+  // `--branch` makes the clone track that branch; a re-init without it after
+  // an earlier `--branch` returns the clone to the remote's default branch.
+  const teamBranch = options.branch?.trim();
+  const applyTeamBranch = async (): Promise<void> => {
+    if (!teamBranch && !existingLocalConfig?.repo.branch) return;
+    const tracked = await trackTeamBranch(localPath, teamBranch);
+    log.info(`Tracking team repo branch ${tracked}`);
+  };
+
   if (await pathExists(localPath)) {
     if (await isGitRepo(localPath)) {
       // Reuse only when the existing clone points at the SAME repo. A leftover
@@ -1686,6 +1702,7 @@ export async function init(options: GlobalOptions & {
         // (re-running init after a new project is added would otherwise keep the
         // old project list — see PR #518 review).
         try {
+          await applyTeamBranch();
           // Non-destructive refresh only: never reset --hard from init (would
           // discard local commits / tracked edits on an ordinary re-init).
           const pullResult = await pullRepoFastForward(localPath);
@@ -1811,6 +1828,12 @@ export async function init(options: GlobalOptions & {
         initSpin.fail(`Init failed: ${(e as Error).message}`);
         process.exit(1);
       }
+    }
+    try {
+      await applyTeamBranch();
+    } catch (e) {
+      log.error(`Cannot track team repo branch ${teamBranch}: ${(e as Error).message}`);
+      process.exit(1);
     }
   }
 
@@ -2013,7 +2036,7 @@ export async function init(options: GlobalOptions & {
 
   // Step 6: Save local config
   const localConfig: LocalConfig = {
-    repo: { localPath, remote: repoInfo.httpsUrl },
+    repo: { localPath, remote: repoInfo.httpsUrl, ...(teamBranch ? { branch: teamBranch } : {}) },
     username,
     ...(forcedProvider ? { provider: forcedProvider } : {}),
     scope,

@@ -578,6 +578,12 @@ export const LocalConfigSchema = z.object({
     localPath: z.string().transform(expandHome),
     remote: z.string(),
     /**
+     * Team repo branch this member tracks, set by `init --branch` (git clones
+     * only). Absent = the remote's default branch. Pull, PR bases and every
+     * other "team main" lookup follow it via the clone's origin/HEAD.
+     */
+    branch: z.string().min(1).optional(),
+    /**
      * Team repo backend. Defaults to 'git' for backward compatibility.
      * - 'git':  a standalone team repo cloned to <home>/team-repo.
      * - 'http': a git-free HTTP team repo (read-only consumer).

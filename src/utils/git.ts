@@ -454,6 +454,45 @@ export async function getDefaultBranch(localPath: string): Promise<string> {
 }
 
 /**
+ * Make a team-repo clone track `branch` instead of the remote's default branch:
+ * check it out with origin/<branch> as upstream and point origin/HEAD at it.
+ * origin/HEAD is what {@link getDefaultBranch} reads, so pull, push PR bases and
+ * every other "team main" lookup follow the tracked branch. Without `branch`,
+ * restore the remote's own default (`git remote set-head origin --auto`).
+ * Fails loudly when the branch does not exist on origin.
+ */
+export async function trackTeamBranch(localPath: string, branch?: string): Promise<string> {
+  const git = createGit(localPath);
+  if (branch) {
+    await git.fetch(['origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    await git.raw(['remote', 'set-head', 'origin', branch]);
+  } else {
+    await git.raw(['remote', 'set-head', 'origin', '--auto']);
+  }
+  defaultBranchCache.delete(localPath);
+  const target = await getDefaultBranch(localPath);
+  const current = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  if (current !== target) {
+    const local = await git.raw(['branch', '--list', target]);
+    await git.checkout(local.trim() ? [target] : ['-b', target, '--track', `origin/${target}`]);
+  }
+  await git.raw(['branch', `--set-upstream-to=origin/${target}`, target]);
+  return target;
+}
+
+/** Whether the clone already tracks `branch`: checked out and named by origin/HEAD. */
+export async function tracksTeamBranch(localPath: string, branch: string): Promise<boolean> {
+  const git = createGit(localPath);
+  try {
+    const head = (await git.revparse(['--abbrev-ref', 'origin/HEAD'])).trim();
+    const current = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+    return head === `origin/${branch}` && current === branch;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Push directly to whatever branch is checked out, whether that is `main`,
  * `master` or anything else. Used during init for first-time setup, and by CI.
  */

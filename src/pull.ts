@@ -7,7 +7,7 @@ import {
 } from './resources/desired.js';
 import type { IndexedSkills } from './utils/search-index.js';
 import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
-import { pullRepo, getHeadRev, createGit, getDefaultBranch, listWorktrees } from './utils/git.js';
+import { pullRepo, getHeadRev, createGit, getDefaultBranch, listWorktrees, trackTeamBranch, tracksTeamBranch } from './utils/git.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { pendingLearningsDir } from './utils/pending-learnings.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
@@ -171,6 +171,11 @@ async function refreshTeamRepo(
   }
   // The git-pull hook caps the fetch: git pull is waiting on it.
   const cap = options.fetchTimeoutMs === undefined ? undefined : AbortSignal.timeout(options.fetchTimeoutMs);
+  // `init --branch`: put the clone back on the tracked branch if anything moved it.
+  const teamBranch = localConfig.repo.branch;
+  if (teamBranch && !await tracksTeamBranch(localConfig.repo.localPath, teamBranch)) {
+    await trackTeamBranch(localConfig.repo.localPath, teamBranch);
+  }
   const result = await pullRepo(localConfig.repo.localPath, cap).catch((e: unknown) => {
     if (cap?.aborted) {
       const timeout = new Error(`team repo fetch exceeded ${options.fetchTimeoutMs} ms, left to the detached pull`);
