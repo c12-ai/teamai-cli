@@ -31,8 +31,8 @@ export interface DeliveredFile {
 }
 
 export type CopyVerdict =
-  | { kind: 'write' }
-  | { kind: 'keep'; teamChanged: boolean; foreign?: true; project?: true };
+  | { kind: 'write'; replaces?: 'symlink' | 'tracked' | 'foreign' }
+  | { kind: 'keep'; teamChanged: boolean };
 
 /** Push does not count a skill's CONTRIBUTORS as a change, so neither does this. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -56,7 +56,9 @@ export interface DeliveryLedger {
   readonly previous: DeliveredHashes | undefined;
   /** What the pull leaves on record: `previous` with its writes and removals applied. */
   readonly hashes: DeliveredHashes;
-  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean; foreign?: true; project?: true }[];
+  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean }[];
+  /** Same-named entries the team version replaced; named once each by reportKept. */
+  readonly replaced: { dest: string; teamRelPath: string; replaces: 'symlink' | 'tracked' | 'foreign' }[];
   /**
    * The model each agent copy received (#830): the record the pull started
    * from until it writes that copy, then what it wrote. A copy pull kept or
@@ -76,6 +78,7 @@ export function openLedger(previous: DeliveredHashes | undefined, agentModels?: 
     previous,
     hashes: { ...previous },
     kept: [],
+    replaced: [],
     held: [],
     agentModels: Object.fromEntries(Object.entries(agentModels ?? {}).map(([stem, byTool]) => [stem, { ...byTool }])),
   };
@@ -121,22 +124,28 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 
 /** What pull does with `target`'s copy of `item`. Read-only. */
 export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<CopyVerdict> {
-  // A symlink, even a dangling one, or a path git tracks is the project's own
-  // entry (a committed link into `.agents/skills`, say): pull never replaces it
-  // or writes into it, whatever it holds (c12 fork).
-  if (await isProjectEntry(target.dest)) return { kind: 'keep', teamChanged: false, foreign: true, project: true };
+  // The team version replaces a same-named entry in every mode (c12 fork): a
+  // symlink (even a dangling one), a git-tracked file, or a copy teamai did
+  // not deliver. The verdict says which, so pull can warn once per name.
   const next = await nextHashes(previous ?? {}, item, target);
-  // Something at the destination teamai has no record of writing, and that
-  // the team repo never held, is the member's or another tool's: pull never
-  // overwrites it (c12 fork).
-  if (await isForeignCopy(previous, item, target, next)) return { kind: 'keep', teamChanged: false, foreign: true };
+  if ((await fse.lstat(target.dest).catch(() => null))?.isSymbolicLink()) return { kind: 'write', replaces: 'symlink' };
+  if (await isForeignCopy(previous, item, target, next)) return { kind: 'write', replaces: 'foreign' };
+  if (await isTracked(target.dest) && await differsFromNext(next)) return { kind: 'write', replaces: 'tracked' };
   if (previous === undefined) return { kind: 'write' };
   return classifyCopy(await withDisk(previous, next));
 }
 
+async function differsFromNext(next: Map<string, string | null>): Promise<boolean> {
+  for (const [file, hash] of next) if (await fileHash(file) !== hash) return true;
+  return false;
+}
+
 /** Whether `dest` is a symlink, or git tracks it or any file under it. */
 export async function isProjectEntry(dest: string): Promise<boolean> {
-  if ((await fse.lstat(dest).catch(() => null))?.isSymbolicLink()) return true;
+  return Boolean((await fse.lstat(dest).catch(() => null))?.isSymbolicLink()) || isTracked(dest);
+}
+
+async function isTracked(dest: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync('git', ['--literal-pathspecs', 'ls-files', '-z', '--', path.basename(dest)],
       { cwd: path.dirname(dest) });
@@ -188,11 +197,15 @@ async function inTeamHistory(teamFile: string, file: string): Promise<boolean> {
 /** Whether pull leaves `target`'s copy as the member changed it; a kept copy is named by reportKept. */
 export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   const verdict = await judgeCopy(ledger.previous, item, target);
-  if (verdict.kind === 'write') return false;
-  ledger.kept.push({
-    dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged,
-    ...verdict.foreign ? { foreign: true as const } : {}, ...verdict.project ? { project: true as const } : {},
-  });
+  if (verdict.kind === 'write') {
+    if (verdict.replaces) {
+      ledger.replaced.push({ dest: target.dest, teamRelPath: item.relativePath, replaces: verdict.replaces });
+      // Writing through a link would change what it points at; drop the link itself.
+      if (verdict.replaces === 'symlink') await fse.remove(target.dest);
+    }
+    return false;
+  }
+  ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged });
   return true;
 }
 
@@ -256,17 +269,16 @@ export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
  */
 export function reportKept(ledger: DeliveryLedger, scopeLabel: string): void {
   const named = new Set<string>();
-  for (const { dest, teamRelPath, teamChanged, foreign, project } of ledger.kept.splice(0)) {
+  for (const { dest, teamRelPath, replaces } of ledger.replaced.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);
-    if (project) {
-      log.warn(`[${scopeLabel}] Skipped ${dest}: it is a symlink or git tracks it, so it is the project's own and ${teamRelPath} is not installed there.`);
-    } else if (foreign) {
-      log.warn(
-        `[${scopeLabel}] Skipped ${dest}: teamai did not deliver it, so it is left as is and ${teamRelPath} is not installed there. `
-        + 'Rename or remove it, then run `teamai pull --force` to receive the team version.',
-      );
-    } else if (teamChanged) {
+    const what = { symlink: 'a symlink', tracked: 'tracked by git', foreign: 'not delivered by teamai' }[replaces];
+    log.warn(`[${scopeLabel}] Replaced ${dest} (${what}) with the team version ${teamRelPath}. Rename your own entry if it should not be overwritten.`);
+  }
+  for (const { dest, teamRelPath, teamChanged } of ledger.kept.splice(0)) {
+    if (named.has(dest)) continue;
+    named.add(dest);
+    if (teamChanged) {
       log.warn(
         // The change may be the team's or the member's own model alias override.
         `[${scopeLabel}] Kept ${dest}: you changed it, and the version teamai would deploy there (${teamRelPath}) has changed since. `

@@ -6,16 +6,20 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
 
 ## Changes
 
-1. **Files teamai did not deliver are never overwritten.** A skill, rule or
-   agent at a destination with no delivery record, whose bytes are neither the
-   current team version nor any version in the team repo's history, is left as
-   is; pull warns `Skipped <path>: teamai did not deliver it`. A copy an older
-   pull wrote, or one the member pushed, matches the history and is updated as
-   before. (`judgeCopy` in `src/resources/delivered-copies.ts`.)
+1. **The team version replaces a same-named entry.** A skill, rule or agent
+   at a destination that is a regular file or directory teamai did not
+   deliver, a symlink (even a dangling one) or a git-tracked path is replaced
+   by the team version in every scope, and pull warns once per name:
+   `Replaced <path> (a symlink | tracked by git | not delivered by teamai)
+   with the team version <team path>`. A symlink is removed first, so its
+   target is never written through. A copy teamai did deliver and the member
+   then edited is still kept (`Kept <path>`). Members' own entries must not
+   share a name with a team one. (`judgeCopy`, `keepsEditedCopy` and
+   `reportKept` in `src/resources/delivered-copies.ts`.)
 2. **No removal of files teamai did not deliver.** The stale-rule sweep, the
    tombstone cleanup and `uninstall` remove a team-named copy only when the
-   delivery record shows teamai wrote it. Since pull never replaces such a
-   file, there is nothing to restore on uninstall.
+   delivery record shows teamai wrote it. A copy the team version replaced is
+   recorded, so uninstall removes it like any delivered copy.
 3. **Reports are opt-in.** Nothing (member registration, sessions, usage
    stats, votes) is committed to or pushed on `teamai-reports` unless the team
    `teamai.yaml` sets `usageReport: true` (`src/utils/reports-branch.ts`).
@@ -43,13 +47,9 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    fetches use git's own credentials. teamai's own state
    still lives under HOME (`~/.teamai`), so point HOME somewhere private to the
    container. (`isProjectOnly` in `src/types.ts`.)
-7. **A project's symlinks and tracked files are never replaced.** In every
-   scope, pull leaves a delivery destination that is a symlink (even a
-   dangling one) or that git tracks (the path or any file under it) as it is,
-   whatever it holds, and warns `Skipped <path>: it is a symlink or git tracks
-   it`. A repo that commits `.claude/skills/<name>` as a link to its own
-   `.agents/skills/<name>` keeps it. The Codex duplicate cleanup never removes
-   such an entry either. (`isProjectEntry` in `src/resources/delivered-copies.ts`.)
+7. **Codex duplicate cleanup spares symlinks.** The cleanup of an identical
+   duplicate in the configured Codex skills path never removes a symlink or a
+   git-tracked entry. (`isProjectEntry` in `src/resources/delivered-copies.ts`.)
 8. **Team clone refresh without `git pull`.** Pull and init fetch only the
    checked-out branch's upstream (origin/<branch> without one) by explicit
    refspec and fast-forward to that ref by name. `git pull` merges whatever

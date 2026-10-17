@@ -59,26 +59,28 @@ afterEach(async () => {
   await fse.remove(tmp);
 });
 
-describe('a same-named skill teamai did not deliver', () => {
+describe('a same-named skill teamai did not deliver (the team version replaces it)', () => {
   beforeEach(async () => {
     await fse.outputFile(path.join(repo, 'skills', 'tdd', 'SKILL.md'), '---\nname: tdd\ndescription: Team TDD\n---\nTeam version.\n');
     await fse.outputFile(path.join(home, '.claude', 'skills', 'tdd', 'SKILL.md'), '---\nname: tdd\ndescription: Mine\n---\nMy own skill.\n');
   });
 
-  it('is judged foreign with no record at all, as on the first pull after init', async () => {
+  it('is judged a replacement with no record at all, as on the first pull after init', async () => {
     const dest = path.join(home, '.claude', 'skills', 'tdd');
-    expect(await judgeCopy(undefined, skillItem('tdd'), { tool: 'claude', dest })).toEqual({ kind: 'keep', teamChanged: false, foreign: true });
+    expect(await judgeCopy(undefined, skillItem('tdd'), { tool: 'claude', dest })).toEqual({ kind: 'write', replaces: 'foreign' });
   });
 
-  it('is left byte for byte, kept off the record, and named in a warning', async () => {
+  it('is replaced by the team version, recorded, and named in a warning', async () => {
     const ledger = openLedger(undefined);
     await new SkillsHandler().pullItem(skillItem('tdd'), teamConfig, localConfig(), ledger);
     reportKept(ledger, 'user');
 
     const dest = path.join(home, '.claude', 'skills', 'tdd');
-    expect(await fse.readFile(path.join(dest, 'SKILL.md'), 'utf8')).toContain('My own skill.');
-    expect(Object.keys(ledger.hashes).some((file) => file.startsWith(dest))).toBe(false);
-    expect(vi.mocked(log.warn).mock.calls.map(String).join('\n')).toMatch(/Skipped .*tdd: teamai did not deliver it/);
+    const text = await fse.readFile(path.join(dest, 'SKILL.md'), 'utf8');
+    expect(text).toContain('Team version.');
+    expect(text).not.toContain('My own skill.');
+    expect(Object.keys(ledger.hashes).some((file) => file.startsWith(dest))).toBe(true);
+    expect(vi.mocked(log.warn).mock.calls.map(String).join('\n')).toMatch(/Replaced .*tdd .*not delivered by teamai/);
   });
 
   it('is still replaced once teamai delivered it, so team updates arrive', async () => {
