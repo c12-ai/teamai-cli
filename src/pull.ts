@@ -371,7 +371,7 @@ async function getExistingLocalNames(
   return existing;
 }
 
-/** `--dry-run`: name each copy the sync would keep because the member changed it (#822). */
+/** `--dry-run`: name each copy the sync would replace, including the member's edits (#822). */
 async function reportWouldKeep(
   handler: ResourceHandler,
   items: readonly ResourceItem[],
@@ -384,8 +384,8 @@ async function reportWouldKeep(
   for (const item of items) {
     for (const target of await handler.deliveryTargets(freshConfig, localConfig, item, received)) {
       const verdict = await judgeCopy(ledger.previous, item, target);
-      if (verdict.kind === 'keep') {
-        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: you changed it since teamai delivered it.`);
+      if (verdict.replaces === 'edited') {
+        log.info(`[${scopeLabel}] [dry-run] Would overwrite local edits in ${target.dest} with the team version.`);
       } else if (verdict.replaces) {
         log.info(`[${scopeLabel}] [dry-run] Would replace ${target.dest} (${verdict.replaces}) with the team version.`);
       }

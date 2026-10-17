@@ -264,7 +264,7 @@ async function warnKeptCopiesTheTeamChanged(
         : await handler.deliveryTargets(teamConfig, localConfig, teamItem);
       for (const target of targets) {
         const verdict = await judgeCopy(previous, teamItem, target);
-        if (verdict.kind === 'keep' && verdict.teamChanged) {
+        if (verdict.replaces === 'edited' && verdict.teamChanged) {
           log.warn(
             `[${item.type}] The version teamai would deploy at ${target.dest} (${item.relativePath}) has changed since it delivered that copy; `
             + 'pushing replaces that change unless you merged it. Merge that version first, '

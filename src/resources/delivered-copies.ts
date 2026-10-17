@@ -34,6 +34,15 @@ export type CopyVerdict =
   | { kind: 'write'; replaces?: 'symlink' | 'tracked' | 'foreign' }
   | { kind: 'keep'; teamChanged: boolean };
 
+/**
+ * What pull does with a copy (c12 fork): the team version always wins, so
+ * pull writes in every case. `edited` is the member's own change to a copy
+ * teamai delivered; `teamChanged` says the team version moved as well.
+ */
+export type PullVerdict =
+  | { kind: 'write'; replaces?: 'symlink' | 'tracked' | 'foreign' }
+  | { kind: 'write'; replaces: 'edited'; teamChanged: boolean };
+
 /** Push does not count a skill's CONTRIBUTORS as a change, so neither does this. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 
@@ -56,9 +65,8 @@ export interface DeliveryLedger {
   readonly previous: DeliveredHashes | undefined;
   /** What the pull leaves on record: `previous` with its writes and removals applied. */
   readonly hashes: DeliveredHashes;
-  readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean }[];
   /** Same-named entries the team version replaced; named once each by reportKept. */
-  readonly replaced: { dest: string; teamRelPath: string; replaces: 'symlink' | 'tracked' | 'foreign' }[];
+  readonly replaced: { dest: string; teamRelPath: string; replaces: 'symlink' | 'tracked' | 'foreign' | 'edited' }[];
   /**
    * The model each agent copy received (#830): the record the pull started
    * from until it writes that copy, then what it wrote. A copy pull kept or
@@ -77,7 +85,6 @@ export function openLedger(previous: DeliveredHashes | undefined, agentModels?: 
   return {
     previous,
     hashes: { ...previous },
-    kept: [],
     replaced: [],
     held: [],
     agentModels: Object.fromEntries(Object.entries(agentModels ?? {}).map(([stem, byTool]) => [stem, { ...byTool }])),
@@ -123,7 +130,7 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 }
 
 /** What pull does with `target`'s copy of `item`. Read-only. */
-export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<CopyVerdict> {
+export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<PullVerdict> {
   // The team version replaces a same-named entry in every mode (c12 fork): a
   // symlink (even a dangling one), a git-tracked file, or a copy teamai did
   // not deliver. The verdict says which, so pull can warn once per name.
@@ -132,7 +139,8 @@ export async function judgeCopy(previous: DeliveredHashes | undefined, item: Res
   if (await isForeignCopy(previous, item, target, next)) return { kind: 'write', replaces: 'foreign' };
   if (await isTracked(target.dest) && await differsFromNext(next)) return { kind: 'write', replaces: 'tracked' };
   if (previous === undefined) return { kind: 'write' };
-  return classifyCopy(await withDisk(previous, next));
+  const verdict = classifyCopy(await withDisk(previous, next));
+  return verdict.kind === 'keep' ? { kind: 'write', replaces: 'edited', teamChanged: verdict.teamChanged } : verdict;
 }
 
 async function differsFromNext(next: Map<string, string | null>): Promise<boolean> {
@@ -194,19 +202,18 @@ async function inTeamHistory(teamFile: string, file: string): Promise<boolean> {
   }
 }
 
-/** Whether pull leaves `target`'s copy as the member changed it; a kept copy is named by reportKept. */
-export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
+/**
+ * Prepare for pull to write `target`'s copy. The team version replaces a
+ * same-named entry and a member's edit alike (c12 fork); what it replaces is
+ * queued for reportKept to name once.
+ */
+export async function replaceCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<void> {
   const verdict = await judgeCopy(ledger.previous, item, target);
-  if (verdict.kind === 'write') {
-    if (verdict.replaces) {
-      ledger.replaced.push({ dest: target.dest, teamRelPath: item.relativePath, replaces: verdict.replaces });
-      // Writing through a link would change what it points at; drop the link itself.
-      if (verdict.replaces === 'symlink') await fse.remove(target.dest);
-    }
-    return false;
+  if (verdict.replaces) {
+    ledger.replaced.push({ dest: target.dest, teamRelPath: item.relativePath, replaces: verdict.replaces });
+    // Writing through a link would change what it points at; drop the link itself.
+    if (verdict.replaces === 'symlink') await fse.remove(target.dest);
   }
-  ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged });
-  return true;
 }
 
 /**
@@ -262,34 +269,17 @@ export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
   for (const file of recordedUnder(hashes, dest)) delete hashes[file];
 }
 
-/**
- * Name each copy pull kept, with the step that shares it or takes the team
- * version. The step is `pull --force`: this pull has recorded the team
- * revision, so a plain pull after it would skip the sync.
- */
+/** Name each copy the team version replaced, once per path. */
 export function reportKept(ledger: DeliveryLedger, scopeLabel: string): void {
   const named = new Set<string>();
   for (const { dest, teamRelPath, replaces } of ledger.replaced.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);
+    if (replaces === 'edited') {
+      log.warn(`[${scopeLabel}] Overwrote local edits in ${dest} with the team version`);
+      continue;
+    }
     const what = { symlink: 'a symlink', tracked: 'tracked by git', foreign: 'not delivered by teamai' }[replaces];
     log.warn(`[${scopeLabel}] Replaced ${dest} (${what}) with the team version ${teamRelPath}. Rename your own entry if it should not be overwritten.`);
-  }
-  for (const { dest, teamRelPath, teamChanged } of ledger.kept.splice(0)) {
-    if (named.has(dest)) continue;
-    named.add(dest);
-    if (teamChanged) {
-      log.warn(
-        // The change may be the team's or the member's own model alias override.
-        `[${scopeLabel}] Kept ${dest}: you changed it, and the version teamai would deploy there (${teamRelPath}) has changed since. `
-        + 'Merge that change into your copy and share it with `teamai push`, '
-        + 'or delete your copy and run `teamai pull --force` to take that version.',
-      );
-    } else {
-      log.info(
-        `[${scopeLabel}] Kept ${dest}: you changed it since teamai delivered it. `
-        + 'Share it with `teamai push`, or delete it and run `teamai pull --force` to get the team version back.',
-      );
-    }
   }
 }

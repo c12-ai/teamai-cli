@@ -123,19 +123,17 @@ describe('a pull at an unchanged team revision after the rule formats change (#9
     await fse.remove(tmpDir);
   });
 
-  it('re-renders the unedited copy, records it, and leaves the edited one', async () => {
+  it('re-renders the unedited copy, records it, and overwrites the edited one', async () => {
     await pull({});
 
     const successes = vi.mocked(log.success).mock.calls.map(([message]) => String(message));
     expect(successes.some((message) => message.includes('Already synced at abc1234'))).toBe(true);
     expect(await fse.readFile(kiroCopy(), 'utf8')).toBe(KIRO);
-    expect(await fse.readFile(qoderCopy(), 'utf8')).toBe('My own wording.\n');
+    expect(await fse.readFile(qoderCopy(), 'utf8')).not.toContain('My own wording.');
     expect(delivered()[kiroCopy()]).toBe(sha256(KIRO));
-    expect(delivered()[qoderCopy()]).toBe(sha256(SCOPED));
-    expect(successes).toContain('[user] Rewrote 1 rule(s) in their tool\'s own format: scoped');
-    // Kept and named, as a full sync names it (#822).
+    // Overwritten and named, as a full sync names it.
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(warnings.filter((message) => message.includes(`Kept ${qoderCopy()}`))).toHaveLength(1);
+    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${qoderCopy()} with the team version`))).toHaveLength(1);
   });
 });
 
@@ -384,26 +382,25 @@ describe('a pull at an unchanged team revision after JoyCode gets its own render
     await fse.remove(tmpDir);
   });
 
-  it('re-renders the unedited copy for JoyCode, and keeps and names the edited one', async () => {
+  it('re-renders the unedited copy for JoyCode, and overwrites and names the edited one', async () => {
     await pull({});
 
     const successes = vi.mocked(log.success).mock.calls.map(([message]) => String(message));
     expect(successes.some((message) => message.includes('Already synced at abc1234'))).toBe(true);
     expect(await fse.readFile(copy('scoped'), 'utf8')).toBe(JOYCODE);
     expect(delivered()[copy('scoped')]).toBe(sha256(JOYCODE));
-    expect(await fse.readFile(copy('edited'), 'utf8')).toContain('My own wording.');
+    expect(await fse.readFile(copy('edited'), 'utf8')).toBe(JOYCODE);
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(warnings.filter((message) => message.includes(`Kept ${copy('edited')}`))).toHaveLength(1);
-    expect(warnings.filter((message) => message.includes(copy('edited')) && message.includes('JoyCode never matches'))).toHaveLength(1);
+    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${copy('edited')} with the team version`))).toHaveLength(1);
     expect(warnings.some((message) => message.includes(copy('scoped')))).toBe(false);
   });
 
-  it('says why the kept copy applies to no file on a full sync too', async () => {
+  it('overwrites the edited copy on a full sync too', async () => {
     await pull({ force: true });
 
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(await fse.readFile(copy('edited'), 'utf8')).toContain('My own wording.');
-    expect(warnings.filter((message) => message.includes(copy('edited')) && message.includes('JoyCode never matches'))).toHaveLength(1);
+    expect(await fse.readFile(copy('edited'), 'utf8')).toBe(JOYCODE);
+    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${copy('edited')} with the team version`))).toHaveLength(1);
   });
 });
 

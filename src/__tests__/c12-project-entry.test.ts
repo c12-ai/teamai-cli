@@ -13,7 +13,7 @@ vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn(), persist: vi.fn() },
 }));
 
-import { contentHash, judgeCopy, keepsEditedCopy, openLedger, reportKept } from '../resources/delivered-copies.js';
+import { contentHash, judgeCopy, replaceCopy, openLedger, reportKept } from '../resources/delivered-copies.js';
 import { log } from '../utils/logger.js';
 import type { ResourceItem } from '../types.js';
 
@@ -94,7 +94,7 @@ describe('judgeCopy replaces the project\'s same-named entries (C12 fork)', () =
   });
 });
 
-describe('keepsEditedCopy carries out the replacement and warns once per name', () => {
+describe('replaceCopy carries out the replacement and warns once per name', () => {
   it('removes a symlink so the write cannot reach its target, and warns', async () => {
     const outside = path.join(project, '.agents', 'team-rule.md');
     write(outside, '# Project rule\n');
@@ -102,11 +102,11 @@ describe('keepsEditedCopy carries out the replacement and warns once per name', 
     const ledger = openLedger(undefined);
     const target = { tool: 'claude' as const, dest: dest(), content: RULE };
 
-    expect(await keepsEditedCopy(ledger, rule, target)).toBe(false);
+    await replaceCopy(ledger, rule, target);
     expect(fs.lstatSync(dest(), { throwIfNoEntry: false })).toBeUndefined();
     expect(fs.readFileSync(outside, 'utf8')).toBe('# Project rule\n');
 
-    await keepsEditedCopy(ledger, rule, target);
+    await replaceCopy(ledger, rule, target);
     reportKept(ledger, 'project');
     expect(warnings().match(/Replaced /g)).toHaveLength(1);
     expect(warnings()).toMatch(/Replaced .*team-rule\.md \(a symlink\)/);
@@ -116,7 +116,7 @@ describe('keepsEditedCopy carries out the replacement and warns once per name', 
     write(dest(), '# Project rule\n');
     git(['add', '-A']);
     const ledger = openLedger(undefined);
-    expect(await keepsEditedCopy(ledger, rule, { tool: 'claude', dest: dest(), content: RULE })).toBe(false);
+    await replaceCopy(ledger, rule, { tool: 'claude', dest: dest(), content: RULE });
     reportKept(ledger, 'project');
     expect(warnings()).toMatch(/Replaced .*team-rule\.md/);
   });
