@@ -64,6 +64,13 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    branch the remote no longer has (renamed or deleted) fails with
    `The team repo has no branch <name>: it was renamed or deleted` and the
    `init --branch <new name> --force` fix. (`fastForward` in `src/utils/git.ts`.)
+9. **A deleted delivered copy is delivered again.** The "Already synced"
+   fast path of pull is taken only while every file in the checkout's delivery
+   record still exists. If a delivered copy was deleted meanwhile (say by the
+   project's own `git pull`), pull logs `[<scope>] N delivered file(s)
+   missing; syncing` and runs the full sync, which puts the team version back
+   without `--force`. An edited copy is not missing. (`countMissingDelivered`
+   in `src/pull.ts`.)
 
 ## Checks
 

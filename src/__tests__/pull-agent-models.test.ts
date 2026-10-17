@@ -747,7 +747,7 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       expect(logged('warn', /Overwrote local edits/)).toBe(false);
     });
 
-    it('says it delivered an agent that had no copy, not that it updated its model', async () => {
+    it('delivers an agent that had no copy by a full sync, not as an updated model', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -760,13 +760,13 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
 
       await pull({ silent: true });
 
-      expect(alreadySynced()).toBe(true);
+      // The deleted copies are in the delivery record, so the fast path steps aside for a full sync.
+      expect(alreadySynced()).toBe(false);
       expect(await claudeModel()).toMatchObject({ model: 'opus' });
       expect(logged('success', /Updated the model/)).toBe(false);
-      expect(logged('success', /Delivered 1 agent\(s\) missing from a tool: implementer/)).toBe(true);
     });
 
-    it('delivers a recorded agent whose copy was deleted since the last pull', async () => {
+    it('delivers a recorded agent whose copy was deleted since the last pull by a full sync', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -774,9 +774,9 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
 
       await pull({ silent: true });
 
-      expect(alreadySynced()).toBe(true);
+      expect(alreadySynced()).toBe(false);
+      expect(logged('info', /1 delivered file\(s\) missing; syncing/)).toBe(true);
       expect(await codexModel()).toMatchObject({ model: 'gpt-6-sol' });
-      expect(logged('success', /Delivered 1 agent\(s\) missing from a tool: implementer/)).toBe(true);
     });
   });
 
