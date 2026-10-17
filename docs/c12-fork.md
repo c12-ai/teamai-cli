@@ -37,7 +37,10 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    to `.claude/settings.local.json` instead of HOME; tools whose only project
    hook file is committed (Codex: `.codex/hooks.json`) get no hooks. No git
    hook is installed, and pull removes one an earlier run left. MCP sync skips
-   a project file git tracks (Codex: `.codex/config.toml`). teamai's own state
+   a project file git tracks (Codex: `.codex/config.toml`). The GitHub clone
+   keeps no token: upstream writes it into the clone's remote URL; here it
+   authenticates the clone only (a header in the child's environment) and later
+   fetches use git's own credentials. teamai's own state
    still lives under HOME (`~/.teamai`), so point HOME somewhere private to the
    container. (`isProjectOnly` in `src/types.ts`.)
 

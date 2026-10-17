@@ -3,6 +3,7 @@ import crossSpawn from 'cross-spawn';
 import { log } from '../../utils/logger.js';
 import { resolveCliPath } from '../../utils/cli-path.js';
 import { isInteractive } from '../../utils/prompt.js';
+import { projectOnlyRequested } from '../../types.js';
 
 // ─── Constants ───────────────────────────────────────────
 
@@ -257,12 +258,28 @@ export class RepoNotFoundError extends Error {
  */
 export function ghRepoClone(repo: string, localPath: string): void {
   const token = ghGetOAuthToken();
-  const cloneUrl = token
+  // Project-only mode (c12 fork) stores no credential in the clone: the token
+  // authenticates this clone only, through a header in the child's environment,
+  // and later fetches and pushes use git's own credential setup.
+  const embed = Boolean(token) && !projectOnlyRequested();
+  const cloneUrl = embed
     ? `https://x-access-token:${token}@github.com/${repo}.git`
     : `https://github.com/${repo}.git`;
+  let env = process.env;
+  if (token && !embed) {
+    // Appended to any GIT_CONFIG_* entries the caller already passes.
+    const n = Number(process.env.GIT_CONFIG_COUNT ?? 0) || 0;
+    env = {
+      ...process.env,
+      GIT_CONFIG_COUNT: String(n + 1),
+      [`GIT_CONFIG_KEY_${n}`]: 'http.https://github.com/.extraHeader',
+      [`GIT_CONFIG_VALUE_${n}`]: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
+    };
+  }
 
   const result = spawnSync('git', ['clone', cloneUrl, localPath], {
     encoding: 'utf-8',
+    env,
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 120_000,
     windowsHide: true,

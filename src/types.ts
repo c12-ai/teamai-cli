@@ -2323,8 +2323,12 @@ export function scopedToolPaths(
  * host user.
  */
 export function isProjectOnly(localConfig: { scope?: Scope }): boolean {
-  return localConfig.scope === 'project'
-    && (process.env.TEAMAI_PROJECT_ONLY === '1' || process.env.TEAMAI_PROJECT_ONLY === 'true');
+  return localConfig.scope === 'project' && projectOnlyRequested();
+}
+
+/** `TEAMAI_PROJECT_ONLY` is set, for code that runs before a config exists (the init clone). */
+export function projectOnlyRequested(): boolean {
+  return process.env.TEAMAI_PROJECT_ONLY === '1' || process.env.TEAMAI_PROJECT_ONLY === 'true';
 }
 
 /**
