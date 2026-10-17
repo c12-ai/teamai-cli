@@ -1,12 +1,11 @@
 /**
- * E2E (#822 item 5): pull keeps a skill, rule or agent the member changed
- * since teamai delivered it, instead of overwriting it.
+ * E2E (#822 item 5, changed by the c12 fork): the team version always wins.
  *
  * Pull records the sha256 of the bytes it writes at each destination in the
  * checkout's record. A copy is edited when it has a record and no longer
- * matches it; it is kept and named, per tool, while the other tools' copies
- * update. A copy teamai has no record of (the first pull on this version) is
- * overwritten as before, and protected from then on.
+ * matches it; pull overwrites it with the team version and prints one
+ * "Overwrote local edits" warning per path. A copy of a resource the team
+ * removed is still kept when the member changed it.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
@@ -170,46 +169,41 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(read(cursorAgent())).toContain('Version two.');
   });
 
-  it('keeps an edited copy on a forced full sync of an unchanged team repo, and restores one the member deleted', async () => {
+  const overwroteWarning = (dest: string): string => `Overwrote local edits in ${dest} with the team version`;
+
+  it('overwrites an edited copy on a forced full sync of an unchanged team repo, and warns once', async () => {
     await pull();
     editClaudeCopies();
-    const agentEdit = read(claudeAgent());
 
     const output = await pull('--force');
 
-    expect(read(claudeScript())).toBe('echo mine\n');
-    expect(read(claudeRule())).toContain('My version.');
-    expect(read(claudeAgent())).toBe(agentEdit);
-    for (const kept of [claudeSkill(), claudeRule(), claudeAgent()]) {
-      expect(output).toContain(`Kept ${kept}: you changed it since teamai delivered it. Share it with \`teamai push\``);
-    }
-    expect(output).not.toContain('has changed since');
-
-    fs.rmSync(claudeSkill(), { recursive: true });
-    fs.rmSync(claudeRule());
-    const restored = await pull('--force');
     expect(read(claudeScript())).toBe('echo one\n');
     expect(read(claudeRule())).toContain('Version one.');
-    expect(restored).not.toContain(`Kept ${claudeSkill()}`);
-    expect(restored).not.toContain(`Kept ${claudeRule()}`);
-    expect(restored).toContain(`Kept ${claudeAgent()}`);
+    expect(read(claudeAgent())).not.toContain('My extra instruction.');
+    for (const replaced of [claudeSkill(), claudeRule(), claudeAgent()]) {
+      expect(output.split(overwroteWarning(replaced))).toHaveLength(2);
+    }
+    expect(output).not.toContain('Kept');
+
+    const again = await pull('--force');
+    expect(again).not.toContain('Overwrote local edits');
   });
 
-  it('keeps an edited copy the team changed since and warns, while the other tools\' copies update', async () => {
+  it('overwrites an edited copy the team changed since, while the other tools\' copies update', async () => {
     await pull();
     editClaudeCopies();
-    const agentEdit = read(claudeAgent());
     teamCommit(teamUpdatesAll);
 
     const output = await pull();
 
-    expect(read(claudeScript())).toBe('echo mine\n');
-    expect(read(claudeRule())).toContain('My version.');
-    expect(read(claudeAgent())).toBe(agentEdit);
-    expect(output).toContain(`Kept ${claudeSkill()}: you changed it, and the version teamai would deploy there (skills/team-skill) has changed since.`);
-    expect(output).toContain(`Kept ${claudeRule()}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
-    expect(output).toContain(`Kept ${claudeAgent()}: you changed it, and the version teamai would deploy there (agents/team-helper.yaml) has changed since.`);
-    // Per tool: the Cursor render of the same rule and agent is not the member's, so it updates.
+    expect(read(claudeScript())).toBe('echo two\n');
+    expect(read(claudeRule())).toContain('Version two.');
+    expect(read(claudeAgent())).toContain('Version two.');
+    expect(read(claudeAgent())).not.toContain('My extra instruction.');
+    for (const replaced of [claudeSkill(), claudeRule(), claudeAgent()]) {
+      expect(output).toContain(overwroteWarning(replaced));
+    }
+    expect(output).not.toContain(overwroteWarning(cursorRule()));
     expect(read(cursorRule())).toContain('Version two.');
     expect(read(cursorAgent())).toContain('Version two.');
     expect(read(cursorScript())).toBe('echo two\n');
@@ -224,12 +218,10 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     `The version teamai would deploy at ${dest} (${relPath}) has changed since it delivered that copy; pushing replaces that change unless you merged it.`
   );
 
-  it('warns at push about a kept copy the team changed since, after a silent pull kept it', async () => {
+  it('warns at push about an edited copy the team changed since, before a pull overwrites it', async () => {
     await pull();
     editClaudeCopies();
     teamCommit(teamUpdatesAll);
-    // The SessionStart pull: it keeps the copies and prints nothing.
-    await pull('--silent');
 
     const output = await pushDryRun();
 
@@ -246,12 +238,11 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
 
     // The review amends the member's change before it merges.
     teamCommit((repo) => fs.writeFileSync(path.join(repo, 'rules', 'team-rule.md'), '# Team rule\n\nMy version, amended.\n'));
-    await pull();
 
     expect(await pushDryRun()).toContain(teamChangedWarning('rules/team-rule.md', claudeRule()));
   });
 
-  it('names the copies --dry-run would keep and writes nothing', async () => {
+  it('names the copies --dry-run would overwrite and writes nothing', async () => {
     await pull();
     editClaudeCopies();
     teamCommit(teamUpdatesAll);
@@ -260,10 +251,10 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
 
     const output = await pull('--dry-run');
 
-    for (const kept of [claudeSkill(), claudeRule(), claudeAgent()]) {
-      expect(output).toContain(`[dry-run] Would keep ${kept}: you changed it since teamai delivered it.`);
+    for (const replaced of [claudeSkill(), claudeRule(), claudeAgent()]) {
+      expect(output).toContain(`[dry-run] Would overwrite local edits in ${replaced} with the team version.`);
     }
-    expect(output).not.toContain(`Would keep ${cursorRule()}`);
+    expect(output).not.toContain(`Would overwrite local edits in ${cursorRule()}`);
     expect(read(statePath())).toBe(stateBefore);
     expect(read(cursorRule())).toBe(cursorRuleBefore);
     expect(read(claudeScript())).toBe('echo mine\n');
@@ -311,7 +302,7 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(fs.existsSync(cursorRule())).toBe(false);
   });
 
-  it('keeps another worktree\'s record of what it delivered through a forced full sync', async () => {
+  it('keeps another worktree\'s record of what it delivered, so its edit is overwritten and named', async () => {
     await pull();
     const worktree = path.join(sandbox, 'wt');
     git(['worktree', 'add', '-q', worktree, '-b', 'wt'], projectRoot);
@@ -334,8 +325,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
 
     const output = await inWorktree();
 
-    expect(read(worktreeRule)).toContain('My version.');
-    expect(output).toContain(`Kept ${worktreeRule}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
+    expect(read(worktreeRule)).toContain('Version two.');
+    expect(output).toContain(overwroteWarning(worktreeRule));
   });
 
   // c12 fork: the team version replaces a same-named copy teamai has no record of.

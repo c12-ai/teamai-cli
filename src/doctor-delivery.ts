@@ -179,7 +179,7 @@ async function differingCopyLabel(
   const { judgeCopy, recordedUnchanged } = await import('./resources/delivered-copies.js');
   const previous = await deliveredHashes(localConfig);
   const verdict = await judgeCopy(previous, item, target);
-  if (verdict.kind === 'keep') return CHANGED_BY_YOU;
+  if (verdict.replaces === 'edited') return CHANGED_BY_YOU;
   return recordedLabel !== undefined && await recordedUnchanged(previous, target.dest) ? recordedLabel : olderLabel;
 }
 

@@ -1686,7 +1686,7 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     expect(Object.keys(ledger.hashes).filter((file) => file.endsWith('former.md'))).toEqual([]);
   });
 
-  it('re-renders a verbatim copy an older teamai delivered, and keeps one the member edited (#822)', async () => {
+  it('re-renders a verbatim copy an older teamai delivered, and overwrites one the member edited (#822)', async () => {
     const kiroCopy = path.join(homeDir, '.kiro/steering/scoped.md');
     const qoderCopy = path.join(homeDir, '.qoder/rules/scoped.md');
     await fse.writeFile(kiroCopy, SCOPED);
@@ -1701,8 +1701,8 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     await handler.pullAllRules(teamConfig, localConfig, undefined, [], ledger);
 
     expect(await fse.readFile(kiroCopy, 'utf-8')).toBe(KIRO);
-    expect(await fse.readFile(qoderCopy, 'utf-8')).toBe(edited);
-    expect(ledger.kept.map((kept) => kept.dest)).toEqual([qoderCopy]);
+    expect(await fse.readFile(qoderCopy, 'utf-8')).not.toBe(edited);
+    expect(ledger.replaced.map((replaced) => replaced.dest)).toEqual([qoderCopy]);
   });
 });
 

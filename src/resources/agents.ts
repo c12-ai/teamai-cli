@@ -15,7 +15,7 @@ import { loadStateForScope } from '../config.js';
 import { placedResourcePath } from '../push-namespaces.js';
 import { itemCandidate, resolveNamespacedItems, type NamespaceResolution } from '../namespace-resolver.js';
 import { getFileContentAtRev, getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
-import { keepsEditedCopy, recordDelivered, type DeliveryLedger } from './delivered-copies.js';
+import { replaceCopy, recordDelivered, type DeliveryLedger } from './delivered-copies.js';
 import { warnOnce } from '../utils/warn-once.js';
 import { TEAM_ALIASES_FILE, aliasWarningsFor, isModelAlias, loadModelAliases, localAliasesPath, resolveAgentModel, type ModelAliases, type ResolutionStep } from '../models/aliases.js';
 import {
@@ -729,7 +729,7 @@ export class AgentsHandler extends ResourceHandler {
     for (const { tool, dest, render } of renders) {
       const destDir = path.dirname(dest);
       try {
-        if (ledger && await keepsEditedCopy(ledger, item, { tool, dest, content: render.content })) continue;
+        if (ledger) await replaceCopy(ledger, item, { tool, dest, content: render.content });
         await ensureDir(destDir);
         // Only a rendered spec can leave a sibling behind: its extension follows
         // the tool's format and changes when `targets` does. A legacy `.md` is
@@ -861,9 +861,8 @@ export class AgentsHandler extends ResourceHandler {
    * - `model`: a tool's resolution differs from what `ledger` recorded for its
    *   copy. With no record, the copy was written by a CLI that recorded
    *   nothing and resolved no alias, so it differs only where this CLI
-   *   replaces the spec's `model`. A copy the member changed is kept and
-   *   queued on `ledger.kept`, so the pull names it and the step that takes
-   *   the new model.
+   *   replaces the spec's `model`. A copy the member changed is replaced
+   *   by the team version, and the pull names it.
    * - `missing`: no copy, as an agent held before it was ever delivered, or
    *   one the member deleted.
    * - `render`: no record, and the copy is still what teamai delivered but
@@ -895,7 +894,7 @@ export class AgentsHandler extends ResourceHandler {
             : render.model.replacesSpecModel ? 'model'
               : await deliveredAndOutdated(ledger, dest, render.content) ? 'render' : undefined;
         if (reason === undefined) continue;
-        if (reason === 'model' && await keepsEditedCopy(ledger, item, target)) continue;
+        if (reason === 'model') await replaceCopy(ledger, item, target);
         copies.push({ ...target, reason });
       }
       if (copies.length > 0) {

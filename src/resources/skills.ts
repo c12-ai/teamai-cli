@@ -16,7 +16,7 @@ import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../proje
 import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
 import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
-import { isProjectEntry, keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
+import { isProjectEntry, replaceCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -771,7 +771,7 @@ export class SkillsHandler extends ResourceHandler {
     for (const target of await this.resolveTargets(teamConfig, localConfig, item, item.sourcePath)) {
       const { tool, dest } = target;
       try {
-        if (ledger && await keepsEditedCopy(ledger, item, target)) continue;
+        if (ledger) await replaceCopy(ledger, item, target);
         await copyDir(item.sourcePath, dest);
         await removeLeftoverVersionFiles(item.sourcePath, dest, otherVersions, ledger?.previous);
         await ensureSkillFrontmatter(dest, item.name);

@@ -8,7 +8,6 @@ import { warnOnce } from '../utils/warn-once.js';
 import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveBaseDir, resolveToolBaseDir, resolveToolRootDir, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY, getUserConfigPath } from '../types.js';
 import { EXCLUDED_RULE_NAMES, isDeployedRecallRule, TEAMAI_CONTEXT_RULE_NAME } from '../builtin-rules.js';
 import { rulePaths, teamRuleBody, teamRuleData } from './team-rule.js';
-import { joycodeQuotedGlobsWarning } from './joycode-rule.js';
 import type { OpencodeRulesTarget } from './opencode-config.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
 import { loadStateForScope } from '../config.js';
@@ -16,7 +15,7 @@ import { placedResourcePath } from '../push-namespaces.js';
 import { deliversEveryNamespace } from '../resource-namespaces.js';
 import { getFileContentAtRev, isPastVersionOf, listFilesAtRev } from '../utils/git.js';
 import {
-  adoptRecord, contentHash, forgetDelivered, keepsEditedCopy, recordDelivered, recordedUnchanged, removedCopyChanged,
+  adoptRecord, contentHash, forgetDelivered, replaceCopy, recordDelivered, recordedUnchanged, removedCopyChanged,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
 import {
@@ -424,12 +423,9 @@ export class RulesHandler extends ResourceHandler {
             + 'Rename your file, then run `teamai pull --force`.');
           continue;
         }
-        if (!ledger || !await keepsEditedCopy(ledger, item, target)) {
-          await writeFile(dest, content);
-          if (ledger) await recordDelivered(ledger.hashes, dest);
-        } else {
-          await warnIfKeptCopyIsInert(target);
-        }
+        if (ledger) await replaceCopy(ledger, item, target);
+        await writeFile(dest, content);
+        if (ledger) await recordDelivered(ledger.hashes, dest);
         // Drop the `.md` copy left by an older layout; a tool that reads a
         // derived extension does not read it, and it would outlive the rule.
         const legacyCopy = path.join(destDir, `${path.basename(dest, path.extname(dest))}.md`);
@@ -466,8 +462,8 @@ export class RulesHandler extends ResourceHandler {
    * record, only a copy that is the team rule verbatim is rewritten. A copy
    * whose path changed (`movedFrom`, OMP's flat names) is written at the new
    * path while the old one is there. For the "Already synced" pull, which
-   * does not run `pullItem`. A copy the member changed is kept, and queued on
-   * `ledger.kept` to be named when teamai would now deliver other bytes there.
+   * does not run `pullItem`. A copy the member changed, whose render changed
+   * since delivery, is replaced by the team version and named on `ledger.replaced`.
    * Returns the names of the rules rewritten.
    */
   async rerenderOutdatedCopies(
@@ -502,12 +498,11 @@ export class RulesHandler extends ResourceHandler {
           const source = await readFileSafe(item.sourcePath);
           if (source === null || disk !== contentHash(source)) continue;
         } else if (disk !== recorded) {
-          // Named by the caller's reportKept; a render unchanged since
-          // delivery is the member's plain edit, which needs no word.
-          if (contentHash(content) !== recorded && await keepsEditedCopy(ledger, item, target)) {
-            await warnIfKeptCopyIsInert(target);
-          }
-          continue;
+          // A render unchanged since delivery is the member's plain edit,
+          // which this pass leaves for the full sync. Otherwise the team
+          // version replaces the edit, and the caller's reportKept names it.
+          if (contentHash(content) === recorded) continue;
+          await replaceCopy(ledger, item, target);
         }
         await writeFile(dest, content);
         await recordDelivered(ledger.hashes, dest);
@@ -1380,15 +1375,6 @@ function keptNestedCopyMessage(tool: string, file: string, name: string, flatCop
 async function isMembersOwnFile(file: string, content: string, ledger: DeliveryLedger | undefined): Promise<boolean> {
   const disk = await fileHash(file);
   return disk !== null && disk !== contentHash(content) && ledger?.previous?.[file] === undefined;
-}
-
-
-/** Say so when a copy pull kept as the member edited it is one the tool cannot apply (JoyCode's quoted globs). */
-async function warnIfKeptCopyIsInert(target: DeliveryTarget): Promise<void> {
-  if (target.tool !== 'joycode') return;
-  const copy = await readFileSafe(target.dest);
-  const warning = copy === null ? null : joycodeQuotedGlobsWarning(target.dest, copy);
-  if (warning) log.warn(warning);
 }
 
 /**

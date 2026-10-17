@@ -239,7 +239,7 @@ describe('CodeBuddy and WorkBuddy rules (#946)', () => {
       expect(warnings()[0]).not.toContain(migrated('mine.md'));
     });
 
-    it('keeps an edited copy of a rule still delivered, as an edit of the copy it came from (#822)', async () => {
+    it('overwrites an edited copy of a rule still delivered, as an edit of the copy it came from (#822)', async () => {
       const source = home('.codebuddy/rules/scoped.md');
       const edited = SCOPED.replace('named', 'my own');
       await fse.outputFile(migrated('scoped.md'), edited);
@@ -247,9 +247,10 @@ describe('CodeBuddy and WorkBuddy rules (#946)', () => {
 
       await handler.pullAllRules(teamConfig, localConfig, undefined, [], ledger);
 
-      expect(await fse.readFile(migrated('scoped.md'), 'utf8')).toBe(edited);
-      expect(ledger.kept.map(({ dest }) => dest)).toContain(migrated('scoped.md'));
-      expect(ledger.hashes[migrated('scoped.md')]).toBe(sha256(SCOPED));
+      const written = await fse.readFile(migrated('scoped.md'), 'utf8');
+      expect(written).not.toContain('my own');
+      expect(ledger.replaced.map(({ dest }) => dest)).toContain(migrated('scoped.md'));
+      expect(ledger.hashes[migrated('scoped.md')]).toBe(sha256(written));
     });
 
     it.each([

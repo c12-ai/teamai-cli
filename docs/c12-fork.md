@@ -13,9 +13,12 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    `Replaced <path> (a symlink | tracked by git | not delivered by teamai)
    with the team version <team path>`. A symlink is removed first, so its
    target is never written through. A copy teamai did deliver and the member
-   then edited is still kept (`Kept <path>`). Members' own entries must not
-   share a name with a team one. (`judgeCopy`, `keepsEditedCopy` and
-   `reportKept` in `src/resources/delivered-copies.ts`.)
+   then edited is overwritten the same way, with one warning per path:
+   `Overwrote local edits in <path> with the team version`. The team version
+   always wins, so a team update reaches every member. A copy of a resource
+   the team removed is still kept when the member changed it. Members' own
+   entries must not share a name with a team one. (`judgeCopy`,
+   `replaceCopy` and `reportKept` in `src/resources/delivered-copies.ts`.)
 2. **No removal of files teamai did not deliver.** The stale-rule sweep, the
    tombstone cleanup and `uninstall` remove a team-named copy only when the
    delivery record shows teamai wrote it. A copy the team version replaced is
