@@ -386,7 +386,7 @@ async function reportWouldKeep(
       const verdict = await judgeCopy(ledger.previous, item, target);
       if (verdict.kind === 'keep') {
         log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: `
-          + (verdict.foreign ? 'teamai did not deliver it.' : 'you changed it since teamai delivered it.'));
+          + (verdict.project ? 'it is a symlink or git tracks it.' : verdict.foreign ? 'teamai did not deliver it.' : 'you changed it since teamai delivered it.'));
       }
     }
   }

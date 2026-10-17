@@ -16,7 +16,7 @@ import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../proje
 import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
 import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
-import { keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
+import { isProjectEntry, keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -42,7 +42,7 @@ export async function resolveSkillDestination(
       // `doctor` and the post-pull pass would otherwise warn about a conflict
       // on every skill, for copies the write path treats as identical.
       if (!sourcePath) return sharedDestination;
-      if (await pathExists(configuredDestination)) {
+      if (await pathExists(configuredDestination) && !await isProjectEntry(configuredDestination)) {
         if (await dirContentEqual(sharedDestination, configuredDestination) && await dirContentEqual(configuredDestination, sourcePath)) {
           await remove(configuredDestination);
           log.debug(`Removed identical TeamAI skill ${skillName} from ${configuredSkillsPath}`);

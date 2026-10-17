@@ -6,6 +6,9 @@
 #   3. nothing reaches the teamai-reports branch without `usageReport: true`
 #   4. a user-scope install puts no git hook in the project repo
 #   5. `init --branch` tracks a non-default team branch (checkout, config, pull)
+#   6. project-only mode never replaces a project's symlinks (even dangling) or
+#      git-tracked files at a delivery destination
+#   7. a renamed team branch: pull names the fix, `init --branch <new>` follows it
 # Usage: scripts/c12/sandbox-trial.sh [empty-sandbox-dir]
 # Nothing outside the sandbox is written; no network remote is used.
 set -euo pipefail
@@ -188,6 +191,47 @@ check "re-init without --branch drops the saved branch" sh -c "! grep -q 'branch
 check "re-init without --branch returns the clone to main" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = main
 run branch-uninstall uninstall --force
 check "foreign files still untouched after the --branch uninstall" foreign_untouched
+
+# --- 6. Project-only mode keeps the project's symlinks and tracked files ------
+PROJECT_C="$SANDBOX/project-c"
+mkdir -p "$PROJECT_C/.agents/skills/tdd" "$PROJECT_C/.claude/skills" "$PROJECT_C/.claude/rules"
+cp "$TEAM_SRC/skills/tdd/SKILL.md" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
+ln -s ../../.agents/skills/tdd "$PROJECT_C/.claude/skills/tdd"
+ln -s ../../no-such-skill "$PROJECT_C/.claude/skills/grill-me"
+cp "$TEAM_SRC/rules/team-rule.md" "$PROJECT_C/.claude/rules/team-rule.md"
+git -C "$PROJECT_C" init -q
+git -C "$PROJECT_C" add -A
+git -C "$PROJECT_C" commit -q -m "project with linked skills"
+cd "$PROJECT_C"
+TEAMAI_PROJECT_ONLY=1 run po-init init "$TEAM_URL" --provider git --agent claude,codex
+TEAMAI_PROJECT_ONLY=1 run po-pull pull --force
+echo "== project-only: the project's symlinks and tracked files =="
+check "team-only skill delivered (positive control)" test -f "$PROJECT_C/.claude/skills/team-only/SKILL.md"
+check "no tracked file changed or deleted" test -z "$(git -C "$PROJECT_C" status --porcelain --untracked-files=no)"
+check "linked skill is still the project's symlink" test "$(readlink "$PROJECT_C/.claude/skills/tdd")" = ../../.agents/skills/tdd
+check "dangling skill symlink kept" test "$(readlink "$PROJECT_C/.claude/skills/grill-me")" = ../../no-such-skill
+check "pull names each kept project entry" grep -q "it is a symlink or git tracks it" "$SANDBOX/logs/po-pull.log"
+TEAMAI_PROJECT_ONLY=1 run po-uninstall uninstall --force
+check "uninstall leaves tracked files and symlinks" test -z "$(git -C "$PROJECT_C" status --porcelain --untracked-files=no)"
+
+# --- 7. A renamed team branch -------------------------------------------------
+cd "$PROJECT"
+run rename-init init "$TEAM_URL" --provider git --scope user --agent claude --branch trial-branch --force
+git --git-dir="$BARE" branch -m trial-branch trial-renamed
+mkdir -p "$TEAM_SRC/skills/after-rename"
+printf -- '---\nname: after-rename\ndescription: After rename\n---\nOn trial-renamed.\n' > "$TEAM_SRC/skills/after-rename/SKILL.md"
+git -C "$TEAM_SRC" add -A
+git -C "$TEAM_SRC" commit -q -m "after rename"
+git -C "$TEAM_SRC" push -q origin trial-branch:trial-renamed
+echo "== renamed team branch =="
+run rename-pull pull --force || true
+check "pull names the renamed branch and the fix" grep -q "no branch trial-branch: it was renamed or deleted" "$SANDBOX/logs/rename-pull.log"
+run rename-follow init "$TEAM_URL" --provider git --scope user --agent claude --branch trial-renamed --force
+check "init --branch follows the new name" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = trial-renamed
+check "the renamed branch's new skill delivered" test -f "$HOME/.claude/skills/after-rename/SKILL.md"
+run rename-pull-after pull --force
+check "foreign files still untouched after the rename" foreign_untouched
+run rename-uninstall uninstall --force
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "ALL CHECKS PASSED (logs: $SANDBOX/logs)"; else echo "$FAILS CHECK(S) FAILED (logs: $SANDBOX/logs)"; exit 1; fi

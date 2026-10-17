@@ -43,6 +43,22 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    fetches use git's own credentials. teamai's own state
    still lives under HOME (`~/.teamai`), so point HOME somewhere private to the
    container. (`isProjectOnly` in `src/types.ts`.)
+7. **A project's symlinks and tracked files are never replaced.** In every
+   scope, pull leaves a delivery destination that is a symlink (even a
+   dangling one) or that git tracks (the path or any file under it) as it is,
+   whatever it holds, and warns `Skipped <path>: it is a symlink or git tracks
+   it`. A repo that commits `.claude/skills/<name>` as a link to its own
+   `.agents/skills/<name>` keeps it. The Codex duplicate cleanup never removes
+   such an entry either. (`isProjectEntry` in `src/resources/delivered-copies.ts`.)
+8. **Team clone refresh without `git pull`.** Pull and init fetch only the
+   checked-out branch's upstream (origin/<branch> without one) by explicit
+   refspec and fast-forward to that ref by name. `git pull` merges whatever
+   FETCH_HEAD lists, and two teamai processes fetching one clone at once left
+   it listing the branch twice: "Cannot fast-forward to multiple branches". A
+   fetch refused because a concurrent one moved the ref is retried once. A
+   branch the remote no longer has (renamed or deleted) fails with
+   `The team repo has no branch <name>: it was renamed or deleted` and the
+   `init --branch <new name> --force` fix. (`fastForward` in `src/utils/git.ts`.)
 
 ## Checks
 
