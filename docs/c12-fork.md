@@ -51,7 +51,11 @@ manage `~/.claude` and `~/.codex`. Releases are tagged `c12-v<upstream>-<n>`.
    authenticates the clone only (a header in the child's environment) and later
    fetches use git's own credentials. teamai's own state
    still lives under HOME (`~/.teamai`), so point HOME somewhere private to the
-   container. (`isProjectOnly` in `src/types.ts`.)
+   container. A launcher that also points `CODEX_HOME` somewhere private to
+   teamai sets `TEAMAI_MEMBER_CODEX_HOME` to the Codex home the member's Codex
+   reads; doctor's Codex project trust check reads that `config.toml` (read
+   only) instead of teamai's own. (`isProjectOnly` in `src/types.ts`,
+   `buildCodexProjectTrustCheck` in `src/doctor-delivery.ts`.)
 7. **Codex duplicate cleanup spares symlinks.** The cleanup of an identical
    duplicate in the configured Codex skills path never removes a symlink or a
    git-tracked entry. (`isProjectEntry` in `src/resources/delivered-copies.ts`.)

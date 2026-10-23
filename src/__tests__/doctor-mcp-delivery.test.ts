@@ -988,6 +988,31 @@ describe('doctor — MCP servers delivered on disk', () => {
       expect(check?.fix).toContain(altConfig);
     });
 
+    describe('in project-only mode (c12 fork)', () => {
+      afterEach(() => {
+        delete process.env.TEAMAI_PROJECT_ONLY;
+        delete process.env.TEAMAI_MEMBER_CODEX_HOME;
+      });
+
+      it('reads the member\'s Codex home, not teamai\'s private one', async () => {
+        // teamai's recorded root has no trust entry; the member's Codex trusts the project.
+        Object.assign(localConfig, { toolRoots: { codex: path.join(homeDir, '.teamai-codex') } });
+        await writeCodexConfig(trusted(await fse.realpath(projectRoot)), '.member-codex');
+        process.env.TEAMAI_PROJECT_ONLY = '1';
+        process.env.TEAMAI_MEMBER_CODEX_HOME = path.join(homeDir, '.member-codex');
+
+        expect(await (await trustCheck())?.check()).toBe(true);
+      });
+
+      it('ignores the member\'s Codex home outside project-only mode', async () => {
+        Object.assign(localConfig, { toolRoots: { codex: path.join(homeDir, '.teamai-codex') } });
+        await writeCodexConfig(trusted(await fse.realpath(projectRoot)), '.member-codex');
+        process.env.TEAMAI_MEMBER_CODEX_HOME = path.join(homeDir, '.member-codex');
+
+        expect(await (await trustCheck())?.check()).toBe(false);
+      });
+    });
+
     it('fails with the parse error when the Codex config does not parse', async () => {
       const codexConfig = await writeCodexConfig('[projects\n');
 

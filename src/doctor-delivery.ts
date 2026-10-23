@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe, readJsonObject } from './utils/fs.js';
 import {
-  CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, managedMcpManifestKey, resolveToolBaseDir,
-  resolveToolRootDir, scopedToolPaths,
+  CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, isProjectOnly, managedMcpManifestKey,
+  resolveToolBaseDir, resolveToolRootDir, scopedToolPaths,
 } from './types.js';
 import type { DeliveryTarget, LocalConfig, ManagedMcpManifest, ResourceItem, TeamaiConfig } from './types.js';
 import type { EntryLayout, EntryResolution } from './namespaced-entries.js';
@@ -909,7 +909,11 @@ export async function buildCodexProjectTrustCheck(ctx: DoctorContext): Promise<C
   const anchors = await resolveAnchors(projectRoot);
   const main = anchors?.projectAnchor ?? root;
   const dirs = [...new Set([root, anchors?.workspaceRoot ?? root, main])];
-  const configFile = path.join(resolveToolRootDir(CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, localConfig.toolRoots), 'config.toml');
+  // Project-only mode (c12 fork): teamai's own CODEX_HOME is private to it, so
+  // the launcher names the Codex home the member's Codex reads.
+  const memberCodexHome = isProjectOnly(localConfig) ? process.env.TEAMAI_MEMBER_CODEX_HOME : undefined;
+  const codexRoot = memberCodexHome || resolveToolRootDir(CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, localConfig.toolRoots);
+  const configFile = path.join(codexRoot, 'config.toml');
   const trust = await codexProjectTrust(configFile, dirs);
   const cause = `${target.file} holds team MCP servers (${nameList(names)}), but Codex loads a project's `
     + '.codex/config.toml only in a trusted project';
