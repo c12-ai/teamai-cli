@@ -11,15 +11,20 @@
 import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
-import { createGit, getDefaultBranch, getHeadCommit, hasCommits } from './git.js';
+import { assertAttachedTeamRepo, createGit, getDefaultBranch, getHeadCommit, hasCommits } from './git.js';
 import { pathExists } from './fs.js';
 import { log } from './logger.js';
 import {
   ForeignCheckoutError,
   createBranchWorktree,
+  failureReason,
+  fetchTrackingRef,
   isPublished,
+  type BranchPushOptions,
   type BranchWrite,
+  type BranchWriteContext,
   type EnsureWorktreeOptions,
+  type PublishResult,
   type RefreshResult,
 } from './branch-worktree.js';
 import {
@@ -28,10 +33,11 @@ import {
   REPORTS_LOCK_FILENAME,
   KNOWLEDGE_WORKTREE_DIRNAME,
   getBusinessRoot,
+  getDataHome,
   type LocalConfig,
 } from '../types.js';
 
-const reportsBranch = createBranchWorktree({
+export const reportsBranch = createBranchWorktree({
   branch: REPORTS_BRANCH,
   worktreeDirname: REPORTS_WORKTREE_DIRNAME,
   lockFilename: REPORTS_LOCK_FILENAME,
@@ -41,6 +47,8 @@ const reportsBranch = createBranchWorktree({
 
 export type EnsureReportsWorktreeOptions = EnsureWorktreeOptions;
 export type ReportsWrite = BranchWrite;
+export type ReportsWriteContext = BranchWriteContext;
+export type ReportsPublishResult = PublishResult;
 
 /** Materialize the reports worktree. See the branch-worktree module. */
 export function ensureReportsWorktree(
@@ -126,37 +134,85 @@ export async function commitAndPushReports(
   localConfig: LocalConfig,
   message: string,
   files: string[],
-  options: { pushIfUnchanged?: boolean } = {},
+  options: BranchPushOptions = {},
 ): Promise<boolean> {
-  if (!await reportsEnabled(localConfig)) return false;
   return isPublished(await reportsBranch.commitAndPush(localConfig, message, files, options));
 }
 
-/** Under the reports lock: sync with origin, run `write`, commit, push. */
-export async function updateReports(
-  localConfig: LocalConfig,
-  write: (worktree: string) => Promise<ReportsWrite | null>,
-  options: { pushIfUnchanged?: boolean } = {},
-): Promise<boolean> {
-  if (!await reportsEnabled(localConfig)) {
-    log.debug('reports: not written, the team repo does not set `usageReport: true`');
-    return false;
+/**
+ * A file's content at the reports branch's remote-tracking ref, or null when
+ * the branch (or that file) is not on origin yet.
+ *
+ * A writer calls this inside its `updateReports` write callback: `syncWorktree`
+ * has just fetched the ref by then, so the content is the last state origin
+ * confirmed — the correct merge base for a retry-safe write (#1027), unlike
+ * the worktree copy, which may already hold this machine's own
+ * merged-but-unpushed result.
+ */
+export async function readReportsOriginFile(
+  worktree: string,
+  relPath: string,
+): Promise<string | null> {
+  try {
+    const git = createGit(worktree);
+    return await git.raw(['show', `origin/${REPORTS_BRANCH}:${relPath}`]);
+  } catch {
+    return null;
   }
-  return isPublished(await reportsBranch.update(localConfig, write, options));
+}
+
+/** A reports file as origin holds it now. */
+export type ReportsOriginRead =
+  | { status: 'found'; text: string }
+  | { status: 'absent' }
+  | { status: 'unreachable'; reason: string };
+
+/**
+ * A file on origin's reports branch, fetched first so a failed fetch reads as `unreachable`, never as a missing file the
+ * way {@link readReportsOriginFile} would. `dir` is a checkout of the repository the branch lives in.
+ */
+export async function fetchReportsOriginFile(dir: string, relPath: string): Promise<ReportsOriginRead> {
+  const git = createGit(dir);
+  try {
+    const heads = await git.listRemote(['--heads', 'origin', REPORTS_BRANCH]);
+    if (heads.trim() === '') return { status: 'absent' };
+    await fetchTrackingRef(git, REPORTS_BRANCH);
+  } catch (e) {
+    return { status: 'unreachable', reason: failureReason(e) };
+  }
+  const text = await readReportsOriginFile(dir, relPath);
+  return text === null ? { status: 'absent' } : { status: 'found', text };
+}
+
+/** What an `updateReports` write decided: a value for its caller, and the files to commit, or null for none. */
+export interface ReportsChange<T> {
+  value: T;
+  write: ReportsWrite | null;
 }
 
 /**
- * Whether the team repo opts in to reports: `usageReport: true` in its
- * teamai.yaml. Without it nothing is committed to or pushed on the reports
- * branch, member registration included (c12 fork).
+ * Under the reports lock: sync with origin, run `write`, commit, push.
+ *
+ * Returns the full publish outcome, so a caller that holds the only durable
+ * copy of what it wrote can drop it exactly on delivery (`isDelivered`) and
+ * keep it on `busy`/`failed` (#1027); callers that only need "did the write
+ * land" wrap with `isPublished`, as before. A `write` that returns a
+ * {@link ReportsChange} gets its `value` back on the outcome; the outcome has
+ * no value when `write` did not run.
  */
-async function reportsEnabled(localConfig: LocalConfig): Promise<boolean> {
-  const { loadTeamConfig } = await import('../config.js');
-  try {
-    return (await loadTeamConfig(localConfig.repo.localPath))?.usageReport === true;
-  } catch {
-    return false;
-  }
+export async function updateReports<T = never>(
+  localConfig: LocalConfig,
+  write: (worktree: string, ctx: ReportsWriteContext) => Promise<ReportsWrite | ReportsChange<T> | null>,
+  options: BranchPushOptions & EnsureReportsWorktreeOptions = {},
+): Promise<PublishResult & { value?: T }> {
+  const held: { change?: { value: T } } = {};
+  const result = await reportsBranch.update(localConfig, async (worktree, ctx) => {
+    const change = await write(worktree, ctx);
+    if (change === null || !('value' in change)) return change;
+    held.change = { value: change.value };
+    return change.write;
+  }, options);
+  return held.change ? { ...result, value: held.change.value } : result;
 }
 
 /**
@@ -175,23 +231,26 @@ export class EmptyRepoError extends Error {
 }
 
 /**
- * Run `fn` against a disposable knowledge worktree for single-repo mode.
+ * Run `fn` against a disposable knowledge worktree.
  *
  * Knowledge PRs (skills/rules/docs/learnings → main) must never run `checkout -b`
  * / `reset --hard` on the user's active working tree. This checks out a fresh,
- * detached worktree at origin/<default> under .teamai/knowledge-wt, passes fn a
- * clone of localConfig whose repo.localPath points at <wt>/.teamai (so all the
- * existing push/remove/roles machinery operates on the worktree), then removes
- * the worktree afterward. The user's active branch and working tree are untouched.
+ * detached worktree at origin/<default>, under .teamai in self mode or the data
+ * home for a separate team repo. In self mode, repo.localPath points at
+ * <wt>/.teamai; otherwise it points at <wt>. The worktree is removed afterward.
+ * The active checkout stays untouched.
+ * Callers publishing new knowledge can require a successful fetch of the base.
  *
  * @returns whatever fn returns.
  */
 export async function withKnowledgeWorktree<T>(
   localConfig: LocalConfig,
   fn: (worktreeConfig: LocalConfig) => Promise<T>,
+  options: { requireFreshBase?: boolean } = {},
 ): Promise<T> {
-  const repoRoot = getBusinessRoot(localConfig);
-  const wt = path.join(localConfig.repo.localPath, KNOWLEDGE_WORKTREE_DIRNAME);
+  const selfMode = localConfig.repo.kind === 'self';
+  const repoRoot = selfMode ? getBusinessRoot(localConfig) : localConfig.repo.localPath;
+  const wt = path.join(selfMode ? localConfig.repo.localPath : getDataHome(localConfig), KNOWLEDGE_WORKTREE_DIRNAME);
   const git = createGit(repoRoot);
 
   // A knowledge worktree must branch off a base commit. A freshly `git init`'d
@@ -220,7 +279,8 @@ export async function withKnowledgeWorktree<T>(
   const defaultBranch = await getDefaultBranch(repoRoot);
   try {
     await git.fetch(['origin', defaultBranch]);
-  } catch {
+  } catch (error) {
+    if (options.requireFreshBase) throw error;
     // offline / no remote — fall back to local default branch state
   }
 
@@ -229,7 +289,8 @@ export async function withKnowledgeWorktree<T>(
   let base = `origin/${defaultBranch}`;
   try {
     await git.raw(['worktree', 'add', '--detach', wt, base]);
-  } catch {
+  } catch (error) {
+    if (options.requireFreshBase) throw error;
     // origin/<default> may not exist locally (fresh repo); fall back to HEAD.
     base = 'HEAD';
     await git.raw(['worktree', 'add', '--detach', wt, base]);
@@ -239,8 +300,8 @@ export async function withKnowledgeWorktree<T>(
     ...localConfig,
     repo: {
       ...localConfig.repo,
-      localPath: path.join(wt, '.teamai'),
-      businessRepoRoot: wt,
+      localPath: selfMode ? path.join(wt, '.teamai') : wt,
+      ...(selfMode ? { businessRepoRoot: wt } : {}),
     },
   };
 
@@ -290,6 +351,7 @@ export async function withDefaultBranchPreview<T>(
   const selfMode = localConfig.repo.kind === 'self';
   const repoRoot = selfMode ? getBusinessRoot(localConfig) : localConfig.repo.localPath;
   const git = createGit(repoRoot);
+  if (!selfMode) await assertAttachedTeamRepo(git, repoRoot);
   // A successful clone pull may preserve dirty manifests/resources. Do not
   // silently replace that view with origin; self mode really reads a worktree.
   if (!selfMode && (await git.raw(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all'])).trim()) {

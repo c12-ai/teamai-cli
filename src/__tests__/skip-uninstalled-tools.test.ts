@@ -516,32 +516,6 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
     expect(await fse.pathExists(path.join(homeDir, '.claude'))).toBe(true);
   });
 
-  it('uses the default home when no local config is available', async () => {
-    const { deployBuiltinSkills } = await import('../builtin-skills.js');
-    const teamConfig = {
-      team: 'test',
-      description: '',
-      repo: 'https://git.woa.com/test/repo.git',
-      provider: 'tgit' as const,
-      reviewers: [],
-      sharing: {
-        skills: {},
-        rules: { enforced: [] },
-        docs: { localDir: '' },
-        env: { injectShellProfile: true },
-      },
-      toolPaths: { claude: { skills: '.claude/skills' } },
-    };
-
-    const deployed = await deployBuiltinSkills(teamConfig);
-
-    expect(deployed).toBeGreaterThan(0);
-    expect(await fse.pathExists(path.join(
-      homeDir,
-      '.claude/skills/teamai/SKILL.md',
-    ))).toBe(true);
-  });
-
   it('deploys the discovery stub only, never the packaged content', async () => {
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
 
@@ -884,6 +858,27 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
     expect(deployed).toBe(0);
     expect(await fse.readFile(path.join(target, 'skills/team-wiki-codebase/SKILL.md'), 'utf8')).toBe(WIKI_SKILL);
     expect(await fse.pathExists(path.join(target, 'skills/teamai'))).toBe(false);
+  });
+
+  it('does not prune through a linked COPILOT_HOME when its skills path is nested', async () => {
+    const { deployBuiltinSkills } = await import('../builtin-skills.js');
+
+    const target = path.join(tmpDir, 'dotfiles/copilot');
+    const copilotHome = path.join(tmpDir, 'linked-copilot-home');
+    await fse.ensureDir(path.join(target, 'nested/skills/team-wiki-codebase'));
+    const legacySkill = path.join(target, 'nested/skills/team-wiki-codebase/SKILL.md');
+    await fse.writeFile(legacySkill, WIKI_SKILL);
+    await fse.symlink(target, copilotHome, 'dir');
+    vi.stubEnv('COPILOT_HOME', copilotHome);
+
+    const deployed = await deployBuiltinSkills(
+      legacyPruneTeamConfig({ copilot: { skills: '.github/skills', userScope: { skills: 'nested/skills' } } }),
+      legacyPruneLocalConfig(tmpDir),
+    );
+
+    expect(deployed).toBe(0);
+    expect(await fse.readFile(legacySkill, 'utf8')).toBe(WIKI_SKILL);
+    expect(await fse.pathExists(path.join(target, 'nested/skills/teamai'))).toBe(false);
   });
 
   it('keeps a skill of the member\'s that only shares a packaged name, whatever its paths', async () => {

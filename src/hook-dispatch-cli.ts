@@ -30,6 +30,9 @@ import { log, setSilent, setStderrOnly } from './utils/logger.js';
 import { clearGitHookRepositoryEnv, GIT_HOOK_TOOL } from './git-hook.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
 import { claudeHookRunsInAnotherHost } from './claude-hook-host.js';
+import { claimCopilotHookEvent } from './copilot-hook-claim.js';
+import { launchedBy, SESSION_RUN_PAYLOAD_KEY, sessionRun } from './launch-context.js';
+import { isSelfMode } from './types.js';
 
 export { claudeHookRunsInAnotherHost };
 
@@ -415,11 +418,12 @@ export async function hookDispatchCli(
   event: string,
   tool: string,
   matcher: string,
-  options: { bgOnly?: boolean; stdinFile?: string; hookArgs?: string[] } = {},
+  options: { bgOnly?: boolean; copilotGlobal?: string; stdinFile?: string; hookArgs?: string[] } = {},
 ): Promise<void> {
+  if (launchedBy(process.env) === 'scorer') return;
   const { bgOnly = false, stdinFile } = options;
   setStderrOnly(true);
-  if (claudeHookRunsInAnotherHost(tool)) {
+  if (claudeHookRunsInAnotherHost(tool, process.env, false)) {
     log.debug('hook-dispatch: skipping claude hooks because Cursor or Copilot CLI has its own teamai hooks');
     return;
   }
@@ -437,6 +441,20 @@ export async function hookDispatchCli(
       : fromGit ? JSON.stringify({ cwd: process.cwd(), git_args: options.hookArgs ?? [] })
         : await readStdin();
     const stdin = parseStdin(raw, event);
+
+    // Dynamic imports and handlers may resolve paths through process.cwd().
+    // A removed worktree has no usable process cwd. Preserve a supplied payload
+    // cwd; recover an omitted one from session history before using a live directory.
+    try {
+      process.cwd();
+    } catch {
+      process.chdir(os.tmpdir());
+      if (!resolveHookCwd(stdin)) {
+        const { recordedHookCwd } = await import('./dashboard-collector.js');
+        const previousCwd = await recordedHookCwd(stdin, tool);
+        if (previousCwd) stdin.cwd = previousCwd;
+      }
+    }
 
     // Config gates: a directory without teamai runs no team handlers (#748), and
     // HTTP-only teams must not receive git-provider-only hook prompts
@@ -463,6 +481,21 @@ export async function hookDispatchCli(
       }
     }
     const localConfig = await resolveHookConfig(stdin, tool);
+    // A self project's overrides and local hooks remain authoritative where
+    // Copilot loaded them, so the global built-ins step aside there.
+    const copilotProject = process.env.COPILOT_PROJECT_DIR?.trim();
+    const selfRoot = localConfig?.scope === 'project' && isSelfMode(localConfig) ? localConfig.projectRoot : undefined;
+    const selfCopilotCopyLoaded = !!selfRoot && (!copilotProject || await import('./hooks.js')
+      .then(({ canonicalProjectRoot }) => canonicalProjectRoot(copilotProject) === canonicalProjectRoot(selfRoot)));
+    // Where the global copy steps aside, it is no replacement for the local Claude copy.
+    if (claudeHookRunsInAnotherHost(tool, process.env, !selfCopilotCopyLoaded)) return;
+    if (!bgOnly && tool === 'copilot') {
+      if (options.copilotGlobal && selfCopilotCopyLoaded) return;
+      const { copilotBuiltinDisabled, copilotBuiltinInstalled } = await import('./hooks.js');
+      if (!await copilotBuiltinInstalled(event, matcher, options.copilotGlobal ? null : localConfig)) return;
+      if (await copilotBuiltinDisabled(localConfig, event, matcher)) return;
+      if (!claimCopilotHookEvent(event, matcher, raw)) return;
+    }
     const handlers = filterHandlersForConfig(buildHandlerRegistry(), localConfig);
     const dispatcher = createDispatcher({ handlers, localConfig });
 
@@ -471,6 +504,22 @@ export async function hookDispatchCli(
     if (bgOnly) {
       await runDispatch(dispatcher, event, matcher, stdin, tool, 'background');
       return;
+    }
+
+    // The session's mode and launcher, resolved once here: background passes read them from the payload, never from their
+    // own environment, which a child started through WMI does not inherit.
+    stdin[SESSION_RUN_PAYLOAD_KEY] = sessionRun(process.env);
+
+    // What the session starts as, read before the detached pull can deliver a new revision into the checkout (#1178),
+    // with the one git state the dashboard's session_start event records too.
+    if (event === 'session-start' && localConfig) {
+      const { GIT_AT_START_PAYLOAD_KEY, readGitStateAtStart } = await import('./dashboard-collector.js');
+      if (cwd) stdin[GIT_AT_START_PAYLOAD_KEY] = await readGitStateAtStart(cwd);
+      else delete stdin[GIT_AT_START_PAYLOAD_KEY];
+      const { CAPTURE_PAYLOAD_KEY, SessionCaptures } = await import('./session-flow/captures.js');
+      const captureId = await SessionCaptures.atStart(localConfig, tool, stdin, process.env);
+      if (captureId) stdin[CAPTURE_PAYLOAD_KEY] = captureId;
+      else delete stdin[CAPTURE_PAYLOAD_KEY];
     }
 
     // Parent: kick off background handlers in a detached process first so they
@@ -483,6 +532,12 @@ export async function hookDispatchCli(
       if (typeof stdin.session_id !== 'string' || !stdin.session_id) {
         stdin.session_id = deriveDispatchSessionId(stdin, tool);
       }
+      // The background pass reads a workflow launch from the payload, never from its own environment, which a child
+      // started through WMI does not inherit. Only this process's environment can set it (#1176).
+      const { LAUNCH_PAYLOAD_KEY, launchEnv, readLaunch } = await import('./launch-context.js');
+      const launch = readLaunch(process.env);
+      if (launch) stdin[LAUNCH_PAYLOAD_KEY] = launchEnv(launch);
+      else delete stdin[LAUNCH_PAYLOAD_KEY];
       settling = spawnBackground(event, tool, matcher, JSON.stringify(stdin), cwd);
     }
 

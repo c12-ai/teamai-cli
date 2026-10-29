@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import type { LocalConfig } from '../types.js';
 
 const { mockSpawn, mockDispatcher } = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
@@ -23,8 +24,10 @@ vi.mock('node:child_process', async (importOriginal) => ({
 
 const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost } =
   await import('../hook-dispatch-cli.js');
-const { CLAUDE_HOOK_OTHER_HOST_SKIP } = await import('../claude-hook-host.js');
+const { claudeHookOtherHostSkip } = await import('../claude-hook-host.js');
+const { reconcileHooks } = await import('../hooks.js');
 const { log } = await import('../utils/logger.js');
+const { commitFile, initRepo, recordDelivery } = await import('./helpers/delivered-checkout.js');
 
 describe('readStdin', () => {
   it('closes a pipe after the EOF timeout so the hook process can exit', async () => {
@@ -57,6 +60,17 @@ describe('deriveDispatchSessionId', () => {
 });
 
 describe('hookDispatchCli', () => {
+  it('skips scorer hooks before reading stdin or resolving config, including background children', async () => {
+    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookConfig');
+    const readFile = vi.spyOn(fs, 'readFileSync');
+    vi.stubEnv('TEAMAI_LAUNCHED_BY', 'scorer');
+    try {
+      for (const bgOnly of [false, true]) await hookDispatchCli('SessionStart', 'claude', '*', { bgOnly, stdinFile: '/missing-judge-payload' });
+      expect(resolveConfig).not.toHaveBeenCalled();
+      expect(readFile).not.toHaveBeenCalledWith('/missing-judge-payload', expect.anything());
+    } finally { resolveConfig.mockRestore(); readFile.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
   it('records why a Git hook cannot sync an unreadable project config, without dispatching', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-broken-config-'));
     const previousCwd = process.cwd();
@@ -88,7 +102,7 @@ describe('hookDispatchCli', () => {
     const copilotHooks = path.join(project, '.github', 'hooks', 'teamai.json');
     fs.writeFileSync(cursorHooks, '{"hooks":{"stop":[{"command":"teamai hook-dispatch stop --tool cursor"}]}}');
     fs.writeFileSync(projectCursorHooks, '{"hooks":{"stop":[{"command":"teamai hook-dispatch stop --tool cursor"}]}}');
-    fs.writeFileSync(copilotHooks, '{"hooks":{"sessionStart":[{"bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+    fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
 
     const bare = path.join(root, 'bare-home');
     fs.mkdirSync(bare);
@@ -101,23 +115,41 @@ describe('hookDispatchCli', () => {
     expect(claudeHookRunsInAnotherHost('claude', { COPILOT_PROJECT_DIR: project, HOME: home })).toBe(true);
     fs.writeFileSync(copilotHooks, '{}');
     expect(claudeHookRunsInAnotherHost('claude', { COPILOT_PROJECT_DIR: project })).toBe(false);
-    fs.writeFileSync(copilotHooks, '{"hooks":{"sessionStart":[{"bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+    fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
     expect(claudeHookRunsInAnotherHost('claude', {})).toBe(false);
     expect(claudeHookRunsInAnotherHost('claude', { CURSOR_VERSION: '', COPILOT_PROJECT_DIR: '', HOME: home })).toBe(false);
     expect(claudeHookRunsInAnotherHost('cursor', { CURSOR_VERSION: '1.2.3', HOME: home })).toBe(false);
     expect(claudeHookRunsInAnotherHost('copilot', { COPILOT_PROJECT_DIR: project })).toBe(false);
 
-    const runPrefix = (extra: NodeJS.ProcessEnv): string => execFileSync(
+    const runPrefix = (extra: NodeJS.ProcessEnv, event?: string, matcher?: string): string => execFileSync(
       'sh',
-      ['-c', `${CLAUDE_HOOK_OTHER_HOST_SKIP}echo RAN`],
+      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN')}echo RAN`],
       { env: { PATH: process.env.PATH ?? '', HOME: bare, ...extra }, encoding: 'utf8' },
     );
-    expect(runPrefix({ CURSOR_VERSION: '1.2.3' })).toBe('RAN\n');
-    expect(runPrefix({ CURSOR_VERSION: '1.2.3', HOME: home })).toBe('');
-    expect(runPrefix({ CURSOR_VERSION: '1.2.3', CURSOR_PROJECT_DIR: project })).toBe('');
-    expect(runPrefix({ COPILOT_PROJECT_DIR: project })).toBe('');
-    expect(runPrefix({ COPILOT_CLI: '1' })).toBe('RAN\n');
-    expect(runPrefix({})).toBe('RAN\n');
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3' }, 'Stop')).toBe('RAN\n');
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3', HOME: home }, 'Stop')).toBe('');
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3', CURSOR_PROJECT_DIR: project }, 'Stop')).toBe('');
+    // Copilot runs the team command itself only when the project's hook file delivers it.
+    expect(runPrefix({ COPILOT_PROJECT_DIR: project }, 'Stop')).toBe('RAN\n');
+    const builtinCopilotHooks = fs.readFileSync(copilotHooks, 'utf8');
+    // Only the same command for the same Copilot event and matcher replaces the Claude copy.
+    const rows: Array<[string | undefined, string | undefined, string, string]> = [
+      ['Stop', undefined, '{"Stop":[{"type":"command","bash":"echo RAN"}]}', ''],
+      ['Stop', '*', '{"Stop":[{"type":"command","command":"echo RAN"}]}', ''],
+      ['Stop', undefined, '{"SessionStart":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+      ['Stop', undefined, '{"Stop":[{"type":"command","bash":"echo RAN","matcher":"Bash"}]}', 'RAN\n'],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN","matcher":"Bash"}]}', ''],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN","matcher":"Edit"}]}', 'RAN\n'],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+      [undefined, undefined, '{"Stop":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+    ];
+    for (const [event, matcher, hooks, output] of rows) {
+      fs.writeFileSync(copilotHooks, `{"version":1,"hooks":${hooks}}`);
+      expect(runPrefix({ COPILOT_PROJECT_DIR: project }, event, matcher), `${event} ${matcher} ${hooks}`).toBe(output);
+    }
+    fs.writeFileSync(copilotHooks, builtinCopilotHooks);
+    expect(runPrefix({ COPILOT_CLI: '1' }, 'Stop')).toBe('RAN\n');
+    expect(runPrefix({}, 'Stop')).toBe('RAN\n');
 
     const previousCursor = process.env.CURSOR_VERSION;
     const previousProjectDir = process.env.CURSOR_PROJECT_DIR;
@@ -164,8 +196,9 @@ describe('hookDispatchCli', () => {
       expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
 
       mockDispatcher.dispatch.mockClear();
-      fs.writeFileSync(copilotHooks, '{"hooks":{"sessionStart":[{"bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+      fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
       process.env.COPILOT_PROJECT_DIR = project;
+      await reconcileHooks(path.join(bare, '.copilot', 'hooks', 'teamai.json'), 'copilot');
       await hookDispatchCli('stop', 'copilot', '*', { stdinFile });
       expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
     } finally {
@@ -181,6 +214,49 @@ describe('hookDispatchCli', () => {
       else process.env.COPILOT_CLI = previousCopilotCli;
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+    }
+  });
+
+  it('steps Claude aside only for a Copilot hook file Copilot loads and runs', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'host-hooks-active-'));
+    const project = path.join(root, 'project');
+    const copilotHome = path.join(root, 'copilot');
+    const projectFile = path.join(project, '.github', 'hooks', 'teamai.json');
+    const globalFile = path.join(copilotHome, 'hooks', 'teamai.json');
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true });
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    const file = (entry: object, extra: object = {}) => JSON.stringify({ version: 1, ...extra, hooks: { Stop: [entry] } });
+    const builtin = { type: 'command', bash: 'teamai hook-dispatch stop --tool copilot' };
+    const team = { type: 'command', bash: 'echo RAN' };
+    // [case, builtin file, team file, Copilot runs it]
+    const rows: Array<[string, string, string, boolean]> = [
+      ['active', file(builtin), file(team), true],
+      ['powershell only', file({ type: 'command', powershell: builtin.bash }), file({ type: 'command', powershell: 'echo RAN' }), true],
+      ['disableAllHooks', file(builtin, { disableAllHooks: true }), file(team, { disableAllHooks: true }), false],
+      ['malformed', `${file(builtin)},`, `${file(team)},`, false],
+      ['no version', JSON.stringify({ hooks: { Stop: [builtin] } }), JSON.stringify({ hooks: { Stop: [team] } }), false],
+      ['version 2', file(builtin, { version: 2 }), file(team, { version: 2 }), false],
+      ['entry not a command', file({ ...builtin, type: 'prompt' }), file({ ...team, type: 'prompt' }), false],
+    ];
+    const env = { COPILOT_PROJECT_DIR: project, COPILOT_HOME: copilotHome, HOME: root };
+    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN')}echo RAN`],
+      { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8' });
+    try {
+      for (const [name, builtinFile, teamFile, runs] of rows) {
+        fs.writeFileSync(projectFile, builtinFile);
+        expect(claudeHookRunsInAnotherHost('claude', env, false), `project, self mode: ${name}`).toBe(runs);
+        expect(claudeHookRunsInAnotherHost('claude', env, true), `project: ${name}`).toBe(runs);
+        fs.rmSync(projectFile);
+        fs.writeFileSync(globalFile, builtinFile);
+        expect(claudeHookRunsInAnotherHost('claude', env, true), `global: ${name}`).toBe(runs);
+        expect(claudeHookRunsInAnotherHost('claude', env, false), `global, self mode: ${name}`).toBe(false);
+        fs.rmSync(globalFile);
+        fs.writeFileSync(projectFile, teamFile);
+        expect(guard(), `team guard: ${name}`).toBe(runs ? '' : 'RAN\n');
+        fs.rmSync(projectFile);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -211,6 +287,104 @@ describe('hookDispatchCli', () => {
     }
   });
 
+  it.each([
+    ['forwards the workflow launch its environment carries', { TEAMAI_LAUNCHED_BY: 'workflow', TEAMAI_LAUNCHED_TOOL: 'claude', TEAMAI_LAUNCHED_CHECKOUT: 'checkout-1' }],
+    ['drops a workflow launch only the host payload names', {}],
+  ])('%s to the detached pull (#1176)', async (_case, env) => {
+    const stdinFile = path.join(os.tmpdir(), `launch-hook-${process.pid}-${Date.now()}.json`);
+    const sent = { TEAMAI_LAUNCHED_BY: 'workflow', TEAMAI_LAUNCHED_TOOL: 'claude', TEAMAI_LAUNCHED_CHECKOUT: 'from-host' };
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'SessionStart', session_id: 's', cwd: process.cwd(), teamai_launch: sent }));
+    let detachedPayload = '';
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    });
+    const saved = { ...process.env };
+    Object.assign(process.env, env);
+
+    try {
+      await hookDispatchCli('session-start', 'codex', '*', { stdinFile });
+      expect(JSON.parse(detachedPayload).teamai_launch).toEqual('TEAMAI_LAUNCHED_BY' in env ? env : undefined);
+    } finally {
+      for (const key of Object.keys(env)) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it.each([
+    [{ CI: 'true', TEAMAI_WORKFLOW_ATTEMPT: 'r0123456789abcdef/a0000000a' }, { runMode: 'unattended', launchedBy: 'workflow' }],
+    [{}, { runMode: 'attended' }],
+  ])('forwards the run mode and launcher of %o to the detached pass, never the ones the host payload names (#1384)', async (env, forwarded) => {
+    const stdinFile = path.join(os.tmpdir(), `run-hook-${process.pid}-${Date.now()}.json`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: process.cwd(), teamai_run: { runMode: 'unattended', launchedBy: 'host' } }));
+    let detachedPayload = '';
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    });
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+
+    try {
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(JSON.parse(detachedPayload).teamai_run).toEqual(forwarded);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it('captures the session before the detached pull starts, and hands it the capture and the one git state it read (#1178)', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'capture-hook-')));
+    const team = path.join(root, 'team');
+    const project = path.join(root, 'project');
+    initRepo(team);
+    initRepo(project);
+    commitFile(project, 'README.md');
+    const rev = commitFile(team, 'skills/review/SKILL.md');
+    const config: LocalConfig = {
+      repo: { localPath: team, remote: 'local', kind: 'git' },
+      username: 'tester', scope: 'project', additionalRoles: [], projectRoot: project, dataHome: path.join(root, 'data'),
+    };
+    await recordDelivery(config, { rev, targets: ['claude'] });
+    const stdinFile = path.join(root, 'payload.json');
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'c1', cwd: project, source: 'startup', teamai_capture: 'from-host' }));
+    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookConfig').mockResolvedValue(config);
+    const capturesDir = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 'c1');
+    let detachedPayload = '';
+    let capturedFirst: string[] = [];
+    mockSpawn.mockImplementation(() => {
+      capturedFirst = fs.existsSync(capturesDir) ? fs.readdirSync(capturesDir) : [];
+      return { on: vi.fn(), stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => { detachedPayload = raw; done(); }) }, unref: vi.fn() };
+    });
+    const originalCwd = process.cwd();
+    vi.stubEnv('HOME', path.join(root, 'home'));
+
+    try {
+      await hookDispatchCli('session-start', 'claude', '*', { stdinFile });
+      expect(capturedFirst).toEqual([`${JSON.parse(detachedPayload).teamai_capture}.json`]);
+      expect(JSON.parse(fs.readFileSync(path.join(capturesDir, capturedFirst[0] ?? ''), 'utf8')).agent.team).toMatchObject({ revision: rev, localChanges: false });
+      const { agent } = JSON.parse(fs.readFileSync(path.join(capturesDir, capturedFirst[0] ?? ''), 'utf8'));
+      expect(JSON.parse(detachedPayload).teamai_git_at_start).toEqual({ head: agent.project.commit, dirty: agent.project.dirty });
+    } finally {
+      process.chdir(originalCwd);
+      vi.unstubAllEnvs();
+      resolveConfig.mockRestore();
+      mockSpawn.mockReset();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('passes a path-free fallback session ID to a Copilot detached handler', async () => {
     const stdinFile = path.join(os.tmpdir(), `copilot-hook-${process.pid}-${Date.now()}.json`);
     const cwd = process.cwd();
@@ -230,6 +404,9 @@ describe('hookDispatchCli', () => {
     };
     mockSpawn.mockReturnValue(child);
 
+    const previousCopilotHome = process.env.COPILOT_HOME;
+    process.env.COPILOT_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-home-'));
+    await reconcileHooks(path.join(process.env.COPILOT_HOME, 'hooks', 'teamai.json'), 'copilot');
     try {
       await hookDispatchCli('session-start', 'copilot', '*', { stdinFile });
       expect(mockSpawn).toHaveBeenCalled();
@@ -237,6 +414,9 @@ describe('hookDispatchCli', () => {
       expect(JSON.parse(detachedPayload).session_id).not.toContain(cwd);
     } finally {
       fs.rmSync(stdinFile, { force: true });
+      fs.rmSync(process.env.COPILOT_HOME, { recursive: true, force: true });
+      if (previousCopilotHome === undefined) delete process.env.COPILOT_HOME;
+      else process.env.COPILOT_HOME = previousCopilotHome;
       if (previousClaudeId === undefined) delete process.env.CLAUDE_SESSION_ID;
       else process.env.CLAUDE_SESSION_ID = previousClaudeId;
     }

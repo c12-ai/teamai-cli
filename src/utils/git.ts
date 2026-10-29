@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import fse from 'fs-extra';
-import simpleGit, { type SimpleGit } from 'simple-git';
+import simpleGit, { type SimpleGit, type outputHandler } from 'simple-git';
+import { z } from 'zod';
+import { execCommand } from './exec.js';
+import { GitAnswers } from './git-answers.js';
+import { gitFindsNoRepository, linkedWorktreesStamp, repositoryStamp } from './git-discovery.js';
 import { log } from './logger.js';
 
 /** What simple-git accepts as a custom binary without its unsafe opt-in. */
@@ -79,7 +83,88 @@ function lookUpGit(pathEnv: string): string {
  * status does not matter.
  */
 function spawnsByPath(candidate: string): boolean {
+  if (isNativeExecutable(candidate)) return true;
   return spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 10_000 }).error === undefined;
+}
+
+/** ELF, Mach-O (thin or universal): a format the kernel starts without an interpreter. */
+const NATIVE_MAGIC = ['7f454c46', 'feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe'];
+
+/**
+ * Whether `file` is a native executable this user may run, which starts when
+ * spawned: only a script can fail to, its interpreter gone. Read from its
+ * first bytes, where the spawn that proves it costs every command a process.
+ */
+function isNativeExecutable(file: string): boolean {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const head = Buffer.alloc(4);
+      return fs.readSync(fd, head, 0, 4, 0) === 4 && NATIVE_MAGIC.includes(head.toString('hex'));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Disables git's interactive credential prompt for the whole teamai process.
+ *
+ * With this unset, a push with missing credentials opens a username/password
+ * prompt on the tty — and since teamai runs git as a subprocess with no tty,
+ * the push hangs forever, stalling init before the local config is written.
+ * `GIT_TERMINAL_PROMPT=0` makes git fail fast with "could not read Username"
+ * instead.
+ *
+ * Set once at process start (see {@link disableGitTerminalPrompt}) so every
+ * spawned git subprocess inherits it. We do NOT use simple-git's `.env()`
+ * chainable for this: both its overloads *replace* the child's entire
+ * environment (`this.env` is used verbatim as the spawn `env`, not merged
+ * with `process.env`), which would drop PATH/HOME and break git itself.
+ */
+const NO_PROMPT_VAR = 'GIT_TERMINAL_PROMPT' as const;
+const NO_PROMPT_VAL = '0' as const;
+
+/**
+ * Set `GIT_TERMINAL_PROMPT=0` process-wide so no git subprocess can block on
+ * an interactive credential prompt. Idempotent; safe to call multiple times.
+ * Preserves an explicit user override if one is already set.
+ */
+export function disableGitTerminalPrompt(): void {
+  if (process.env[NO_PROMPT_VAR] === undefined) {
+    process.env[NO_PROMPT_VAR] = NO_PROMPT_VAL;
+  }
+}
+
+/**
+ * Block timeout for git subprocesses spawned by `teamai init` pushes and by
+ * every write or refresh of a side branch (reports, learnings), which holds
+ * that branch's lock while git runs. simple-git's `timeout.block` kills the
+ * spawned process when it produces no output for this long (unlike
+ * `withTimeout`, a Promise.race that only stops awaiting while the child keeps
+ * running and holds the Node event loop open).
+ *
+ * Not global: a ceiling here would also kill legitimate slow clones/fetches/
+ * rebases of the team repo in unrelated commands. The env var lets a slow link
+ * or a very large team repo raise the ceiling without a new release. Read at
+ * call time (not module load) so tests can override it.
+ *
+ * Validates the env var: a non-numeric, negative, or non-finite value falls
+ * back to the default rather than reaching simple-git (which would either
+ * silently disable the timeout or misbehave).
+ */
+export function gitBlockTimeoutMs(): number {
+  const raw = process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS;
+  if (raw !== undefined) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 30_000;
 }
 
 /**
@@ -87,12 +172,44 @@ function spawnsByPath(candidate: string): boolean {
  *
  * Authentication is handled by the provider's remote URL or by normal Git
  * facilities such as credential helpers, SSH config, and SSH agents.
+ *
+ * Every instance inherits the process-wide `GIT_TERMINAL_PROMPT=0` set by
+ * {@link disableGitTerminalPrompt}, so a missing credential fails fast
+ * instead of hanging on a prompt that can never be answered.
  */
 export function createGit(basePath?: string, abort?: AbortSignal): SimpleGit {
-  if (basePath) {
-    return simpleGit({ baseDir: basePath, binary: gitBinary(), abort });
-  }
-  return simpleGit({ binary: gitBinary(), abort });
+  const git = basePath
+    ? simpleGit({ baseDir: basePath, binary: gitBinary(), abort })
+    : simpleGit({ binary: gitBinary(), abort });
+  return git.outputHandler(markOutputSeen);
+}
+
+// simple-git already waits for the process to close, then sleeps 50ms more
+// when it printed nothing (`deferClose` in its completion plugin, not
+// configurable). Silent commands (`add`, `fetch`, `worktree prune`, a config
+// write) are common, so a pull spent much of its time in that sleep. An empty
+// chunk once stdout ends marks the output seen: `end` precedes the `close`
+// simple-git waits for, and an empty chunk adds nothing to the output.
+const markOutputSeen: outputHandler = (_command, stdout) => {
+  stdout.once('end', () => stdout.emit('data', Buffer.alloc(0)));
+};
+
+/**
+ * Like {@link createGit}, but additionally kills any git subprocess that
+ * produces no output for {@link gitBlockTimeoutMs}, so a stalled remote cannot
+ * hold a branch lock or the CLI forever.
+ */
+export function createGitWithBlockTimeout(basePath?: string): SimpleGit {
+  const block = gitBlockTimeoutMs();
+  // The kill reaches git alone: its HTTP helper would keep the stalled
+  // connection, and the CLI with it, until the server dropped it. curl's own
+  // stall limit ends the helper, a second after the kill so the kill still
+  // decides how the command fails.
+  const config = ['http.lowSpeedLimit=1', `http.lowSpeedTime=${Math.ceil(block / 1000) + 1}`];
+  const git = basePath
+    ? simpleGit({ baseDir: basePath, binary: gitBinary(), timeout: { block }, config })
+    : simpleGit({ binary: gitBinary(), timeout: { block }, config });
+  return git.outputHandler(markOutputSeen);
 }
 
 /**
@@ -110,10 +227,37 @@ export function createGit(basePath?: string, abort?: AbortSignal): SimpleGit {
  * With `paths`, commits those paths alone, taken literally, and leaves anything
  * else staged in the checkout out of the commit and still staged. Without, it
  * commits the whole index.
+ *
+ * With `identityFallback`, a commit git cannot attribute, as on a CI runner
+ * with no user.email, is made as `TeamAI <teamai@localhost>` like a workflow
+ * workspace commit. Only the git config keys left unset are filled in, so an
+ * identity the user configured is kept.
  */
-export function commitSkippingHooks(git: SimpleGit, message: string, paths?: readonly string[]) {
-  if (paths === undefined) return git.commit(message, { '--no-verify': null });
-  return git.raw(['--literal-pathspecs', 'commit', '--no-verify', '-m', message, '--', ...paths]);
+export async function commitSkippingHooks(
+  git: SimpleGit,
+  message: string,
+  paths?: readonly string[],
+  options: { identityFallback?: boolean } = {},
+) {
+  const identity = options.identityFallback ? await fallbackIdentityConfig(git) : [];
+  if (paths === undefined && identity.length === 0) return git.commit(message, { '--no-verify': null });
+  const commit = [...identity, '--literal-pathspecs', 'commit', '--no-verify', '-m', message];
+  return git.raw(paths === undefined ? commit : [...commit, '--', ...paths]);
+}
+
+/** `-c` arguments setting TeamAI's identity for each unset key, or none when git already resolves an author and committer. */
+async function fallbackIdentityConfig(git: SimpleGit): Promise<string[]> {
+  try {
+    await git.raw(['var', 'GIT_AUTHOR_IDENT']);
+    await git.raw(['var', 'GIT_COMMITTER_IDENT']);
+    return [];
+  } catch {
+    const unset = async (key: string) => (await git.raw(['config', '--get', key]).catch(() => '')).trim() === '';
+    return [
+      ...(await unset('user.name') ? ['-c', 'user.name=TeamAI'] : []),
+      ...(await unset('user.email') ? ['-c', 'user.email=teamai@localhost'] : []),
+    ];
+  }
 }
 
 /**
@@ -187,6 +331,17 @@ export async function getRemoteUrl(localPath: string, remoteName = 'origin'): Pr
   const git = createGit(localPath);
   try {
     const url = (await git.raw(['remote', 'get-url', remoteName])).trim();
+    return url || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the literal configured remote URL without applying url.*.insteadOf rewrites. */
+export async function getConfiguredRemoteUrl(localPath: string, remoteName = 'origin'): Promise<string | null> {
+  const git = createGit(localPath);
+  try {
+    const url = (await git.raw(['config', '--get', `remote.${remoteName}.url`])).trim();
     return url || null;
   } catch {
     return null;
@@ -330,6 +485,24 @@ export async function commitPaths(
   return true;
 }
 
+export class DetachedTeamRepoError extends Error {
+  constructor(defaultBranch: string) {
+    super(`The team repo is checked out at a fixed commit (a team ref pin, or an interrupted switch), so this command cannot change it. Run teamai pull --team-ref ${defaultBranch} to follow the default branch again.`);
+    this.name = 'DetachedTeamRepoError';
+  }
+
+  static rethrow(error: unknown): void {
+    if (error instanceof DetachedTeamRepoError) throw error;
+  }
+}
+
+export async function assertAttachedTeamRepo(git: SimpleGit, localPath: string): Promise<void> {
+  if (await gitFindsNoRepository(localPath) || !await isDedicatedRepoRoot(localPath)) return;
+  if (!(await git.raw(['symbolic-ref', '-q', 'HEAD'])).trim()) {
+    throw new DetachedTeamRepoError(await getDefaultBranch(localPath));
+  }
+}
+
 /**
  * Pull the latest changes from origin into a local team-repo clone.
  *
@@ -348,7 +521,9 @@ export async function commitPaths(
  */
 export async function pullRepo(localPath: string, abort?: AbortSignal): Promise<string> {
   const git = createGit(localPath, abort);
-  const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  await assertAttachedTeamRepo(git, localPath);
+  // An unborn branch has no HEAD to name: `git pull` handles it, as for a detached one.
+  const branch = await git.revparse(['--abbrev-ref', 'HEAD']).then((b) => b.trim(), () => 'HEAD');
 
   try {
     return await fastForward(git, branch);
@@ -408,7 +583,8 @@ const defaultBranchCache = new Map<string, string>();
  */
 export async function pullRepoFastForward(localPath: string): Promise<string> {
   const git = createGit(localPath);
-  return fastForward(git, (await git.revparse(['--abbrev-ref', 'HEAD'])).trim());
+  await assertAttachedTeamRepo(git, localPath);
+  return fastForward(git, await git.revparse(['--abbrev-ref', 'HEAD']).then((b) => b.trim(), () => 'HEAD'));
 }
 
 /**
@@ -555,9 +731,18 @@ export async function tracksTeamBranch(localPath: string, branch: string): Promi
 /**
  * Push directly to whatever branch is checked out, whether that is `main`,
  * `master` or anything else. Used during init for first-time setup, and by CI.
+ *
+ * `opts.initPush` selects the spawn-level block timeout factory used by init
+ * (see {@link createGitWithBlockTimeout}); other callers get the plain factory.
  */
-export async function pushRepoDirectly(localPath: string, message: string, files: string[]): Promise<void> {
-  const git = createGit(localPath);
+export async function pushRepoDirectly(
+  localPath: string,
+  message: string,
+  files: string[],
+  opts: { initPush?: boolean } = {},
+): Promise<void> {
+  const git = opts.initPush ? createGitWithBlockTimeout(localPath) : createGit(localPath);
+  await assertAttachedTeamRepo(git, localPath);
   const existingFiles = [];
   for (const f of files) {
     const fullPath = fs.existsSync(`${localPath}/${f}`);
@@ -616,13 +801,14 @@ export async function pushLearningToOrigin(
 
 /**
  * Best-effort push all changes in a team repo clone.
- * Logs success/failure without throwing.
+ * Logs other push failures; refuses detached team clones.
  * @deprecated Use autoPushViaMR instead for import flows.
  */
 export async function autoPushTeamRepo(repoPath: string, message: string): Promise<void> {
   try {
     await pushRepoDirectly(repoPath, message, ['.']);
   } catch (err) {
+    DetachedTeamRepoError.rethrow(err);
     log.warn(`[git] autoPush failed (non-blocking): ${(err as Error).message}`);
   }
 }
@@ -630,7 +816,7 @@ export async function autoPushTeamRepo(repoPath: string, message: string): Promi
 /**
  * Push changes via branch + MR/PR instead of direct push to main.
  * Creates a branch, commits, pushes, creates MR, then returns to default branch.
- * Non-blocking: logs warnings on failure without throwing.
+ * Logs other push failures; refuses detached team clones.
  */
 export async function autoPushViaMR(
   repoPath: string,
@@ -638,10 +824,11 @@ export async function autoPushViaMR(
   files: string[],
   teamConfig: { repo: string; provider?: string; reviewers?: string[] },
   localConfig: { repo: { remote: string; localPath: string }; username: string; provider?: string },
+  opts: { initPush?: boolean } = {},
 ): Promise<string | null> {
   try {
     const branchName = generateBranchName(localConfig.username);
-    const pushed = await pushRepoBranch(repoPath, message, files, branchName);
+    const pushed = await pushRepoBranch(repoPath, message, files, branchName, { initPush: opts.initPush });
     if (!pushed) {
       log.debug('[git] autoPushViaMR: nothing to commit');
       return null;
@@ -650,11 +837,13 @@ export async function autoPushViaMR(
     const { createPrWithFallback } = await import('../push.js');
     const prUrl = await createPrWithFallback(
       teamConfig, localConfig, branchName, message, message,
+      opts.initPush ? { spawnTimeoutMs: gitBlockTimeoutMs() } : {},
     );
 
     await checkoutMaster(repoPath);
     return prUrl;
   } catch (err) {
+    DetachedTeamRepoError.rethrow(err);
     log.warn(`[git] autoPushViaMR failed (non-blocking): ${(err as Error).message}`);
     try { await checkoutMaster(repoPath); } catch { /* best effort */ }
     return null;
@@ -724,15 +913,19 @@ export async function remoteBranchExists(
  * force-pushed, which updates that PR in place instead of opening another one.
  * If the rebuilt tree matches what the remote branch already holds, nothing is
  * pushed and the function returns false.
+ *
+ * `opts.initPush` selects the spawn-level block timeout factory used by init
+ * (see {@link createGitWithBlockTimeout}); other callers get the plain factory.
  */
 export async function pushRepoBranch(
   localPath: string,
   message: string,
   files: string[],
   branchName: string,
-  opts: { reuseBranch?: boolean } = {},
+  opts: { reuseBranch?: boolean; initPush?: boolean } = {},
 ): Promise<boolean> {
-  const git = createGit(localPath);
+  const git = opts.initPush ? createGitWithBlockTimeout(localPath) : createGit(localPath);
+  await assertAttachedTeamRepo(git, localPath);
 
   if (opts.reuseBranch) {
     // Fetch so the tree comparison below can see the remote branch's content.
@@ -866,9 +1059,13 @@ async function leaveAndDeletePushBranch(
  */
 export async function checkoutMaster(localPath: string): Promise<void> {
   const git = createGit(localPath);
+  await assertAttachedTeamRepo(git, localPath);
   const defaultBranch = await getDefaultBranch(localPath);
   await switchToDefaultBranch(git, defaultBranch);
 }
+
+/** Where every generated review branch lives on origin. */
+export const PUSH_BRANCH_PREFIX = 'teamai/push/';
 
 /**
  * Generate a branch name for teamai push.
@@ -877,7 +1074,27 @@ export function generateBranchName(username: string): string {
   const now = new Date();
   const pad = (n: number) => n.toString().padStart(2, '0');
   const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `teamai/push/${username}/${timestamp}`;
+  return `${PUSH_BRANCH_PREFIX}${username}/${timestamp}`;
+}
+
+/**
+ * generateBranchName's name, or when the clone at `localPath` already has a
+ * branch by it (local, or origin's as last fetched), the first of `-2`, `-3`…
+ * after it that is free. Names are per second: a push that opens two PRs, or
+ * follows another within the second, would otherwise reuse one and fail.
+ */
+export async function unusedBranchName(localPath: string, username: string): Promise<string> {
+  const name = generateBranchName(username);
+  const prefixes = ['refs/heads/', 'refs/remotes/origin/'];
+  // A ref name holds no glob character, so `name` matches only itself.
+  const listed = await createGit(localPath)
+    .raw(['for-each-ref', '--format=%(refname)', ...prefixes.flatMap((p) => [`${p}${name}`, `${p}${name}-*`])])
+    .catch(() => '');
+  const taken = new Set(listed.split('\n').filter(Boolean)
+    .map((ref) => ref.slice(prefixes.find((p) => ref.startsWith(p))?.length ?? 0)));
+  let candidate = name;
+  for (let n = 2; taken.has(candidate); n++) candidate = `${name}-${n}`;
+  return candidate;
 }
 
 /**
@@ -895,10 +1112,10 @@ export function generateBranchName(username: string): string {
  * @returns True if repoPath is its own git top level; false if unconfirmed/unsafe.
  */
 export async function isDedicatedRepoRoot(repoPath: string): Promise<boolean> {
-  const git = createGit(repoPath);
+  if (await gitFindsNoRepository(repoPath)) return true;
   let toplevel: string;
   try {
-    toplevel = (await git.revparse(['--show-toplevel'])).trim();
+    toplevel = (await checkoutLocation(repoPath))?.toplevel ?? (await createGit(repoPath).revparse(['--show-toplevel'])).trim();
   } catch {
     // Not inside a git repository at all — there is no enclosing repo to damage,
     // so treat repoPath as a plain dedicated dir (historical behavior). fail-open.
@@ -917,27 +1134,18 @@ export async function isDedicatedRepoRoot(repoPath: string): Promise<boolean> {
 }
 
 /**
- * The two path anchors teamai derives from a git checkout (issue #374).
- *
- * These are deliberately distinct because a git worktree has two different
- * "roots":
- *  - `workspaceRoot` is the CURRENT checkout (`git rev-parse --show-toplevel`).
- *    Each worktree has its own. This is where project-scope AI-tool resources
- *    (skills/rules/agents) must be written, because every tool discovers them by
- *    scanning up from the launch directory to the current repository root — it
- *    does NOT follow `git-common-dir` back to the main checkout.
- *  - `projectAnchor` is the MAIN checkout, shared by the main repo and all of its
- *    worktrees (the first entry of `git worktree list --porcelain`). This is the
- *    stable per-project identity that P1 will use to key machine-local data under
- *    `~/.teamai/projects/<slug>/`.
- *
- * For a plain (non-worktree) repository the two are identical.
+ * Checkout paths and the stable identity used for project partitions.
+ * `workspaceRoot` receives this checkout's resources; `mainCheckout` receives
+ * shared tool files, or is null when each checkout needs its own files.
+ * `projectAnchor` remains Git's first worktree entry, including Git-directory
+ * identities, except initialized submodule clones in superproject worktrees
+ * inherit the original submodule's identity.
  */
 export interface ProjectAnchors {
   workspaceRoot: string;
   projectAnchor: string;
-  /** The shared identity is a bare repository, not a checkout suitable for project files. */
-  projectAnchorIsBare?: boolean;
+  /** Checkout whose shared project files tools read; null when Git cannot locate one. */
+  mainCheckout: string | null;
 }
 
 /**
@@ -948,7 +1156,7 @@ export interface ProjectAnchors {
  *
  * Implementation notes:
  *  - `workspaceRoot` is `--show-toplevel` (the current checkout).
- *  - `projectAnchor` is the MAIN worktree, taken from the FIRST entry of
+ *  - `projectAnchor` is the stable identity, taken from the FIRST entry of
  *    `git worktree list --porcelain` (git always lists the main worktree first).
  *    Every linked worktree reports the same first entry, so all worktrees of a
  *    repo share one anchor. This is deliberately NOT `dirname(--git-common-dir)`:
@@ -956,7 +1164,7 @@ export interface ProjectAnchors {
  *    outside the checkout and its parent (e.g. a shared `gitdirs/`) would collide
  *    across unrelated repos. The porcelain first entry stays a stable, distinct
  *    identity in that case.
- *  - Both anchors are realpath-normalized so a symlinked prefix (macOS `/tmp` →
+ *  - Identity and checkout paths are realpath-normalized so a symlinked prefix (macOS `/tmp` →
  *    `/private/tmp`) does not make the same checkout look like two different ones.
  *    Case-insensitive-filesystem normalization is intentionally NOT done here; it
  *    is only needed for the P1 slug hash and belongs with that change.
@@ -979,57 +1187,271 @@ export async function resolveAnchors(cwd?: string): Promise<ProjectAnchors | nul
 }
 
 async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
-  const git = createGit(cwd);
-  let toplevel: string;
-  let mainWorktree: string;
-  let projectAnchorIsBare = false;
+  if (await gitFindsNoRepository(cwd ?? process.cwd())) return null;
   try {
-    toplevel = (await git.revparse(['--show-toplevel'])).trim();
-    const list = await git.raw(['worktree', 'list', '--porcelain']);
-    // The first `worktree <path>` line is the main worktree, shared by all
-    // linked worktrees of this repository.
-    const first = list.split('\n').find((l) => l.startsWith('worktree '));
-    mainWorktree = first ? first.slice('worktree '.length).trim() : '';
-    projectAnchorIsBare = list.split('\n\n')[0].split('\n').some((line) => line.trim() === 'bare');
+    const git = createGit(cwd);
+    const toplevel = (await checkoutLocation(cwd ?? process.cwd()))?.toplevel ?? (await git.revparse(['--show-toplevel'])).trim();
+    const entries = await readWorktreeList(cwd) ?? await readWorktreeList(cwd, true);
+    const first = entries?.[0];
+    if (!toplevel || !first) return null;
+    const workspaceRoot = await realpath(toplevel);
+    let projectAnchor = first.path;
+    const commonDir = await gitCommonDir(workspaceRoot);
+    let mainCheckout: string | null = first.bare ? null : projectAnchor;
+    if (!first.bare && projectAnchor === commonDir) {
+      const worktree = await git.raw(['--git-dir', commonDir, 'config', '--get', 'core.worktree']).catch(() => '');
+      if (worktree.trim()) {
+        mainCheckout = await realpath(path.resolve(commonDir, worktree.trim()));
+      } else {
+        const gitDir = await realpath(path.resolve(cwd ?? process.cwd(), (await git.revparse(['--git-dir'])).trim()));
+        mainCheckout = gitDir === commonDir ? workspaceRoot : null;
+      }
+    }
+    // Superproject worktrees clone submodules into their own modules directory.
+    // Only an existing original submodule can supply their shared identity.
+    if (commonDir && projectAnchor === commonDir) {
+      const clone = commonDir.match(/^(.*)[\\/]worktrees[\\/][^\\/]+[\\/]modules[\\/](.+)$/);
+      if (clone) {
+        const original = path.join(clone[1], 'modules', clone[2]);
+        if (await fse.pathExists(original)) projectAnchor = await realpath(original);
+      }
+    }
+    return { workspaceRoot, projectAnchor, mainCheckout };
   } catch {
     return null;
   }
-  if (!toplevel || !mainWorktree) return null;
+}
+
+/** One entry of `git worktree list --porcelain -z`. */
+export interface WorktreeListEntry {
+  path: string;
+  bare: boolean;
+  prunable: boolean;
+}
+
+/**
+ * Parse `git worktree list --porcelain -z`: each attribute ends with NUL and
+ * each entry with an extra NUL, so a path (or a lock reason) holding a newline
+ * stays whole (#993).
+ */
+export function parseWorktreeList(output: string): WorktreeListEntry[] {
+  const entries: WorktreeListEntry[] = [];
+  let entry: WorktreeListEntry | null = null;
+  for (const field of output.split('\0')) {
+    if (field.startsWith('worktree ')) {
+      entry = { path: field.slice('worktree '.length), bare: false, prunable: false };
+      entries.push(entry);
+    } else if (entry && field === 'bare') {
+      entry.bare = true;
+    } else if (entry && (field === 'prunable' || field.startsWith('prunable '))) {
+      entry.prunable = true;
+    }
+  }
+  return entries;
+}
+
+/** Where a directory sits in its checkout, from one `git rev-parse` (checkoutLocation). */
+export interface CheckoutLocation {
+  /** The checkout's root, as git prints it. */
+  toplevel: string;
+  /** The directory's path from `toplevel`, `/`-separated with a trailing `/`; empty at the root. */
+  prefix: string;
+  /** The realpath of the git directory shared by every worktree of the repository. */
+  commonDir: string;
+  /** The `info/exclude` git reads there. */
+  excludeFile: string;
+}
+
+const checkoutLocations = GitAnswers.of('locations', z.object({
+  toplevel: z.string(), prefix: z.string(), commonDir: z.string(), excludeFile: z.string(),
+}) satisfies z.ZodType<CheckoutLocation>);
+
+/**
+ * Where `dir` sits in its checkout, from one `git rev-parse` for what
+ * gitCommonDir, resolveAnchors, isDedicatedRepoRoot and the git exclude files
+ * each asked git for: a pull asked about four directories eleven times.
+ * Remembered while the repository git finds for `dir` stays the same
+ * (repositoryStamp), and shared by callers asking at the same time. Null when
+ * git cannot say it this way: no repository, a directory outside any work tree
+ * (a bare repository, inside `.git`), the environment handing git a
+ * repository, git opening another git directory than the stamp's (one it
+ * passed over, which no stamp would follow), or git failing. Callers then ask
+ * git as before, for its answer or its error. A null is not remembered.
+ */
+export async function checkoutLocation(dir: string): Promise<CheckoutLocation | null> {
+  const found = await repositoryStamp(dir);
+  if (found === null) return null;
+  return checkoutLocations.answer(path.resolve(dir), found.stamp, () => readCheckoutLocation(dir, found.gitDir));
+}
+
+async function readCheckoutLocation(dir: string, stampGitDir: string): Promise<CheckoutLocation | null> {
   try {
-    const [workspaceRoot, projectAnchor] = await Promise.all([
-      realpath(toplevel),
-      realpath(mainWorktree),
-    ]);
-    return { workspaceRoot, projectAnchor, ...(projectAnchorIsBare ? { projectAnchorIsBare: true } : {}) };
+    const result = await execCommand('git', ['rev-parse', '--show-toplevel', '--show-prefix', '--git-common-dir', '--git-path', 'info/exclude', '--git-dir'], { cwd: dir, timeoutMs: 10_000 });
+    const [toplevel = '', prefix = '', commonDir = '', gitPath = '', gitDir = ''] = result.code === 0 ? result.stdout.split(/\r?\n/) : [];
+    if (!toplevel || !commonDir || !gitPath || !gitDir) return null;
+    // Git prints relative paths from where it runs: the real path, symlinks resolved.
+    const base = await realpath(dir);
+    const [opened, stamped] = await Promise.all([realpath(path.resolve(base, gitDir)), realpath(stampGitDir)]);
+    if (opened !== stamped) return null;
+    return { toplevel, prefix, commonDir: await realpath(path.resolve(base, commonDir)), excludeFile: path.resolve(base, gitPath) };
   } catch {
     return null;
   }
 }
 
 /**
- * List the realpath'd top-level directory of every worktree of the repo that
- * contains `cwd` (main checkout + all linked worktrees), from
- * `git worktree list --porcelain`. Returns [] outside a git repo, or when `cwd`
- * does not exist. Used by a project-wide uninstall to clean each worktree's
- * managed resources before the shared partition is deleted (issue #374 P1-2C).
+ * The realpath of the git common directory of the repository containing
+ * `cwd`, shared by its main checkout and every linked worktree, or null when
+ * git cannot tell (no repository, a missing directory, a worktree whose git
+ * directory was pruned).
  */
-export async function listWorktrees(cwd?: string): Promise<string[]> {
-  let list: string;
+export async function gitCommonDir(cwd: string): Promise<string | null> {
+  if (await gitFindsNoRepository(cwd)) return null;
+  // Remembered by checkoutLocation while the repository on disk stays the same;
+  // anything else asks git each time.
+  const located = await checkoutLocation(cwd);
+  if (located) return located.commonDir;
   try {
     // Inside the try: simple-git throws at once for a directory that does not exist.
-    list = await createGit(cwd).raw(['worktree', 'list', '--porcelain']);
+    const out = (await createGit(cwd).revparse(['--git-common-dir'])).replace(/\r?\n$/, '');
+    return await realpath(path.resolve(await realpath(cwd), out));
   } catch {
-    return [];
+    return null;
   }
-  const roots = list
-    .split('\n')
-    .filter((l) => l.startsWith('worktree '))
-    .map((l) => l.slice('worktree '.length).trim())
-    .filter(Boolean);
-  const resolved = await Promise.all(
-    roots.map((r) => realpath(r).catch(() => r)),
-  );
-  return Array.from(new Set(resolved));
+}
+
+/**
+ * The `.git` entry in directory `dir` or the nearest one above it, or null. Where
+ * git cannot name the repository of a directory that has one, git failed
+ * there (not installed, a broken `.git`, unreadable metadata, `safe.directory`)
+ * rather than found none, so which project governs the directory is unknown.
+ */
+export async function nearestGitEntry(dir: string): Promise<string | null> {
+  const exists = (p: string): Promise<boolean> => fs.promises.lstat(p).then(() => true, () => false);
+  // A directory that does not exist is in no repository git failed to read.
+  if (!await exists(dir)) return null;
+  for (let at = path.resolve(dir); ; at = path.dirname(at)) {
+    const entry = path.join(at, '.git');
+    if (await exists(entry)) return entry;
+    if (path.dirname(at) === at) return null;
+  }
+}
+
+/**
+ * Whether `root` is still a checkout of the repository whose common directory
+ * is `commonDir` (see gitCommonDir): it holds a `.git` entry, and git there
+ * names the same common directory. A removed worktree fails the first test, a
+ * pruned one the second. Probed per checkout because `git worktree list` does
+ * not list the main checkout of a `--separate-git-dir` repo or a submodule
+ * (#993).
+ */
+export async function isLiveCheckout(root: string, commonDir: string): Promise<boolean> {
+  if (!await fse.pathExists(path.join(root, '.git'))) return false;
+  return await gitCommonDir(root) === commonDir;
+}
+
+/** A live checkout sharing a TeamAI identity, including inherited submodule clones. */
+export async function isLiveProjectCheckout(root: string, projectAnchor: string): Promise<boolean> {
+  if (!await fse.pathExists(path.join(root, '.git'))) return false;
+  return (await resolveAnchors(root))?.projectAnchor === projectAnchor;
+}
+
+/** Recover a checkout from a persisted identity without treating a Git directory as one. */
+export async function checkoutForProjectAnchor(anchor: string, recordedRoot?: string): Promise<string | null> {
+  if (!await fse.pathExists(anchor)) return null;
+  const worktree = await createGit(anchor).raw(['config', '--get', 'core.worktree']).catch(() => '');
+  const candidates = [anchor, ...(worktree.trim() ? [path.resolve(anchor, worktree.trim())] : []),
+    ...recordedRoot ? [recordedRoot] : [], ...await listWorktrees(anchor)];
+  for (const candidate of candidates) {
+    if (!await fse.pathExists(path.join(candidate, '.git'))) continue;
+    const anchors = await resolveAnchors(candidate);
+    if (anchors?.projectAnchor === anchor) return anchors.mainCheckout ?? anchors.workspaceRoot;
+  }
+  return null;
+}
+
+/** A `git worktree list` entry, with `path` realpath'd and `listed` as git printed it. */
+interface ListedWorktree extends WorktreeListEntry {
+  listed: string;
+}
+
+/**
+ * `git worktree list` output by directory and form, kept while the directory
+ * stays in the same repository (checkoutLocation) and its linked worktrees are
+ * unchanged (linkedWorktreesStamp): one pull asks for the same list several
+ * times.
+ */
+const worktreeLists = GitAnswers.of('worktreeLists', z.string());
+
+/**
+ * The entries of `git worktree list --porcelain -z` for the repo containing
+ * `cwd`, or null when git fails: outside a repository, a missing `cwd`, or git
+ * older than 2.36, which has no `-z`. With `newlineSplit`, the entries of
+ * `git worktree list --porcelain` instead, split on newlines, which cuts a
+ * path holding one: never a proof of liveness (#993).
+ */
+async function readWorktreeList(cwd?: string, newlineSplit = false): Promise<ListedWorktree[] | null> {
+  const dir = cwd ?? process.cwd();
+  if (await gitFindsNoRepository(dir)) return null;
+  // Taken before git runs: a worktree changed meanwhile changes the next stamp.
+  const commonDir = (await checkoutLocation(dir))?.commonDir ?? null;
+  const linked = commonDir === null ? null : await linkedWorktreesStamp(commonDir);
+  const readList = async (): Promise<string | null> => {
+    try {
+      // Inside the try: simple-git throws at once for a directory that does not exist.
+      return await createGit(cwd).raw(['worktree', 'list', '--porcelain', ...newlineSplit ? [] : ['-z']]);
+    } catch {
+      return null;
+    }
+  };
+  // The list is the repository's, whichever of its directories git runs in.
+  let list = commonDir === null || linked === null
+    ? await readList()
+    : await worktreeLists.answer(`${newlineSplit}\0${commonDir}`, linked, readList);
+  if (list === null) return null;
+  if (newlineSplit) list = list.split(/\r?\n/).join('\0');
+  return Promise.all(parseWorktreeList(list)
+    .filter((entry) => entry.path)
+    .map(async (entry) => ({ ...entry, listed: entry.path, path: await realpath(entry.path).catch(() => entry.path) })));
+}
+
+/** The checkouts among `entries`: neither bare, prunable, nor the common directory itself. */
+function listedCheckouts(entries: ListedWorktree[], commonDir: string | null): ListedWorktree[] {
+  return entries.filter((entry) => !entry.bare && !entry.prunable && entry.path !== commonDir);
+}
+
+/**
+ * List the realpath'd top-level directory of every worktree of the repo that
+ * contains `cwd` (main checkout + all linked worktrees), from
+ * `git worktree list --porcelain -z`. Bare and prunable entries are left out,
+ * and so is the git directory itself, which a `--separate-git-dir` repo or a
+ * submodule lists in place of its main checkout (#993): that checkout is then
+ * missing, so liveness is never read from this list alone (see isLiveCheckout,
+ * completeWorktreeList). On git before 2.36, which has no `-z`, it falls back
+ * to the newline-split list: callers that guard every checkout's files (the
+ * shared `info/exclude`, per-worktree MCP cleanup) need the siblings there
+ * too. Returns [] when git fails both ways.
+ */
+export async function listWorktrees(cwd?: string): Promise<string[]> {
+  const entries = await readWorktreeList(cwd) ?? await readWorktreeList(cwd, true);
+  if (!entries) return [];
+  const commonDir = await gitCommonDir(path.resolve(cwd ?? process.cwd()));
+  return [...new Set(listedCheckouts(entries, commonDir).map((entry) => entry.path))];
+}
+
+/**
+ * Every checkout of the repository whose common directory is `commonDir`
+ * (gitCommonDir of `cwd`), each both as `git worktree list` printed it and
+ * realpath'd, but only when that list names every checkout: null when git
+ * fails, and when a non-bare entry is the common directory itself, which is
+ * how a `--separate-git-dir` repo or a submodule stands in for its main
+ * checkout (#993). A path in neither form in a non-null list is not a checkout
+ * of the repository; a null list proves nothing about a path missing from it.
+ */
+export async function completeWorktreeList(cwd: string, commonDir: string): Promise<string[] | null> {
+  const entries = await readWorktreeList(cwd);
+  if (!entries || entries.some((entry) => !entry.bare && entry.path === commonDir)) return null;
+  return [...new Set(listedCheckouts(entries, commonDir).flatMap((entry) => [entry.listed, entry.path]))];
 }
 
 /**
@@ -1044,9 +1466,14 @@ export async function listWorktrees(cwd?: string): Promise<string[]> {
  *  2. Active merge with MERGE_HEAD — `merge --abort` works, but
  *     `reset --hard` handles this too.
  *  3. Stuck on a stale push branch — switch back to the default branch.
- *  4. Uncommitted modifications — reset discards them.
+ *  4. Uncommitted modifications — reset discards them; untracked files
+ *     (which reset --hard leaves in place) are swept by `clean -fd`, matching
+ *     pushRepoBranch. Without the clean, a leftover untracked file blocks the
+ *     pull/checkout that follows with "untracked working tree files would be
+ *     overwritten".
  */
-export async function resetToCleanMaster(git: SimpleGit, localPath?: string): Promise<void> {
+export async function resetToCleanMaster(git: SimpleGit, localPath: string): Promise<void> {
+  await assertAttachedTeamRepo(git, localPath);
   const status = await git.status();
   const hasConflicts = status.conflicted.length > 0;
   const isDirty = hasConflicts
@@ -1060,22 +1487,13 @@ export async function resetToCleanMaster(git: SimpleGit, localPath?: string): Pr
       + `${status.modified.length} modified, ${status.not_added.length} untracked)`,
     );
     await git.reset(['--hard', 'HEAD']);
+    // reset --hard leaves untracked files (counted above) in place.
+    await git.clean('f', ['-d']);
   }
 
   // Ensure we're on the default branch (previous push may have left us on a feature branch)
   const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
-  // Resolve default branch from localPath if given, otherwise infer from origin/HEAD via git
-  let defaultBranch = 'main';
-  if (localPath) {
-    defaultBranch = await getDefaultBranch(localPath);
-  } else {
-    try {
-      const ref = (await git.revparse(['--abbrev-ref', 'origin/HEAD'])).trim();
-      if (ref.startsWith('origin/')) defaultBranch = ref.slice('origin/'.length);
-    } catch {
-      // origin/HEAD not set; use 'main' as best guess
-    }
-  }
+  const defaultBranch = await getDefaultBranch(localPath);
   if (branch !== defaultBranch) {
     log.debug(`Switching from stale branch '${branch}' back to ${defaultBranch}`);
     await switchToDefaultBranch(git, defaultBranch);
@@ -1179,6 +1597,27 @@ export async function getHeadCommit(localPath: string, rev = 'HEAD'): Promise<st
   }
 }
 
+/** The full sha of the commit checked out, and whether tracked files differ from it. */
+export type HeadState = { head: string; dirty: boolean };
+
+/**
+ * The commit checked out at `cwd` and whether tracked files differ from it
+ * (modified or staged), from one `git status`. Untracked files are not listed,
+ * since that is the slow part in a large repo. Null in a repo with no commits;
+ * throws when git fails, is aborted, or `cwd` is not in a work tree.
+ * `--no-optional-locks` keeps it from taking the index lock the user's own git
+ * commands may need.
+ */
+export async function getHeadState(cwd: string, abort?: AbortSignal): Promise<HeadState | null> {
+  const out = await createGit(cwd, abort).raw([
+    '--no-optional-locks', 'status', '--porcelain=v2', '--branch', '--untracked-files=no',
+  ]);
+  const lines = out.split('\n').filter(Boolean);
+  const head = lines.find((l) => l.startsWith('# branch.oid '))?.slice('# branch.oid '.length).trim();
+  if (!head || head === '(initial)') return null;
+  return { head, dirty: lines.some((l) => !l.startsWith('#')) };
+}
+
 /**
  * Whether `absFile`'s content was, at some point on the current branch, the
  * content of `relPath`. A local copy that matches an OLDER team version and
@@ -1190,6 +1629,31 @@ export async function isPastVersionOf(repoPath: string, absFile: string, relPath
 }
 
 /** The files under `dir` at `rev`, relative to the repo root; empty when either is unknown. */
+export interface GitTreeEntry {
+  path: string;
+  mode: string;
+}
+
+/** The files and modes under `dir` at `rev`, relative to the repo root; empty when either is unknown. */
+export async function listTreeAtRev(repoPath: string, rev: string, dir: string): Promise<GitTreeEntry[]> {
+  try {
+    const raw = await createGit(repoPath).raw(['ls-tree', '-r', '-z', rev, '--', dir]);
+    const entries: GitTreeEntry[] = [];
+    for (const line of raw.split('\0')) {
+      if (!line) continue;
+      const tabIndex = line.indexOf('\t');
+      if (tabIndex === -1) continue;
+      const meta = line.slice(0, tabIndex);
+      const filePath = line.slice(tabIndex + 1);
+      const mode = meta.split(' ')[0] ?? '';
+      entries.push({ path: filePath, mode });
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
 export async function listFilesAtRev(repoPath: string, rev: string, dir: string): Promise<string[]> {
   try {
     return (await createGit(repoPath).raw(['ls-tree', '-r', '-z', '--name-only', rev, '--', dir])).split('\0').filter(Boolean);

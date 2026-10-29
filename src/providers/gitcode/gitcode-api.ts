@@ -1,8 +1,10 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { z } from 'zod';
+import type { PullRequestRef } from '../types.js';
 import { GITCODE_HOST } from './repo-url.js';
+import { getUserHome, legacyUserHome } from '../../utils/home.js';
 import { sanitizeGitUrl } from '../../utils/redact.js';
 
 /**
@@ -71,20 +73,49 @@ function authHeaders(token: string): Record<string, string> {
 // Entry format: `machine gitcode.com login oauth2 password <token>`.
 
 function netrcPath(): string {
-  return path.join(os.homedir(), '.netrc');
+  return path.join(getUserHome(), '.netrc');
+}
+
+/**
+ * Every `~/.netrc` that may hold the token, most current first.
+ *
+ * `netrcPath()` follows `getUserHome()`; before that it followed
+ * `os.homedir()`. A user whose `HOME` points elsewhere already has their token
+ * in the older location, so reads fall back to it rather than reporting
+ * "unauthenticated" and making them paste the token again. Writes always target
+ * `netrcPath()`, so re-authenticating consolidates onto the current home.
+ *
+ * Returns an empty list when no home resolves at all — the same "no credential
+ * found" outcome the caller had before, rather than an exception from a getter
+ * that used to swallow everything.
+ */
+function netrcReadPaths(): string[] {
+  let current: string;
+  try {
+    current = netrcPath();
+  } catch {
+    return [];
+  }
+  const paths = [current];
+  const legacy = legacyUserHome();
+  if (legacy) paths.push(path.join(legacy, '.netrc'));
+  return paths;
 }
 
 /** Read the gitcode.com token from ~/.netrc, or null when absent/unreadable. */
 export function readNetrcToken(): string | null {
-  try {
-    const content = fs.readFileSync(netrcPath(), 'utf-8');
-    const match = content.match(
-      new RegExp(`machine\\s+${GITCODE_HOST.replace('.', '\\.')}\\s+.*?password\\s+(\\S+)`),
-    );
-    return match?.[1] ?? null;
-  } catch {
-    return null;
+  const pattern = new RegExp(
+    `machine\\s+${GITCODE_HOST.replace('.', '\\.')}\\s+.*?password\\s+(\\S+)`,
+  );
+  for (const file of netrcReadPaths()) {
+    try {
+      const match = fs.readFileSync(file, 'utf-8').match(pattern);
+      if (match?.[1]) return match[1];
+    } catch {
+      // Missing or unreadable here — try the next location.
+    }
   }
+  return null;
 }
 
 /**
@@ -153,8 +184,11 @@ export class GitCodeRepoNotFoundError extends Error {
  * basic-auth so the credential PERSISTS to `.git/config` and later `git push`
  * (branch + PR flow) authenticates without a separate credential helper.
  *
- * This mirrors the GitHub (`x-access-token:<token>@`) and TGit (`oauth2:<token>@`)
- * providers. GitCode's git-over-HTTPS endpoint accepts Basic `oauth2:<token>`
+ * This mirrors the TGit (`oauth2:<token>@`) provider. GitHub used to embed the
+ * token the same way, but #978 replaced that with a one-shot `http.extraHeader`
+ * plus a URL-scoped `credential.helper`, so no token reaches `.git/config`
+ * there any more.
+ * GitCode's git-over-HTTPS endpoint accepts Basic `oauth2:<token>`
  * but REJECTS `Authorization: Bearer` (verified live) — so an in-URL credential,
  * not a Bearer header, is required. The token lives only in the private team-repo
  * clone under ~/.teamai/team-repo.
@@ -242,6 +276,7 @@ export interface GitCodePullCreateOptions {
   description?: string;
   /** Working directory (unused for the REST path, kept for interface parity) */
   cwd?: string;
+  spawnTimeoutMs?: number;
 }
 
 /**
@@ -264,6 +299,7 @@ export async function gitcodePullCreate(opts: GitCodePullCreateOptions): Promise
     headers: authHeaders(token),
     body: JSON.stringify(body),
     redirect: 'manual',
+    ...(opts.spawnTimeoutMs ? { signal: AbortSignal.timeout(opts.spawnTimeoutMs) } : {}),
   });
   if (!resp.ok) {
     const errBody = await resp.text().catch(() => '');
@@ -276,4 +312,42 @@ export async function gitcodePullCreate(opts: GitCodePullCreateOptions): Promise
   // (singular), verified against the live API — not `/pulls/`.
   if (pr.number) return `https://${GITCODE_HOST}/${opts.repo}/pull/${pr.number}`;
   throw new Error('GitCode PR created but response did not include html_url.');
+}
+
+// ─── Open pull request lookup ────────────────────────────
+
+const LOOKUP_PAGE = 100;
+
+/** A listed pull request; a state outside Gitee's three is one this cannot read. */
+const GitCodeOpenPullSchema = z.object({
+  html_url: z.string(),
+  state: z.enum(['open', 'closed', 'merged']),
+  head: z.object({ ref: z.string(), repo: z.object({ full_name: z.string() }).nullable() }),
+  base: z.object({ ref: z.string(), repo: z.object({ full_name: z.string() }) }),
+});
+
+/**
+ * The open pull request from `source` into `target` in `repo`, asked of the GitCode REST API with the token
+ * `getGitCodeToken` resolves. A request from a fork with the same branch name is not it. Never prompts, and throws,
+ * rather than answering none, when GitCode cannot be asked or answers in time, answers what this cannot read, fills a
+ * whole page without it, or names a request on another host.
+ */
+export async function gitcodeFindOpenPull({ repo, source, target, timeoutMs }: PullRequestRef): Promise<string | undefined> {
+  const token = requireToken();
+  const query = new URLSearchParams({ state: 'open', head: source, base: target, per_page: String(LOOKUP_PAGE) });
+  const resp = await fetch(`${gitcodeApiBase()}/repos/${repo}/pulls?${query}`, {
+    headers: authHeaders(token), redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!resp.ok) throw new Error(`GitCode answered the open pull request lookup with HTTP ${resp.status}. Check GITCODE_TOKEN and its access to the repository.`);
+  const pulls = z.array(GitCodeOpenPullSchema).safeParse(await resp.json().catch(() => undefined));
+  if (!pulls.success) throw new Error('GitCode answered the open pull request lookup with data TeamAI cannot read.');
+  const ours = (name: string | undefined): boolean => name?.toLowerCase() === repo.toLowerCase();
+  const found = pulls.data.find((pull) => pull.state === 'open' && pull.head.ref === source && pull.base.ref === target
+    && ours(pull.head.repo?.full_name) && ours(pull.base.repo.full_name));
+  if (!found) {
+    if (pulls.data.length >= LOOKUP_PAGE) throw new Error('GitCode listed more open pull requests than one page, so TeamAI cannot tell whether this branch has one.');
+    return undefined;
+  }
+  if (!found.html_url.startsWith(`https://${GITCODE_HOST}/`)) throw new Error('GitCode answered the open pull request lookup with a URL on another host.');
+  return found.html_url;
 }

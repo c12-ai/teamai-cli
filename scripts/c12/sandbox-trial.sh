@@ -4,7 +4,7 @@
 #   1. same-named skills, rules and agents teamai did not deliver are replaced by
 #      the team version with one warning each; other files stay untouched
 #   2. uninstall leaves them as they were, and removes what teamai delivered
-#   3. nothing reaches the teamai-reports branch without `usageReport: true`
+#   3. a second install and uninstall leave the member's files as they are
 #   4. a user-scope install puts no git hook in the project repo
 #   5. `init --branch` tracks a non-default team branch (checkout, config, pull)
 #   6. project-only mode replaces a same-named symlink (even dangling) with the
@@ -57,8 +57,6 @@ run() {
   echo "\$ teamai $*" > "$log"
   teamai "$@" < /dev/null >> "$log" 2>&1 || { echo "teamai $* failed:"; tail -20 "$log"; return 1; }
 }
-reports_branch() { git --git-dir="$BARE" for-each-ref --format='%(refname)' refs/heads/teamai-reports; }
-no_reports_branch() { [ -z "$(reports_branch)" ]; }
 no_hook_config() { [ -z "$(git -C "$1" config --get-regexp '^hook\.' || true)" ]; }
 
 # --- Team repo -------------------------------------------------------------
@@ -134,7 +132,6 @@ check "project tree unchanged" diff -q <(hashes "$PROJECT") "$SANDBOX/project.sh
 check "project has no untracked or ignored files" test -z "$(git -C "$PROJECT" status --porcelain --ignored)"
 check "no git hook config in the project" no_hook_config "$PROJECT"
 check "no git hook files added in the project" diff -q <(ls -A "$PROJECT/.git/hooks") "$SANDBOX/project-githooks.txt"
-check "no teamai-reports branch on the team remote" no_reports_branch
 
 # --- 2. Uninstall -----------------------------------------------------------
 run user-uninstall uninstall --force
@@ -143,17 +140,12 @@ check "member-only rule still untouched" foreign_untouched
 check "delivered team-only skill removed" test ! -e "$HOME/.claude/skills/team-only"
 check "delivered team rule removed" test ! -e "$HOME/.claude/rules/team-rule.md"
 check "foreign user hook kept in settings.json" foreign_hook_kept
-check "no teamai-reports branch on the team remote" no_reports_branch
 
-# --- 3. Reports after opt-in ------------------------------------------------
+# --- 3. A second install and uninstall --------------------------------------
 git -C "$TEAM_SRC" remote add origin "$BARE" 2>/dev/null || true
-printf 'usageReport: true\n' >> "$TEAM_SRC/teamai.yaml"
-git -C "$TEAM_SRC" commit -q -am "opt in to reports"
-git -C "$TEAM_SRC" push -q origin HEAD:main
-run optin-init init "$TEAM_URL" --provider git --scope user --agent claude
-echo "== user scope: usageReport: true =="
-check "member registration pushed to teamai-reports once opted in" test -n "$(reports_branch)"
-run optin-uninstall uninstall --force
+run second-init init "$TEAM_URL" --provider git --scope user --agent claude
+echo "== user scope: second install/uninstall =="
+run second-uninstall uninstall --force
 check "foreign files still untouched after a second install/uninstall" foreign_untouched
 
 # --- 4. Workspace scope keeps committed project rules ------------------------
@@ -175,6 +167,8 @@ git -C "$TEAM_SRC" commit -q -m "branch-only skill"
 git -C "$TEAM_SRC" push -q origin trial-branch
 cd "$PROJECT"
 run branch-init init "$TEAM_URL" --provider git --scope user --agent claude --branch trial-branch
+# init no longer copies team resources (0.28): the first pull does.
+run branch-first-pull pull
 echo "== user scope: init --branch =="
 check "branch saved in the local config" grep -q 'branch: trial-branch' "$HOME/.teamai/config.yaml"
 check "team clone checked out on the branch" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = trial-branch
@@ -213,7 +207,7 @@ check "team-only skill delivered (positive control)" test -f "$PROJECT_C/.claude
 check "linked skill is now the team directory, not a symlink" test ! -L "$PROJECT_C/.claude/skills/tdd" -a -f "$PROJECT_C/.claude/skills/tdd/SKILL.md"
 check "dangling skill symlink replaced" test ! -L "$PROJECT_C/.claude/skills/grill-me" -a -f "$PROJECT_C/.claude/skills/grill-me/SKILL.md"
 check "the link target was not written through" grep -q "PROJECT copy of tdd" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
-check "init names each replaced project entry" grep -q "Replaced .*(a symlink)" "$SANDBOX/logs/po-init.log"
+check "pull names each replaced project entry" grep -q "Replaced .*(a symlink)" "$SANDBOX/logs/po-init.log" "$SANDBOX/logs/po-pull.log"
 TEAMAI_PROJECT_ONLY=1 run po-uninstall uninstall --force
 check "uninstall removes the delivered copies" test ! -e "$PROJECT_C/.claude/skills/team-only"
 check "uninstall leaves the project's own .agents skill" grep -q "PROJECT copy of tdd" "$PROJECT_C/.agents/skills/tdd/SKILL.md"
@@ -232,8 +226,8 @@ run rename-pull pull --force || true
 check "pull names the renamed branch and the fix" grep -q "no branch trial-branch: it was renamed or deleted" "$SANDBOX/logs/rename-pull.log"
 run rename-follow init "$TEAM_URL" --provider git --scope user --agent claude --branch trial-renamed --force
 check "init --branch follows the new name" test "$(git -C "$HOME/.teamai/team-repo" rev-parse --abbrev-ref HEAD)" = trial-renamed
-check "the renamed branch's new skill delivered" test -f "$HOME/.claude/skills/after-rename/SKILL.md"
 run rename-pull-after pull --force
+check "the renamed branch's new skill delivered" test -f "$HOME/.claude/skills/after-rename/SKILL.md"
 check "foreign files still untouched after the rename" foreign_untouched
 run rename-uninstall uninstall --force
 
@@ -248,6 +242,7 @@ git -C "$TEAM_SRC" add -A
 git -C "$TEAM_SRC" commit -q -m "add gone-skill"
 git -C "$TEAM_SRC" push -q origin HEAD:main
 TEAMAI_PROJECT_ONLY=1 run rm-init init "$TEAM_URL" --provider git --agent claude
+TEAMAI_PROJECT_ONLY=1 run rm-first-pull pull
 check "gone-skill delivered (positive control)" test -f "$PROJECT_D/.claude/skills/gone-skill/SKILL.md"
 echo "my local edit" >> "$PROJECT_D/.claude/skills/gone-skill/SKILL.md"
 git -C "$TEAM_SRC" rm -q -r skills/gone-skill

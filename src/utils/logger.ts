@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import chalk from 'chalk';
-import ora, { type Ora } from 'ora';
+import type { Ora } from 'ora';
 import { getUserHome } from './home.js';
 
 let verboseEnabled = false;
@@ -28,12 +28,19 @@ let _logFilePath: string | null = null;
 /** Whether the parent directory has been ensured this process. */
 let _dirEnsured = false;
 
+function defaultLogFilePath(): string {
+  return path.join(getUserHome(), '.teamai', 'debug.log');
+}
+
+/** Whether the parent directory existed when this process started. */
+let _dirExistedAtStart = fs.existsSync(path.dirname(defaultLogFilePath()));
+
 /** Re-entrant guard: true while writeToFile is executing. */
 let _writing = false;
 
 function getLogFilePath(): string {
   if (!_logFilePath) {
-    _logFilePath = path.join(getUserHome(), '.teamai', 'debug.log');
+    _logFilePath = defaultLogFilePath();
   }
   return _logFilePath;
 }
@@ -44,8 +51,14 @@ function getLogFilePath(): string {
  */
 function ensureLogDir(): void {
   if (_dirEnsured) return;
+  const dir = path.dirname(getLogFilePath());
+  // An uninstall removed the TeamAI home while this process ran; logging must not bring it back.
+  if (_dirExistedAtStart && !fs.existsSync(dir)) {
+    _dirEnsured = true;
+    return;
+  }
   try {
-    fs.mkdirSync(path.dirname(getLogFilePath()), { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
   } catch {
     // best-effort — if we can't create the dir, writes will fail silently
   }
@@ -94,12 +107,14 @@ function writeToFile(level: string, msg: string): void {
 export function _setLogFilePath(p: string): void {
   _logFilePath = p;
   _dirEnsured = false;
+  _dirExistedAtStart = fs.existsSync(path.dirname(p));
 }
 
 /** Reset internal state (for testing only). */
 export function _resetState(): void {
   _logFilePath = null;
   _dirEnsured = false;
+  _dirExistedAtStart = fs.existsSync(path.dirname(defaultLogFilePath()));
   _writing = false;
 }
 
@@ -173,7 +188,12 @@ export const log = {
   },
 };
 
-export function spinner(text: string): Ora {
+/**
+ * Loads ora on first use: imported up front, it ran string-width's setup (an
+ * Intl.Segmenter and a Unicode-property regex) in every command, hooks included.
+ */
+export async function spinner(text: string): Promise<Ora> {
+  const { default: ora } = await import('ora');
   if (silentMode) {
     // return a no-op spinner in silent mode
     return ora({ text, isSilent: true });

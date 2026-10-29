@@ -7,7 +7,7 @@ import { parseLearningDoc, titleFromFilename } from './utils/search-index.js';
 import { requireInit, detectProjectConfig } from './config.js';
 import { calculateTeamHealth } from './skill-health.js';
 import { createGit } from './utils/git.js';
-import type { UserStats, TokenUsage } from './types.js';
+import type { RunModeSplit, UserStats, UserModeStats, TokenUsage } from './types.js';
 import { totalTokens } from './types.js';
 import { mergeDailyStats, summarizeTrendWindow, type TrendPeriod } from './session-trends.js';
 
@@ -226,13 +226,14 @@ async function getRecentSessions(repoPath: string): Promise<string[]> {
  */
 async function getRecentLearnings(
   learningsDirs: readonly string[],
+  namespaces?: readonly string[],
 ): Promise<{ recent: LearningInfo[]; total: number }> {
   const recent: LearningInfo[] = [];
   let total = 0;
 
   try {
     const { listLearningFiles } = await import('./utils/learnings-roots.js');
-    const mdFiles = await listLearningFiles(learningsDirs);
+    const mdFiles = await listLearningFiles(learningsDirs, namespaces);
     total = mdFiles.length;
 
     // Calculate 7-day cutoff as YYYY-MM-DD string for comparison
@@ -316,6 +317,26 @@ export function summarizeInterventions(teamStats: UserStats[]): InterventionSumm
     avgPerSession: totalSessions > 0 ? totalInterventions / totalSessions : 0,
     ranked,
   };
+}
+
+/**
+ * The team's `count` split by run mode. A member's top-level counter holds every count of their own sessions, and what
+ * neither mode holds was recorded without one, so it is shown apart, never as a mode.
+ */
+export function splitByRunMode(teamStats: UserStats[], count: (stats: UserModeStats | undefined) => number): RunModeSplit {
+  const split: RunModeSplit = { attended: 0, unattended: 0, notRecorded: 0 };
+  for (const user of teamStats) {
+    const attended = count(user.attended);
+    const unattended = count(user.unattended);
+    split.attended += attended;
+    split.unattended += unattended;
+    split.notRecorded += Math.max(0, count(user) - attended - unattended);
+  }
+  return split;
+}
+
+function formatRunModeSplit(split: RunModeSplit, unit: string, format: (count: number) => string = String): string {
+  return `  By run mode: attended ${format(split.attended)} · unattended ${format(split.unattended)} · not recorded ${format(split.notRecorded)} ${unit}`;
 }
 
 /** Aggregated team-wide conversation-turn + token-usage summary (Issue #75). */
@@ -473,6 +494,25 @@ export async function generateDigest(): Promise<void> {
     console.log(`🔧 Unique skills used: ${health.length}`);
     console.log('');
 
+    // Workflow run totals (#1083): counts and durations only, from the
+    // end-phase records each member published to the reports branch.
+    const workflowTotals = teamStats.reduce(
+      (sum, u) => ({
+        runs: sum.runs + (u.workflows?.runs ?? 0),
+        succeeded: sum.succeeded + (u.workflows?.succeeded ?? 0),
+        failed: sum.failed + (u.workflows?.failed ?? 0),
+        durationMs: sum.durationMs + (u.workflows?.totalDurationMs ?? 0),
+      }),
+      { runs: 0, succeeded: 0, failed: 0, durationMs: 0 },
+    );
+    if (workflowTotals.runs > 0) {
+      const minutes = Math.round(workflowTotals.durationMs / 60000);
+      console.log('⚙️ Workflow runs:');
+      console.log(`  ${workflowTotals.runs} total · ${workflowTotals.succeeded} succeeded · ${workflowTotals.failed} failed`);
+      console.log(`  ${minutes} min cumulative run time`);
+      console.log('');
+    }
+
     // Session highlights
     if (sessions.length > 0) {
       console.log('📝 Session Highlights:');
@@ -486,8 +526,14 @@ export async function generateDigest(): Promise<void> {
     // Not another repository's learnings checkout, if one sits where this
     // project's would (#808).
     const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
+    const { readWorkspaceChildren, safeDeliveredLearningsNamespaces } = await import('./workspace-children.js');
+    const learningsNamespaces = await safeDeliveredLearningsNamespaces(
+      await readWorkspaceChildren(localConfig),
+      'digest',
+    );
     const { recent: recentLearnings, total: totalLearnings } = await getRecentLearnings(
       await indexableLearningsRoots(localConfig),
+      learningsNamespaces,
     );
     if (recentLearnings.length > 0) {
       console.log(`📚 New Learnings This Week: ${recentLearnings.length}`);
@@ -541,6 +587,7 @@ export async function generateDigest(): Promise<void> {
       console.log(
         `  Breakdown: interrupt ${interventions.interrupt} · reject ${interventions.toolReject} · correction ${interventions.correction}`,
       );
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => stats?.interventions?.sessions ?? 0), 'sessions'));
       console.log('');
     }
 
@@ -550,11 +597,13 @@ export async function generateDigest(): Promise<void> {
       const t = conversation.tokens;
       console.log('💬 Lifetime Conversation & Token Usage:');
       console.log(`  Lifetime human prompts: ${conversation.totalPrompts}`);
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => stats?.prompts ?? 0), 'prompts'));
       console.log(
         `  Lifetime tokens: ${formatTokenCount(conversation.totalTokens)} ` +
         `(input ${formatTokenCount(t.input)} · output ${formatTokenCount(t.output)} · ` +
         `cache read ${formatTokenCount(t.cacheRead)} · cache write ${formatTokenCount(t.cacheCreation)})`,
       );
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => totalTokens(stats?.tokens)), 'tokens', formatTokenCount));
       console.log('');
     }
 

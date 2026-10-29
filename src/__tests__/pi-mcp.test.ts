@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
-import { reconcileMcpForConfig, resolveMcpTargets } from '../mcp-reconcile.js';
-import { buildMcpDeliveryChecks } from '../doctor-delivery.js';
+import { reconcileMcpForConfig } from '../mcp-reconcile.js';
+import { buildMcpDeliveryChecks, mcpTransportNotes } from '../doctor-delivery.js';
 import { detectMcpFormat, renderJsonEntry, supportsTransport } from '../resources/mcp-format.js';
 import { TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
 
@@ -71,9 +71,6 @@ describe('Pi MCP', () => {
       : path.join(projectRoot, '.pi/mcp.json');
     const personal = { command: 'personal-server', exposure: 'direct' };
     await fse.outputJson(file, { autoEnableCodemode: false, mcpServers: { personal } });
-    expect(await resolveMcpTargets(team, local)).toContainEqual(expect.objectContaining({
-      tool: 'pi', file, projectScope: scope === 'project',
-    }));
     const dry = await reconcileMcpForConfig(team, local, { dryRun: true });
     expect(dry.wrote).toBe(false);
     expect((await fse.readJson(file)).mcpServers).toEqual({ personal });
@@ -110,7 +107,7 @@ describe('Pi MCP', () => {
   });
 
 
-  it('doctor reports unsupported SSE and local edits, and accepts the delivered definition', async () => {
+  it('doctor notes unsupported SSE, reports local edits, and accepts the delivered definition', async () => {
     const context = { localConfig: config, teamConfig: team, toolPaths: team.toolPaths, hookToolPaths: team.toolPaths, baseDir: home };
     const check = async () => {
       const checks = await buildMcpDeliveryChecks(context);
@@ -119,7 +116,8 @@ describe('Pi MCP', () => {
       return pi!;
     };
     await reconcileMcpForConfig(team, config);
-    expect((await check()).fix).toContain('pi does not support sse transport');
+    expect(await (await check()).check()).toBe(true);
+    expect(await mcpTransportNotes(context)).toEqual([expect.stringMatching(/^MCP servers pi cannot use: legacy \(sse\) in /)]);
     await fse.writeFile(source, yaml.slice(0, yaml.indexOf('  - name: legacy')));
     expect(await (await check()).check()).toBe(true);
     const file = path.join(home, '.pi/agent/mcp.json');

@@ -26,18 +26,44 @@ import {
 import { reconcileHooksToAllTools } from '../hooks.js';
 import { loadOpencodePlugin, loadPluginDefinition, loadV2Plugin } from './helpers/opencode-plugin.js';
 import { log } from '../utils/logger.js';
+import * as builtinHooks from '../builtin-hooks.js';
 
 describe('resolveOpencodePluginDir', () => {
   it('project scope → <base>/.opencode/plugin', () => {
     expect(resolveOpencodePluginDir('/repo', 'project')).toBe(path.join('/repo', '.opencode', 'plugin'));
   });
-  it('user scope → <base>/.config/opencode/plugin', () => {
-    expect(resolveOpencodePluginDir('/home/u', 'user')).toBe(path.join('/home/u', '.config', 'opencode', 'plugin'));
+  it('user scope → the plugin directory of OpenCode\'s config home, which XDG_CONFIG_HOME moves', () => {
+    vi.stubEnv('XDG_CONFIG_HOME', '');
+    vi.stubEnv('OPENCODE_CONFIG_DIR', '');
+    expect(resolveOpencodePluginDir('/elsewhere', 'user')).toBe(path.join(os.homedir(), '.config', 'opencode', 'plugin'));
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(os.tmpdir(), 'xdg'));
+    expect(resolveOpencodePluginDir('/elsewhere', 'user')).toBe(path.join(os.tmpdir(), 'xdg', 'opencode', 'plugin'));
+    vi.unstubAllEnvs();
   });
 });
 
 describe('buildPluginSource', () => {
   const src = buildPluginSource();
+  it.each(['linux', 'win32'])('dispatches through the installed Node entry without a shell on %s', async (platform) => {
+    const entry = platform === 'win32' ? 'C:\\Program Files\\teamai\\index.js' : '/opt/team ai/index.js';
+    const resolver = vi.spyOn(builtinHooks, 'resolveCliEntry').mockReturnValue(entry);
+    const spawn = vi.fn((_command: string, _args: string[], _options: Record<string, unknown>) => {
+      const child = new EventEmitter() as any;
+      child.stdin = { write: vi.fn(), end: () => queueMicrotask(() => child.emit('close', 0)) };
+      return child;
+    });
+    try {
+      const plugin = loadPluginDefinition(buildPluginSource(), { __childProcess: { spawn }, process: { platform } });
+      const hooks = await plugin.server({ directory: '/work/proj' });
+      await hooks.event({ event: { type: 'session.created' } });
+      expect(spawn).toHaveBeenCalledExactlyOnceWith(process.execPath,
+        [entry, 'hook-dispatch', 'session-start', '--tool', 'opencode'],
+        expect.objectContaining({ windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] }));
+      expect(spawn.mock.calls[0][2]).not.toHaveProperty('shell', true);
+    } finally {
+      resolver.mockRestore();
+    }
+  });
   it('loads as a default plugin definition for both OpenCode APIs', async () => {
     const plugin = loadPluginDefinition(src);
     expect(plugin.id).toBe('teamai.hooks');
@@ -72,14 +98,11 @@ describe('buildPluginSource', () => {
     expect(src).toContain('child.stdin.write(stdin)');
     expect(src).not.toContain('new Response(stdin)');
   });
-  it('maps lowercase OpenCode tool ids back to PascalCase matchers', () => {
-    // OpenCode passes `skill` / `todowrite`; the handler registry keys matchers
-    // on `Skill` / `TodoWrite`.
-    expect(src).toContain("skill: 'Skill'");
-    expect(src).toContain("todowrite: 'TodoWrite'");
-    expect(src).toContain('TOOL_MATCHER[tool]');
-    // The dead PascalCase id comparison must be gone.
-    expect(src).not.toContain("tool === 'Skill'");
+  it('sends OpenCode\'s own tool ids on one wildcard pass, with no matcher-scoped pass (#1221)', () => {
+    expect(src).toContain('tool_name: tool,');
+    expect(src).not.toContain('TOOL_MATCHER');
+    expect(src).not.toContain("'--matcher'");
+    expect(src).not.toContain("skill: 'Skill'");
   });
   it('forwards tool_name / tool_input on post-tool-use and prompt on chat.message', () => {
     expect(src).toContain('tool_name');
@@ -133,7 +156,7 @@ describe('OpenCode plugin: bridge payloads (#884)', () => {
     await hooks['chat.message']({ sessionID: PARENT }, { parts: [{ type: 'text', text: '/retry now' }] });
     await hooks.event({ event: { type: 'session.idle', properties: { sessionID: PARENT } } });
 
-    expect(dispatches.map((d) => [d.args[1], d.payload])).toEqual([
+    expect(dispatches.map((d) => [d.args[2], d.payload])).toEqual([
       ['session-start', { cwd: '/work/proj', session_id: PARENT }],
       ['session-start', { cwd: '/work/proj', session_id: CHILD }],
       ['prompt-submit', { cwd: '/work/proj', session_id: PARENT, prompt: '/retry now' }],
@@ -212,8 +235,8 @@ describe('buildAgentHookPluginSource is valid JS across event kinds and tricky c
 
 describe('injectOpencodeHooks / removeOpencodeHooks', () => {
   let tmp: string;
-  beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-hooks-')); });
-  afterEach(async () => { await fse.remove(tmp); });
+  beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-hooks-')); vi.stubEnv('HOME', tmp); });
+  afterEach(async () => { vi.unstubAllEnvs(); await fse.remove(tmp); });
 
   it('project scope writes .opencode/plugin/teamai-hooks.ts', async () => {
     await injectOpencodeHooks(tmp, 'project');
@@ -234,6 +257,20 @@ describe('injectOpencodeHooks / removeOpencodeHooks', () => {
     const first = await fse.readFile(file, 'utf8');
     await injectOpencodeHooks(tmp, 'project');
     expect(await fse.readFile(file, 'utf8')).toBe(first);
+  });
+
+  it('keeps an installed plugin if this process cannot resolve the CLI entry', async () => {
+    await injectOpencodeHooks(tmp, 'project');
+    const file = path.join(tmp, '.opencode', 'plugin', OPENCODE_HOOK_FILE);
+    const before = await fse.readFile(file, 'utf8');
+    const resolver = vi.spyOn(builtinHooks, 'resolveCliEntry').mockReturnValue(null);
+    try {
+      await injectOpencodeHooks(tmp, 'project');
+      expect(await fse.readFile(file, 'utf8')).toBe(before);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('cannot resolve the teamai CLI entry'));
+    } finally {
+      resolver.mockRestore();
+    }
   });
 
   it('reports the injection only when the plugin changes', async () => {
@@ -257,8 +294,8 @@ describe('injectOpencodeHooks / removeOpencodeHooks', () => {
 
 describe('agent-hook plugins', () => {
   let tmp: string;
-  beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-ah-')); });
-  afterEach(async () => { await fse.remove(tmp); });
+  beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-ah-')); vi.stubEnv('HOME', tmp); });
+  afterEach(async () => { vi.unstubAllEnvs(); await fse.remove(tmp); });
 
   it('installs a named plugin file for a supported event', async () => {
     await applyOpencodeAgentHook({ slug: 'my-hook', event: 'SessionStart', command: 'echo hi', baseDir: tmp, scope: 'user' });
@@ -275,8 +312,9 @@ describe('agent-hook plugins', () => {
     expect(content).toContain('"chat.message": async');
   });
 
-  it('skips events with no OpenCode equivalent', async () => {
-    await applyOpencodeAgentHook({ slug: 'bad', event: 'PreToolUse', command: 'x', baseDir: tmp, scope: 'user' });
+  it('rejects events with no OpenCode equivalent and writes nothing', async () => {
+    await expect(applyOpencodeAgentHook({ slug: 'bad', event: 'PreToolUse', command: 'x', baseDir: tmp, scope: 'user' }))
+      .rejects.toThrow('OpenCode has no hook event for PreToolUse');
     expect(await fse.pathExists(path.join(tmp, '.config', 'opencode', 'plugin', 'teamai-agent-bad.ts'))).toBe(false);
   });
 
@@ -286,6 +324,26 @@ describe('agent-hook plugins', () => {
     expect(await fse.pathExists(file)).toBe(true);
     await removeOpencodeAgentHook({ slug: 'gone', baseDir: tmp, scope: 'user' });
     expect(await fse.pathExists(file)).toBe(false);
+  });
+
+  it('keeps one copy of an agent-hook plugin in a moved home, since OpenCode 1.x also loads the default one (#1221)', async () => {
+    vi.stubEnv('OPENCODE_CONFIG_DIR', path.join(tmp, 'oc-moved'));
+    try {
+      const earlier = path.join(tmp, '.config', 'opencode', 'plugin', 'teamai-agent-dup.ts');
+      const moved = path.join(tmp, 'oc-moved', 'plugin', 'teamai-agent-dup.ts');
+      await fse.outputFile(earlier, '// an earlier release wrote this');
+
+      await applyOpencodeAgentHook({ slug: 'dup', event: 'Stop', command: 'x', baseDir: tmp, scope: 'user' });
+      expect(await fse.pathExists(moved)).toBe(true);
+      expect(await fse.pathExists(earlier)).toBe(false);
+
+      await fse.outputFile(earlier, '// an earlier release wrote this');
+      await removeOpencodeAgentHook({ slug: 'dup', baseDir: tmp, scope: 'user' });
+      expect(await fse.pathExists(moved)).toBe(false);
+      expect(await fse.pathExists(earlier)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('gates a matcher-scoped tool hook on the tool id (case-insensitive)', async () => {
@@ -403,7 +461,7 @@ describe('OpenCode V2 built-in plugin', () => {
     await host.emit('session.created', { sessionID: 'ses_other' }, { directory: '/other' });
     await host.emit('session.status', { sessionID: 'ses_v2', status: { type: 'idle' } });
     await host.emit('session.idle', { sessionID: 'ses_v2' });
-    expect(host.dispatches.map((d) => [d.args[1], d.payload])).toEqual([
+    expect(host.dispatches.map((d) => [d.args[2], d.payload])).toEqual([
       ['session-start', { cwd: '/work/proj', session_id: 'ses_v2' }],
       ['stop', { cwd: '/work/proj', session_id: 'ses_v2' }],
     ]);
@@ -412,28 +470,117 @@ describe('OpenCode V2 built-in plugin', () => {
     expect(Object.keys(host.callbacks)).toEqual([]);
   });
 
-  it('forwards prompt and tool results through shared dispatch, with aliases and exactly one matcher pass', async () => {
+  it('forwards prompt and tool results through shared dispatch, with aliases and no matcher pass', async () => {
     const host = await loadV2Plugin();
     await host.callbacks['session.prompt']({ sessionID: 'ses_v2', prompt: { text: '/retry now' } });
     await host.callbacks['tool.execute.after']({ tool: 'skill', sessionID: 'ses_v2', input: { name: 'review' }, status: 'completed', result: { content: [{ type: 'text', text: 'loaded' }, { type: 'file', filename: 'skip' }, { type: 'text', text: 'next' }] } });
     await host.callbacks['tool.execute.after']({ tool: 'shell', sessionID: 'ses_v2', input: { command: 'false' }, status: 'completed', result: { content: 'failed', metadata: { exit: 1 } } });
     await host.callbacks['tool.execute.after']({ tool: 'shell', sessionID: 'ses_v2', input: {}, status: 'error', error: { message: 'denied' } });
     await host.callbacks['tool.execute.after']({ tool: 'subagent', sessionID: 'ses_v2', input: {}, status: 'completed', result: { content: 'child done', metadata: { sessionID: 'ses_child' } } });
-    expect(host.dispatches.map((d) => d.args)).toEqual([
+    expect(host.dispatches.map((d) => d.args.slice(1))).toEqual([
       ['hook-dispatch', 'prompt-submit', '--tool', 'opencode'],
       ['hook-dispatch', 'post-tool-use', '--tool', 'opencode'],
-      ['hook-dispatch', 'post-tool-use', '--tool', 'opencode', '--matcher', 'Skill'],
       ['hook-dispatch', 'post-tool-use', '--tool', 'opencode'],
       ['hook-dispatch', 'post-tool-use', '--tool', 'opencode'],
       ['hook-dispatch', 'post-tool-use', '--tool', 'opencode'],
     ]);
     expect(host.dispatches[0].payload).toEqual({ cwd: '/work/proj', session_id: 'ses_v2', prompt: '/retry now' });
-    expect(host.dispatches[1].payload).toMatchObject({ tool_name: 'Skill', tool_input: { name: 'review' }, tool_response: 'loaded\nnext', tool_status: 'success' });
-    expect(host.dispatches[3].payload).toMatchObject({ tool_name: 'bash', tool_response: 'failed', tool_status: 'failure' });
-    expect(host.dispatches[4].payload).toMatchObject({ tool_response: 'denied', tool_status: 'failure' });
-    expect(host.dispatches[5].payload).toMatchObject({ tool_name: 'task', session_link: { child: 'ses_child', parent: 'ses_v2' } });
+    expect(host.dispatches[1].payload).toMatchObject({ tool_name: 'skill', tool_input: { name: 'review' }, tool_response: 'loaded\nnext', tool_status: 'success' });
+    expect(host.dispatches[2].payload).toMatchObject({ tool_name: 'bash', tool_response: 'failed', tool_status: 'failure' });
+    expect(host.dispatches[3].payload).toMatchObject({ tool_response: 'denied', tool_status: 'failure' });
+    expect(host.dispatches[4].payload).toMatchObject({ tool_name: 'task', session_link: { child: 'ses_child', parent: 'ses_v2' } });
     await host.cleanup?.();
-    expect(host.disposed.sort()).toEqual(['session.prompt', 'tool.execute.after']);
+    expect(host.disposed.sort()).toEqual(['session.compaction', 'session.context', 'session.prompt', 'tool.execute.after']);
+  });
+});
+
+// #915: on OpenCode V2 the team MCP servers reach a project through the plugin,
+// from the `.opencode/teamai-mcp.json` pull writes, not through opencode.json.
+describe('OpenCode V2 plugin: team MCP servers', () => {
+  let tmp: string;
+  beforeEach(async () => { tmp = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-mcp-'))); });
+  afterEach(async () => { await fse.remove(tmp); });
+
+  const MEMBER = { type: 'local', command: ['mine'] };
+
+  it('adds the servers of the nearest project in the form V2 reads, and none outside it', async () => {
+    const project = path.join(tmp, 'proj');
+    await fse.outputJson(path.join(project, '.opencode', 'teamai-mcp.json'), { mcp: {
+      local: { type: 'local', command: ['srv', '--flag'], environment: { TOKEN: 'abc' }, enabled: true },
+      remote: { type: 'remote', url: 'https://api.example.com/mcp', enabled: false },
+    } });
+    const deep = path.join(project, 'src', 'deep');
+    await fse.ensureDir(deep);
+
+    const host = await loadV2Plugin(buildPluginSource(path.join(tmp, 'user')), {}, deep);
+    expect(host.mcpServers({ mine: MEMBER })).toEqual({
+      mine: MEMBER,
+      local: { type: 'local', command: ['srv', '--flag'], environment: { TOKEN: 'abc' } },
+      remote: { type: 'remote', url: 'https://api.example.com/mcp', disabled: true },
+    });
+    await host.cleanup?.();
+    expect(host.disposed).toContain('mcp.transform');
+
+    const outside = await loadV2Plugin(buildPluginSource(path.join(tmp, 'user')), {}, tmp);
+    expect(outside.mcpServers({ mine: MEMBER })).toEqual({ mine: MEMBER });
+    await outside.cleanup?.();
+  });
+
+  it('finds a project whose .opencode holds only its MCP file, and reads no context from a project above it', async () => {
+    const outer = path.join(tmp, 'outer');
+    await fse.outputFile(path.join(outer, '.opencode', 'teamai-context.md'), 'OUTER-CONTEXT\n');
+    const inner = path.join(outer, 'inner');
+    await fse.outputJson(path.join(inner, '.opencode', 'teamai-mcp.json'), { mcp: { api: { type: 'remote', url: 'https://inner.example.com', enabled: true } } });
+    await fse.ensureDir(path.join(inner, 'src'));
+
+    const host = await loadV2Plugin(buildPluginSource(path.join(tmp, 'user')), {}, path.join(inner, 'src'));
+    expect(host.mcpServers()).toEqual({ api: { type: 'remote', url: 'https://inner.example.com' } });
+    const event = { sessionID: 'ses', system: [] as Array<{ type: string; text: string }> };
+    await host.callbacks['session.context'](event);
+    expect(event.system.map((part) => part.text).join('\n')).not.toContain('OUTER-CONTEXT');
+    await host.cleanup?.();
+  });
+
+  it('passes a nested .opencode that holds only the member\'s rules, to reach the teamai project above it', async () => {
+    const root = path.join(tmp, 'mono');
+    await fse.outputFile(path.join(root, '.opencode', 'teamai-context.md'), 'ROOT-CONTEXT\n');
+    await fse.outputJson(path.join(root, '.opencode', 'teamai-mcp.json'), { mcp: { api: { type: 'remote', url: 'https://root.example.com', enabled: true } } });
+    const pkg = path.join(root, 'packages', 'web');
+    await fse.outputFile(path.join(pkg, '.opencode', 'rules', 'mine.md'), 'MEMBER-RULE\n');
+    await fse.ensureDir(path.join(pkg, 'src'));
+
+    const host = await loadV2Plugin(buildPluginSource(path.join(tmp, 'user')), {}, path.join(pkg, 'src'));
+    expect(host.mcpServers()).toEqual({ api: { type: 'remote', url: 'https://root.example.com' } });
+    const event = { sessionID: 'ses', system: [] as Array<{ type: string; text: string }> };
+    await host.callbacks['session.context'](event);
+    const texts = event.system.map((part) => part.text).join('\n');
+    expect(texts).toContain('ROOT-CONTEXT');
+    expect(texts).not.toContain('MEMBER-RULE');
+    await host.cleanup?.();
+  });
+
+  it('with no teamai file above, reads every rules directory up, so a nested package\'s own rules do not hide the team\'s', async () => {
+    const root = path.join(tmp, 'mono');
+    await fse.outputFile(path.join(root, '.opencode', 'rules', 'team.md'), 'TEAM-RULE\n');
+    const pkg = path.join(root, 'packages', 'web');
+    await fse.outputFile(path.join(pkg, '.opencode', 'rules', 'mine.md'), 'MEMBER-RULE\n');
+    await fse.ensureDir(path.join(pkg, 'src'));
+
+    const host = await loadV2Plugin(buildPluginSource(path.join(tmp, 'user')), {}, path.join(pkg, 'src'));
+    const event = { sessionID: 'ses', system: [] as Array<{ type: string; text: string }> };
+    await host.callbacks['session.context'](event);
+    const texts = event.system.map((part) => part.text);
+    expect(texts.findIndex((text) => text.includes('TEAM-RULE'))).toBeGreaterThanOrEqual(0);
+    expect(texts.findIndex((text) => text.includes('MEMBER-RULE'))).toBeGreaterThan(texts.findIndex((text) => text.includes('TEAM-RULE')));
+    expect(host.mcpServers()).toEqual({});
+    await host.cleanup?.();
+  });
+
+  it('adds nothing from an agent-hook plugin, so the servers are set once', async () => {
+    await fse.outputJson(path.join(tmp, '.opencode', 'teamai-mcp.json'), { mcp: { api: { type: 'remote', url: 'https://x.example.com', enabled: true } } });
+    const host = await loadV2Plugin(buildAgentHookPluginSource('s', 'session.created', 'echo hi'), {}, tmp);
+    expect(host.mcpServers()).toEqual({});
+    await host.cleanup?.();
   });
 });
 
@@ -458,6 +605,8 @@ describe('enterprise dual-host dispatch', () => {
         if (event.startsWith('session.')) await host.emit(event, { sessionID: 'ses_v2' });
         else if (event === 'chat.message') await host.callbacks['session.prompt']({ sessionID: 'ses_v2', prompt: { text: 'hello' } });
         else await host.callbacks['tool.execute.after']({ tool: 'shell', status: 'completed', input: {}, result: {} });
+        // Only teamai's own plugin adds the team context; one per agent hook would repeat it.
+        expect(host.callbacks['session.context']).toBeUndefined();
         await host.cleanup?.();
       }
       expect(spawn).toHaveBeenCalledExactlyOnceWith('sh', ['-c', 'echo enterprise'], expect.objectContaining({ cwd: '/work/proj', stdio: 'ignore' }));
@@ -494,6 +643,7 @@ describe('enterprise dual-host dispatch', () => {
 
   it('replaces an enterprise hook in place, then removes it', async () => {
     const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-update-'));
+    vi.stubEnv('HOME', tmp);
     try {
       const def = { slug: 'update', event: 'SessionStart', baseDir: tmp, scope: 'user' as const };
       await applyOpencodeAgentHook({ ...def, command: 'echo old' });
@@ -503,7 +653,7 @@ describe('enterprise dual-host dispatch', () => {
       expect(await fse.readFile(path.join(dir, 'teamai-agent-update.ts'), 'utf8')).not.toContain('echo old');
       await removeOpencodeAgentHook(def);
       expect(await fse.readdir(dir)).toEqual([]);
-    } finally { await fse.remove(tmp); }
+    } finally { vi.unstubAllEnvs(); await fse.remove(tmp); }
   });
 });
 

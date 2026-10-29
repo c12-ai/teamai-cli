@@ -4,11 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { ensureDir, pathExists, readFileSafe, writeFile, remove, listFiles } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
-import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
-import { getUserHome } from './utils/home.js';
-import { ALL_SUPPORTED_TOOLS, agentStemFromFilename, renderForTool, reverseFromClaude } from './resources/agent-format.js';
-import type { ToolName } from './resources/agent-format.js';
+import { keepsTrackedCopy } from './resources/delivered-copies.js';
+import { agentStemFromFilename, renderForTool, reverseFromClaude } from './resources/agent-format.js';
+import { isAgentToolId } from './tools.js';
+import { installOf, locate, writable } from './locate.js';
+import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Built-in agents deployment ──────────────────────────
 //
@@ -81,6 +81,7 @@ async function removeStaleAgentSiblings(targetAgentsDir: string, stem: string, t
     if (agentStemFromFilename(file) !== stem) continue;
     if (file === `${stem}${targetExt}`) continue;
     try {
+      if (await keepsTrackedCopy(path.join(targetAgentsDir, file), path.join(targetAgentsDir, `${stem}${targetExt}`))) continue;
       await remove(path.join(targetAgentsDir, file));
       log.debug(`Removed stale agent sibling ${file} for ${stem}`);
     } catch {
@@ -91,8 +92,12 @@ async function removeStaleAgentSiblings(targetAgentsDir: string, stem: string, t
 
 export async function deployBuiltinAgents(
   teamConfig: TeamaiConfig,
-  localConfig?: LocalConfig,
-  options?: { skipRecall?: boolean },
+  localConfig: LocalConfig,
+  options?: {
+    skipRecall?: boolean; recorder?: DeliveryRecorder; dryRun?: boolean;
+    /** Gets each tool that did not take every built-in agent (`DeliveryLedger.toolsMissingAgents`). */
+    toolsMissingAgents?: Set<string>;
+  },
 ): Promise<number> {
   const builtinDir = getBuiltinAgentsDir();
   if (!await pathExists(builtinDir)) {
@@ -112,35 +117,35 @@ export async function deployBuiltinAgents(
     .filter((f) => !(options?.skipRecall && f === 'teamai-recall.md'));
   if (agentFiles.length === 0) return 0;
 
-  const defaultBaseDir = getUserHome();
+  const install = installOf(teamConfig, localConfig);
   let deployed = 0;
 
-  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig ?? {}))) {
-    if (!toolPath.agents) {
+  for (const tool of Object.keys(install.toolPaths)) {
+    const where = await locate(tool, 'agents', install);
+    if (!where.gates.every((gate) => gate.met)) {
+      log.debug(`Skipping built-in agent deployment for ${tool}: excluded or not installed`);
+      continue;
+    }
+    if (!isAgentToolId(tool)) {
+      if (install.toolPaths[tool]?.agents) {
+        log.warn(
+          `Skipping built-in agent deployment for ${tool}: unsupported agent format; ` +
+          'disable this target or add a native renderer',
+        );
+      }
+      continue;
+    }
+    const targetAgentsDir = writable(where)?.path;
+    if (targetAgentsDir === undefined) {
       log.debug(`Skipping built-in agent deployment for ${tool}: no agents path`);
       continue;
     }
-    const baseDir = localConfig ? resolveToolBaseDir(tool, localConfig) : defaultBaseDir;
-    const installed = localConfig
-      ? await isToolInstalledForConfig(tool, toolPath.agents, localConfig)
-      : await ResourceHandler.isToolInstalled(toolPath.agents, baseDir);
-    if (!installed) {
-      log.debug(`Skipping built-in agent deployment for ${tool}: tool not installed`);
-      continue;
-    }
-    if (localConfig && isAgentExcluded(localConfig, tool)) continue;
-    if (!(ALL_SUPPORTED_TOOLS as string[]).includes(tool)) {
-      log.warn(
-        `Skipping built-in agent deployment for ${tool}: unsupported agent format; ` +
-        'disable this target or add a native renderer',
-      );
-      continue;
-    }
-
-    const targetAgentsDir = path.join(baseDir, toolPath.agents);
     try {
-      await ensureDir(targetAgentsDir);
+      // A dry run writes nothing (#915): no directory, no sibling removed.
+      if (!options?.dryRun) await ensureDir(targetAgentsDir);
     } catch (e) {
+      options?.recorder?.failed('builtin');
+      options?.toolsMissingAgents?.add(tool);
       log.warn(`Failed to create agents dir for ${tool}: ${(e as Error).message}`);
       continue;
     }
@@ -155,16 +160,24 @@ export async function deployBuiltinAgents(
         if (!parsed.ok) {
           throw new Error(`invalid built-in agent ${file}: ${parsed.reason}`);
         }
-        const rendered = renderForTool(parsed.spec, tool as ToolName);
+        const rendered = renderForTool(parsed.spec, tool);
         const stem = path.basename(file, '.md');
+        if (options?.dryRun) {
+          options.recorder?.report('builtin', path.join(targetAgentsDir, `${stem}${rendered.ext}`));
+          deployed++;
+          continue;
+        }
         // Clean up any same-stem sibling with a different extension before
         // writing the (possibly new) native extension — e.g. an upgrade that
         // switches a tool's native extension must not leave the stale file behind.
         await removeStaleAgentSiblings(targetAgentsDir, stem, rendered.ext);
         const dest = path.join(targetAgentsDir, `${stem}${rendered.ext}`);
         await writeFile(dest, rendered.content);
+        options?.recorder?.report('builtin', dest);
         deployed++;
       } catch (e) {
+        options?.recorder?.failed('builtin');
+        options?.toolsMissingAgents?.add(tool);
         log.warn(`Failed to deploy built-in agent ${file} to ${tool}: ${(e as Error).message}`);
       }
     }

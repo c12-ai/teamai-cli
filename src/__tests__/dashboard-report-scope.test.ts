@@ -4,7 +4,7 @@
  * each scope pushes. Only the reports-branch push and the handlers that reach
  * the network or spawn processes are stubbed.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it as vitestIt, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,9 +15,25 @@ import type { LocalConfig } from '../types.js';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   // The detached background pass: run inline instead (bgOnly) so its writes are observable.
-  spawn: vi.fn(() => ({ on: vi.fn(), stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) }, unref: vi.fn() })),
+  // A foreground dispatch with a background handler still spawns the detached
+  // child for real (spawnBackground): on win32 that goes through the WMI
+  // escape first, whose promise only settles via the process's own
+  // 'close'/'error' event. A bare `on: vi.fn()` never fires it, hanging every
+  // such test until timeout -- so this fires 'close' with a success code,
+  // same as hook-dispatch-cli.test.ts's fakePowerShell helper.
+  spawn: vi.fn(() => {
+    const child = {
+      stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
+      on(event: string, cb: (...args: unknown[]) => void) {
+        if (event === 'close') setTimeout(() => cb(0), 0);
+        return child;
+      },
+      unref: vi.fn(),
+    };
+    return child;
+  }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', () => ({
   doUpdate: vi.fn(async () => undefined),
   // appendEvent and compactEvents take the events file's lock (#804); the
@@ -26,39 +42,65 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('../local-agent.js', () => ({ reportAndSyncFromHook: vi.fn(async () => null) }));
-// Each scope's reports branch is a plain directory next to its team repo.
+// Each scope's reports branch is a plain directory next to its team repo. The
+// mock publishes immediately: the write lands, `onDelivered` hooks run, and
+// "origin" is that same directory's current content.
 vi.mock('../utils/reports-branch.js', () => ({
-  updateReports: vi.fn(async (cfg: LocalConfig, write: (wt: string) => Promise<unknown>) => {
+  updateReports: vi.fn(async (cfg: LocalConfig, write: (wt: string, ctx: { onDelivered: (fn: () => Promise<void>) => void }) => Promise<unknown>) => {
     const dir = path.join(path.dirname(cfg.repo.localPath), 'reports-wt');
     fs.mkdirSync(dir, { recursive: true });
-    return (await write(dir)) != null;
+    const delivered: (() => Promise<void>)[] = [];
+    const change = await write(dir, { onDelivered: (fn) => { delivered.push(fn); } });
+    for (const fn of delivered) await fn();
+    return { status: change != null ? 'published' : 'already-present' };
+  }),
+  readReportsOriginFile: vi.fn(async (wt: string, relPath: string) => {
+    try { return fs.readFileSync(path.join(wt, relPath), 'utf8'); } catch { return null; }
   }),
 }));
 
 const { hookDispatchCli } = await import('../hook-dispatch-cli.js');
 const { resolveProjectDataHome, saveLocalConfigForScope, resolveConfigForDir, loadLocalConfig } = await import('../config.js');
 const { reportUsageToTeam } = await import('../team-push.js');
+const { reconcileHooks } = await import('../hooks.js');
 const { getDataHome } = await import('../types.js');
 const { dataHomeKey } = await import('../dashboard-collector.js');
+const { SESSION_RUN_PAYLOAD_KEY, sessionRun } = await import('../launch-context.js');
 const dataHomeKeyOf = (config: LocalConfig) => dataHomeKey(getDataHome(config));
 
 let tmp: string;
-let originalHome: string | undefined;
-let originalCwd: string;
+const originalHome = process.env.HOME;
+const originalCwd = process.cwd();
 
-beforeEach(() => {
-  tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-scope-')));
-  originalHome = process.env.HOME;
-  originalCwd = process.cwd();
-  process.env.HOME = path.join(tmp, 'home');
-  fs.mkdirSync(process.env.HOME);
+// HOME is process-wide, and Vitest does not stop a test body that times out:
+// left running, it writes into the next test's HOME and fails that test. So
+// each test's body is kept, and afterEach waits for it before that HOME goes.
+let body: Promise<void> | undefined;
+const keep = <A extends unknown[]>(fn: (...args: A) => Promise<void>) => (...args: A) => (body = fn(...args));
+const it = Object.assign((name: string, fn: () => Promise<void>) => vitestIt(name, keep(fn)), {
+  each: <T extends unknown[] | [unknown]>(cases: readonly T[]) =>
+    (name: string, fn: (...args: T) => Promise<void>) => vitestIt.each(cases)(name, keep(fn)),
 });
 
-afterEach(() => {
-  process.chdir(originalCwd);
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
-  fs.rmSync(tmp, { recursive: true, force: true });
+beforeEach(async () => {
+  tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-scope-')));
+  process.env.HOME = path.join(tmp, 'home');
+  fs.mkdirSync(process.env.HOME);
+  // Copilot runs the built-ins it has installed.
+  await reconcileHooks(path.join(process.env.HOME, '.copilot', 'hooks', 'teamai.json'), 'copilot');
+});
+
+afterEach(async () => {
+  // A wait that outlives hookTimeout lets the next test start: this teardown
+  // then removes only its own directory and leaves that test's HOME alone.
+  const own = { tmp, home: process.env.HOME };
+  await Promise.allSettled([body]);
+  if (process.env.HOME === own.home) {
+    process.chdir(originalCwd);
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+  fs.rmSync(own.tmp, { recursive: true, force: true });
 });
 
 const teamaiHome = () => path.join(tmp, 'home', '.teamai');
@@ -1328,5 +1370,106 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
     writeSharedSnapshots({ 'rollback-p': 1 }, new Date().toISOString().slice(0, 10));
 
     expect(await report(project)).toBeNull();
+  });
+});
+
+describe('the usage report counts the member\'s own sessions, split by run mode (#1384)', () => {
+  /**
+   * One session run with `env` in its host's environment. The background passes run with none of it: they read the
+   * mode and the launcher from the payload, as the foreground dispatcher forwards them.
+   */
+  async function sessionIn(env: Record<string, string>, base: Record<string, unknown>): Promise<void> {
+    for (const [event, name] of [['session-start', 'SessionStart'], ['prompt-submit', 'UserPromptSubmit'], ['stop', 'Stop']] as const) {
+      const payload = { ...base, hook_event_name: name, ...(event === 'prompt-submit' ? { prompt: 'hello' } : {}) };
+      const stdinFile = path.join(tmp, `stdin-${Date.now()}-${Math.random()}.json`);
+      for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+      let forwarded: ReturnType<typeof sessionRun>;
+      try {
+        fs.writeFileSync(stdinFile, JSON.stringify(payload));
+        await hookDispatchCli(event, 'claude', '*', { stdinFile });
+        forwarded = sessionRun(process.env);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      fs.writeFileSync(stdinFile, JSON.stringify({ ...payload, [SESSION_RUN_PAYLOAD_KEY]: forwarded }));
+      await hookDispatchCli(event, 'claude', '*', { bgOnly: true, stdinFile });
+    }
+  }
+
+  const events = () => fs.readFileSync(path.join(teamaiHome(), 'dashboard', 'events.jsonl'), 'utf-8')
+    .split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  it('a background pass records the mode and launcher its payload carries, with neither in its environment', async () => {
+    const { root } = await setup();
+    const stdinFile = path.join(tmp, 'stop.json');
+    fs.writeFileSync(stdinFile, JSON.stringify({
+      session_id: 'sid-step', cwd: root, hook_event_name: 'Stop', [SESSION_RUN_PAYLOAD_KEY]: { runMode: 'unattended', launchedBy: 'workflow' },
+    }));
+
+    await hookDispatchCli('stop', 'claude', '*', { bgOnly: true, stdinFile });
+
+    expect(events().find((event) => event.type === 'stop')).toMatchObject({ sessionId: 'sid-step', runMode: 'unattended', launchedBy: 'workflow' });
+  });
+
+  it('a session a workflow step launched adds nothing to the member\'s totals', async () => {
+    const { root, project } = await setup();
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, { session_id: 'sid-step', cwd: root });
+
+    expect(events().map((event) => [event.type, event.runMode, event.launchedBy])).toEqual([
+      ['session_start', 'attended', 'workflow'], ['prompt_submit', 'attended', 'workflow'], ['stop', 'attended', 'workflow'],
+    ]);
+    expect(await report(project)).toBeNull();
+  });
+
+  it('keeps the top-level counters, adds each mode\'s, and leaves what was recorded without a mode in neither', async () => {
+    const { root, project } = await setup();
+    const statsPath = path.join(path.dirname(project.repo.localPath), 'reports-wt', 'stats', 'tester.yaml');
+    fs.mkdirSync(path.dirname(statsPath), { recursive: true });
+    // Written before modes were recorded.
+    fs.writeFileSync(statsPath, YAML.stringify({
+      username: 'tester', updatedAt: '2026-01-01T00:00:00.000Z', skills: {},
+      interventions: { sessions: 5, interrupt: 1, toolReject: 0, correction: 0 }, prompts: 30,
+    }));
+    await sessionIn({}, { session_id: 'sid-attended', cwd: root });
+    await sessionIn({ CI: 'true' }, { session_id: 'sid-unattended', cwd: root });
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, { session_id: 'sid-step', cwd: root });
+
+    const stats = await report(project);
+
+    expect(stats).toMatchObject({
+      interventions: { sessions: 7, interrupt: 1 },
+      prompts: 32,
+      attended: { interventions: { sessions: 1, interrupt: 0 }, prompts: 1 },
+      unattended: { interventions: { sessions: 1, interrupt: 0 }, prompts: 1 },
+    });
+    // A second report adds nothing: each mode compares against the same baselines.
+    expect(await report(project)).toEqual(stats);
+  });
+
+  it('counts a session a workflow step continued only up to the step, so none of the step\'s turns reach the member', async () => {
+    const { root, project } = await setup();
+    const transcript = path.join(tmp, 'continued.jsonl');
+    let turns = 0;
+    const turn = (inputTokens: number): void => {
+      turns += 1;
+      fs.appendFileSync(transcript, [
+        { type: 'user', message: { content: [{ type: 'text', text: 'please continue' }] } },
+        { type: 'assistant', message: { id: `msg-${turns}`, content: [{ type: 'text', text: 'done' }], usage: { input_tokens: inputTokens, output_tokens: 5 } } },
+      ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    };
+    const continued = { session_id: 'sid-continued', cwd: root, transcript_path: transcript };
+
+    turn(10);
+    await sessionIn({}, continued);
+    turn(20);
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, continued);
+    // The member resumes the session: its transcript now holds the step's turn too.
+    turn(10);
+    await sessionIn({}, continued);
+
+    expect(await report(project)).toMatchObject({
+      prompts: 1, tokens: { input: 10, output: 5 },
+      attended: { prompts: 1, tokens: { input: 10, output: 5 } },
+    });
   });
 });

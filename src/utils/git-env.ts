@@ -23,10 +23,11 @@
 import { isInteractive } from './prompt.js';
 
 /**
- * Applied only where the caller left the variable unset, so an explicit value
- * always wins.
+ * Applied process-wide only where the caller left the variable unset, so an
+ * explicit value always wins there. A git child that must never prompt, even
+ * in an interactive run, gets it as its own environment.
  */
-const NON_INTERACTIVE_GIT_ENV: Record<string, string> = {
+export const NON_INTERACTIVE_GIT_ENV: Readonly<Record<string, string>> = {
   GIT_TERMINAL_PROMPT: '0',
   // `echo` answers the askpass request with an empty line, so the credential is
   // rejected at once instead of a dialog waiting for a person who is not there.
@@ -44,4 +45,36 @@ export function applyNonInteractiveGitEnv(): void {
   for (const [name, value] of Object.entries(NON_INTERACTIVE_GIT_ENV)) {
     if (process.env[name] === undefined) process.env[name] = value;
   }
+}
+
+/**
+ * Variables through which Git hands a hook the repository it runs for
+ * (`git rev-parse --local-env-vars`, minus GIT_CONFIG_COUNT and its
+ * GIT_CONFIG_KEY/VALUE pairs, which a member sets in their own environment and
+ * Git never adds for a hook). Every git child teamai starts would inherit them
+ * and act on the business repo instead of the team clone it names.
+ */
+export const GIT_REPOSITORY_ENV = [
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_CONFIG',
+  'GIT_CONFIG_PARAMETERS',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_IMPLICIT_WORK_TREE',
+  'GIT_GRAFT_FILE',
+  'GIT_INDEX_FILE',
+  'GIT_NO_REPLACE_OBJECTS',
+  'GIT_REPLACE_REF_BASE',
+  'GIT_PREFIX',
+  'GIT_INTERNAL_SUPER_PREFIX',
+  'GIT_SHALLOW_FILE',
+  'GIT_COMMON_DIR',
+] as const;
+
+/** `env` without the repository Git exported for a hook: a git child started with it acts on its cwd's repository. */
+export function withoutGitRepositoryEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const copy = { ...env };
+  for (const name of GIT_REPOSITORY_ENV) delete copy[name];
+  return copy;
 }

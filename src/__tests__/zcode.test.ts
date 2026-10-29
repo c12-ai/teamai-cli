@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { builtinHookDefs } from '../builtin-hooks.js';
 import { KNOWN_AGENTS } from '../known-agents.js';
 import { getHookStatus, hasTeamaiHooks, reconcileHooks } from '../hooks.js';
-import { agentFileExtensionForTool, ALL_SUPPORTED_TOOLS } from '../resources/agent-format.js';
-import { detectMcpFormat } from '../resources/mcp-format.js';
+import { agentFileExtensionForTool } from '../resources/agent-format.js';
 import { HookDef, TeamaiConfigSchema } from '../types.js';
+import { AGENT_TOOLS } from '../tools.js';
 
 describe('ZCode support', () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -19,7 +19,8 @@ describe('ZCode support', () => {
       skills: '.zcode/skills',
       agents: '.zcode/agents',
       settings: '.zcode/cli/config.json',
-      mcp: '.agents/mcp.json',
+      mcp: '.zcode/cli/config.json',
+      mcpProject: '.zcode/config.json',
     });
   });
 
@@ -28,9 +29,8 @@ describe('ZCode support', () => {
       displayName: 'ZCode',
       skillsPath: '.zcode/skills',
     });
-    expect(ALL_SUPPORTED_TOOLS).toContain('zcode');
+    expect(AGENT_TOOLS).toContain('zcode');
     expect(agentFileExtensionForTool('zcode')).toBe('.md');
-    expect(detectMcpFormat('zcode')).toBe('claude');
   });
 
   it('generates raw (unwrapped) dispatch commands for ZCode', () => {
@@ -40,7 +40,7 @@ describe('ZCode support', () => {
     for (const def of defs) {
       // Process-type entries get their shell wrapper added by the ZCode writer
       // (bash + args), so the command itself must be wrapper-free.
-      expect(def.command.startsWith('teamai hook-dispatch ')).toBe(true);
+      expect(def.command).toMatch(/^(?:PATH="\$HOME\/\.teamai\/bin:\$PATH" )?teamai hook-dispatch /);
       expect(def.command).toContain('--tool zcode');
       expect(def.command).not.toContain('bash -lc');
     }
@@ -77,16 +77,15 @@ describe('ZCode support', () => {
           }
           expect(hook.type).toBe('process');
           if (process.platform === 'win32') {
-            // wscript.exe is a GUI-subsystem binary — hook runs never flash a
-            // console window, and the hidden VBS launcher keeps the session
-            // start non-blocking even while the dispatch pulls over the
-            // network.
-            expect(hook.command).toBe('wscript.exe');
-            expect(hook.args?.[0]).toContain('teamai-hook-dispatch.vbs');
+            // The entry runs the Node launcher, which hands ZCode's stdio to
+            // the dispatch and the reply back. The WSH hosts cannot: wscript
+            // has no StdOut at all, and cscript re-encodes redirected stdout.
+            expect(hook.command).toBe('node');
+            expect(hook.args?.[0]).toContain('teamai-hook-dispatch.mjs');
           } else {
             // POSIX has no console-flash problem: the tail runs directly.
             expect(hook.command).toBe('bash');
-            expect(hook.args?.[0]).toBe('-lc');
+            expect(hook.args?.[0]).toBe('-c');
           }
           // The command tail is the LAST argv slot on every platform, stored
           // verbatim for managed-entry detection and the manifest.
@@ -99,20 +98,22 @@ describe('ZCode support', () => {
       expect(await getHookStatus(configPath, 'zcode')).toBe('installed');
 
       if (process.platform === 'win32') {
-        // The launcher script is content-managed: assert the template shipped
-        // by THIS build — it dispatches Arguments(0) verbatim with no
-        // hardcoded prefix (a stale prefix doubled the tail and dispatched
-        // event=teamai; shape-only assertions missed exactly that bug).
-        const vbs = await fse.readFile(
-          path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs'),
+        // The launcher is content-managed: assert the template shipped by THIS
+        // build and what makes it work — it forwards the caller's argv, inherits
+        // the caller's streams, and names no dispatch command of its own (a
+        // hardcoded one would double the tail the way the old launcher's stale
+        // prefix did, which shape-only assertions missed).
+        const launcher = await fse.readFile(
+          path.join(path.dirname(configPath), 'teamai-hook-dispatch.mjs'),
           'utf-8',
         );
-        expect(vbs).toContain('WScript.Arguments(0)');
-        expect(vbs).not.toContain('""teamai hook-dispatch');
+        expect(launcher).toContain('process.argv[2]');
+        expect(launcher).toContain("stdio: 'inherit'");
+        expect(launcher).not.toContain('teamai hook-dispatch');
 
         // A deleted/quarantined launcher must not be reported as installed:
         // the entries are dead without the script.
-        await fse.remove(path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs'));
+        await fse.remove(path.join(path.dirname(configPath), 'teamai-hook-dispatch.mjs'));
         expect(await getHookStatus(configPath, 'zcode')).toBe('missing');
       }
     } finally {
@@ -142,8 +143,8 @@ describe('ZCode support', () => {
     try {
       const configPath = path.join(home, '.zcode', 'cli', 'config.json');
       await fse.ensureDir(path.dirname(configPath));
-      // An entry written by an older generation: [vbsPath, 'wait', tail].
-      const vbs = path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs');
+      // An entry written by an older generation: [launcherPath, 'wait', tail].
+      const legacyLauncher = path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs');
       await fse.writeJson(configPath, {
         hooks: {
           enabled: true,
@@ -154,7 +155,7 @@ describe('ZCode support', () => {
                   {
                     type: 'process',
                     command: 'wscript.exe',
-                    args: [vbs, 'wait', 'teamai hook-dispatch session-start --tool zcode'],
+                    args: [legacyLauncher, 'wait', 'teamai hook-dispatch session-start --tool zcode'],
                     timeoutMs: 180000,
                   },
                 ],
@@ -173,12 +174,12 @@ describe('ZCode support', () => {
       );
       // The legacy entry must be recognized as managed and replaced, not
       // kept alongside a fresh copy. The fresh entry carries the tail as its
-      // LAST argv slot on every platform ([vbsPath, tail] on win32,
-      // ['-lc', tail] on POSIX) and no mode slot.
+      // LAST argv slot on every platform ([launcherPath, tail] on win32,
+      // ['-c', tail] on POSIX) and no mode slot.
       expect(withPayload).toHaveLength(1);
       const fresh = withPayload[0].hooks[0].args ?? [];
       expect(fresh).toHaveLength(2);
-      expect(fresh[1]).toBe('teamai hook-dispatch session-start --tool zcode');
+      expect(fresh[1]).toBe(builtinHookDefs('zcode').find((def) => def.event === 'SessionStart')!.command);
       expect(fresh.some((a) => a === 'wait')).toBe(false);
     } finally {
       await fse.remove(home);
@@ -205,11 +206,11 @@ describe('ZCode support', () => {
       }
       expect(await hasTeamaiHooks(configPath, 'zcode')).toBe(false);
       expect(await getHookStatus(configPath, 'zcode')).toBe('missing');
-      // The launcher script must be deleted even when its content matches the
-      // current template exactly — a content-diff gate would skip it and leave
-      // the file behind.
+      // The launcher must be deleted even when its content matches the current
+      // template exactly — a content-diff gate would skip it and leave the file
+      // behind.
       expect(
-        await fse.pathExists(path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs')),
+        await fse.pathExists(path.join(path.dirname(configPath), 'teamai-hook-dispatch.mjs')),
       ).toBe(false);
     } finally {
       await fse.remove(home);
@@ -351,6 +352,30 @@ describe('ZCode support', () => {
         expect(entries).toEqual([]);
       }
       expect(await hasTeamaiHooks(configPath, 'zcode')).toBe(false);
+    } finally {
+      await fse.remove(home);
+    }
+  });
+
+  it('deletes the pre-fix WSH launcher on inject and on removeAll', async () => {
+    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-zcode-test-'));
+    try {
+      const configPath = path.join(home, '.zcode', 'cli', 'config.json');
+      const legacy = path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs');
+      await fse.ensureDir(path.dirname(configPath));
+      await fse.outputFile(legacy, "' a launcher this fix replaced\n");
+
+      await reconcileHooks(configPath, 'zcode');
+
+      // No entry references the .vbs once the entries point at the .mjs, so
+      // inject must delete it rather than strand it in ~/.zcode forever.
+      expect(await fse.pathExists(legacy)).toBe(false);
+      expect(await getHookStatus(configPath, 'zcode')).toBe('installed');
+
+      await fse.outputFile(legacy, "' a launcher this fix replaced\n");
+      await reconcileHooks(configPath, 'zcode', [], { removeAll: true });
+
+      expect(await fse.pathExists(legacy)).toBe(false);
     } finally {
       await fse.remove(home);
     }

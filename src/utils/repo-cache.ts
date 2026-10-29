@@ -1,7 +1,9 @@
 import path from 'node:path';
-import os from 'node:os';
 
 import fs from 'fs-extra';
+
+import { getUserHome } from './home.js';
+import { assertSafePath, assertWithinRoot } from './path-safety.js';
 
 // ─── Constants ──────────────────────────────────────────
 
@@ -13,10 +15,21 @@ const LAST_SYNC_FILE = 'LAST_SYNC';
  * 返回缓存根目录（可通过 TEAMAI_CACHE_DIR 环境变量覆盖）。
  */
 function getCacheRoot(): string {
-    return process.env.TEAMAI_CACHE_DIR ?? path.join(os.homedir(), '.teamai', 'cache', 'repos');
+    return process.env.TEAMAI_CACHE_DIR ?? path.join(getUserHome(), '.teamai', 'cache', 'repos');
 }
 
 // ─── Public API ─────────────────────────────────────────
+
+/** Check the current filesystem boundary again immediately before destructive cache operations. */
+export function assertSafeRepoCachePath(cacheDir: string): void {
+    const root = path.resolve(getCacheRoot());
+    const target = path.resolve(cacheDir);
+    assertWithinRoot(root, target);
+    if (target === root) {
+        throw new Error('Invalid repository cache path: expected a repository below the cache root.');
+    }
+    assertSafePath(target, [root]);
+}
 
 /**
  * 计算单仓的本地缓存目录：~/.teamai/cache/repos/<provider>/<owner>/<repo>
@@ -26,7 +39,15 @@ function getCacheRoot(): string {
  * @param repo      仓库名
  */
 export function getRepoCacheDir(provider: string, owner: string, repo: string): string {
-    return path.join(getCacheRoot(), provider, owner, repo);
+    const segments = [provider, ...owner.split('/'), repo];
+    // URL parsers do not validate filesystem components; clone cleanup deletes this path before fetching.
+    if (provider.includes('/') || repo.includes('/') || segments.some((segment) =>
+        !segment || /^[. ]+$/.test(segment) || /[\\:]/.test(segment) || segment.includes('\0'))) {
+        throw new Error('Invalid repository cache path: expected a provider, owner/group and repository name without traversal segments.');
+    }
+    const cacheDir = path.join(getCacheRoot(), ...segments);
+    assertSafeRepoCachePath(cacheDir);
+    return cacheDir;
 }
 
 /**

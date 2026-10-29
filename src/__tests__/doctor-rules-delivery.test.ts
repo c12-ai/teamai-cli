@@ -17,6 +17,8 @@ vi.mock('../utils/logger.js', () => ({
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
   setStderrOnly: vi.fn(),
+  isSilent: () => false,
+  setSilent: vi.fn(),
 }));
 
 import crypto from 'node:crypto';
@@ -24,6 +26,7 @@ import { loadLocalConfig, loadStateForScope, loadTeamConfig } from '../config.js
 import { buildChecks, doctor, resolveDoctorContext, type Check, type DoctorReport } from '../doctor.js';
 import { checkoutKey } from '../pull.js';
 import { StateSchema, TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 /**
  * The rules half of the delivery check (#624). A rule changes both its filename
@@ -86,6 +89,7 @@ describe('doctor — rules delivered on disk', () => {
   }
 
   async function checks(): Promise<Check[]> {
+    commitTeamRepo(repoPath);
     const ctx = await resolveDoctorContext();
     if (!ctx) throw new Error('expected a resolved doctor context');
     return buildChecks(ctx);
@@ -214,7 +218,8 @@ describe('doctor — rules delivered on disk', () => {
 
     const cursor = await rulesCheck('cursor');
     expect(await cursor.check()).toBe(false);
-    expect(cursor.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds those globs and nothing records teamai writing them: pull keeps it (#993).
+    expect(cursor.fix).toContain("not teamai's (kept by pull): reviews");
   });
 
   it('reports a .md copy whose body drifted from the team rule', async () => {
@@ -227,7 +232,9 @@ describe('doctor — rules delivered on disk', () => {
 
     const claude = await rulesCheck('claude');
     expect(await claude.check()).toBe(false);
-    expect(claude.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds that body and nothing records teamai writing it: pull keeps it (#993).
+    expect(claude.fix).toContain("not teamai's (kept by pull): reviews");
+    expect(claude.fix).toContain(`Kept ${drifted}: it is not teamai's`);
   });
 
   it.each([
@@ -247,7 +254,8 @@ describe('doctor — rules delivered on disk', () => {
     await fse.writeFile(reviews, `${frontmatter.replace('**/*.ts', '**/*.py')}Body of reviews\n`);
     const check = await rulesCheck(tool);
     expect(await check.check()).toBe(false);
-    expect(check.fix).toContain('delivered from an older copy: reviews');
+    // A hand edit with no record is the member's: pull keeps it (#993).
+    expect(check.fix).toContain("not teamai's (kept by pull): reviews");
     expect(check.fix).toContain(fields);
     expect(check.fix).not.toContain('.mdc');
   });
@@ -580,6 +588,107 @@ describe('doctor — rules delivered on disk', () => {
     vi.stubEnv('HERMES_HOME', path.join(tempDir, 'no-hermes'));
 
     expect(await namedCheck('Team rules are inlined in Hermes SOUL.md')).toBeUndefined();
+  });
+
+  describe('Cursor workspaces outside the home directory (#1197)', () => {
+    const CURSOR_HOOKS = '.cursor/hooks.json';
+    const OUTSIDE_HOME = 'Team rules reach Cursor workspaces outside the home directory';
+    const WITH_ENV_HINT = 'Team rules and the team env hint fit one Cursor hook reply';
+
+    async function writeCursorHooks(sessionStart: unknown[]): Promise<void> {
+      await fse.outputFile(path.join(homeDir, CURSOR_HOOKS), JSON.stringify({ version: 1, hooks: { sessionStart } }));
+    }
+
+    beforeEach(() => {
+      teamConfig.toolPaths.cursor = { rules: CURSOR_RULES, settings: CURSOR_HOOKS };
+    });
+
+    it('passes when ~/.cursor/hooks.json registers the teamai sessionStart hook', async () => {
+      await writeCursorHooks([{ command: 'bash -lc "teamai hook-dispatch session-start --tool cursor 2>/dev/null" || true' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+    });
+
+    it('fails when no teamai sessionStart hook is registered, saying why the rules file is not enough', async () => {
+      await writeCursorHooks([]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('only in a workspace under the home directory');
+      expect(check.fix).toContain('teamai hooks inject');
+    });
+
+    it.each([
+      ['teamai hook-dispatch session-start --tool claude', false],
+      ['teamai hook-dispatch session-start --tool cursor-agent', false],
+      ['teamai hook-dispatch session-start --tool=cursor', true],
+    ])('reads the dispatch\'s --tool value: %s', async (command, passes) => {
+      await writeCursorHooks([{ command }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(passes);
+    });
+
+    it('passes near the limit when nothing else shares the hook reply', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(9_500)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+      expect(await (await namedCheck(WITH_ENV_HINT))!.check()).toBe(true);
+    });
+
+    it('flags the team env hint pushing the rules out of the shared hook reply', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(9_800)}\n`);
+      await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: API_URL\n    value: https://example.invalid\n');
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+      const shared = (await namedCheck(WITH_ENV_HINT))!;
+      expect(shared.informational).toBe(true);
+      expect(await shared.check()).toBe(false);
+      expect(shared.fix).toContain('leaves the rules out');
+    });
+
+    it('names the length, not the team\'s builtin.disabled entry, while the hook is still registered', async () => {
+      await fse.outputFile(path.join(repoPath, 'hooks', 'hooks.yaml'), 'builtin:\n  disabled:\n    - Hook dispatch session-start\n');
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(10_000)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(check.fix).not.toContain('builtin.disabled');
+      expect(check.fix).toContain('characters');
+    });
+
+    it('tells the member to repair invalid JSON by hand, which hooks inject will not rewrite', async () => {
+      await fse.outputFile(path.join(homeDir, CURSOR_HOOKS), '{ invalid JSON');
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('Fix the file by hand');
+    });
+
+    it('names the team\'s builtin.disabled entry when the team turned the session-start hook off', async () => {
+      await fse.outputFile(path.join(repoPath, 'hooks', 'hooks.yaml'), 'builtin:\n  disabled:\n    - Hook dispatch session-start\n');
+      await writeCursorHooks([]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('builtin.disabled');
+    });
+
+    it('fails when the rules are over Cursor\'s hook context limit', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(10_000)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('10000-character limit');
+    });
+
+    it('emits no check in project scope, where the project delivers into the workspace itself', async () => {
+      Object.assign(localConfig, { scope: 'project', projectRoot: path.join(tempDir, 'project') });
+
+      expect(await namedCheck(OUTSIDE_HOME)).toBeUndefined();
+    });
   });
 
   describe('Hermes in project scope (#946)', () => {

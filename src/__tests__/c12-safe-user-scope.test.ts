@@ -11,13 +11,12 @@ vi.mock('../utils/logger.js', () => ({
 import { SkillsHandler } from '../resources/skills.js';
 import { RulesHandler } from '../resources/rules.js';
 import { judgeCopy, openLedger, recordDelivered, reportKept, type DeliveredHashes } from '../resources/delivered-copies.js';
-import { updateReports } from '../utils/reports-branch.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig, ResourceItem, TeamaiConfig } from '../types.js';
 
-// c12 fork: a member's own skills, rules and agents are never teamai's to
-// overwrite or delete, and nothing reaches the team repo's reports branch
-// unless the team opts in.
+// c12 fork: a same-named skill, rule or agent takes the team version, while a
+// member's own file with a name the team does not deliver is never teamai's to
+// delete.
 
 let tmp: string;
 let home: string;
@@ -65,9 +64,11 @@ describe('a same-named skill teamai did not deliver (the team version replaces i
     await fse.outputFile(path.join(home, '.claude', 'skills', 'tdd', 'SKILL.md'), '---\nname: tdd\ndescription: Mine\n---\nMy own skill.\n');
   });
 
-  it('is judged a replacement with no record at all, as on the first pull after init', async () => {
+  it('is judged the member\'s by upstream with no record at all, as on the first pull after init', async () => {
     const dest = path.join(home, '.claude', 'skills', 'tdd');
-    expect(await judgeCopy(undefined, skillItem('tdd'), { tool: 'claude', dest })).toEqual({ kind: 'write', replaces: 'foreign' });
+    const origin = { repoPath: repo, pathspec: 'skills/tdd' };
+    // Upstream's judgement (#993); keepsEditedCopy turns it into a replacement (c12-project-entry.test.ts).
+    expect(await judgeCopy(undefined, skillItem('tdd'), { tool: 'claude', dest, origin })).toEqual({ kind: 'member' });
   });
 
   it('is replaced by the team version, recorded, and named in a warning', async () => {
@@ -126,32 +127,5 @@ describe('an unrecorded copy holding bytes the team repo once had', () => {
     await new RulesHandler().pullAllRules(teamConfig, localConfig(), undefined, [], openLedger(undefined));
 
     expect(await fse.readFile(copy, 'utf8')).toBe('# Team rule v2\n');
-  });
-});
-
-describe('reports without `usageReport: true`', () => {
-  const git = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
-
-  it.each([
-    ['no usageReport key', 'team: acme\nrepo: origin\n'],
-    ['usageReport: false', 'team: acme\nrepo: origin\nusageReport: false\n'],
-  ])('writes, commits and pushes nothing (%s)', async (_label, teamYaml) => {
-    const seed = path.join(tmp, 'seed');
-    await fse.outputFile(path.join(seed, 'teamai.yaml'), teamYaml);
-    git(tmp, 'init', '-q', '--initial-branch=main', seed);
-    git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', 'init');
-    const origin = path.join(tmp, 'origin.git');
-    git(tmp, 'clone', '-q', '--bare', seed, origin);
-    const clone = path.join(tmp, 'clone');
-    git(tmp, 'clone', '-q', origin, clone);
-
-    const write = vi.fn(async () => ({ files: ['members/'], message: '[teamai] Register member: member' }));
-    const config = { ...localConfig(), repo: { localPath: clone, remote: origin, kind: 'git' } } as LocalConfig;
-    expect(await updateReports(config, write)).toBe(false);
-
-    expect(write).not.toHaveBeenCalled();
-    expect(git(origin, 'branch', '--list', 'teamai-reports').trim()).toBe('');
-    expect(git(clone, 'branch', '--list', 'teamai-reports').trim()).toBe('');
   });
 });

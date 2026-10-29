@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -13,9 +14,13 @@ import {
   aggregateSessionInterventions,
   aggregateSessionMetrics,
   compactEvents,
+  memberEvents,
   reconcileRequestLog,
   dedupeEvents,
+  dashboardReport,
+  GIT_AT_START_PAYLOAD_KEY,
 } from '../dashboard-collector.js';
+import { collectSession } from '../session-collector.js';
 import type { DashboardEvent } from '../types.js';
 import * as pidMonitor from '../pid-monitor.js';
 import { _resetState as resetLogger, _setLogFilePath } from '../utils/logger.js';
@@ -1156,6 +1161,46 @@ describe('parseHookEvent', () => {
     expect(event!.tool).toBe('claude-internal');
   });
 
+  it('extracts Codex answers before the summary limit and ignores question metadata', async () => {
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([
+      { questionItemId: 'id'.repeat(200), question: 'wrong?', answer: 'Use the web interface.' },
+      { question: 'Language?', answer: '简体中文' },
+    ]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe('Use the web interface.\n简体中文');
+    expect(event?.correction).toBe(false);
+  });
+
+  it.each(['tcodex', 'codex-internal'])('extracts Codex answers for %s', async (tool) => {
+    const prompt = '<send_user_message_question_reply>[{"questionItemId":"q1","answer":"Use the web interface."}]</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+    expect(event?.promptSummary).toBe('Use the web interface.');
+  });
+
+  it('redacts and caps extracted Codex answers', async () => {
+    const answer = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ' + 'x'.repeat(250) + ' wrong';
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([{ answer }]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toContain('<REDACTED:gh_tok>');
+    expect(event?.promptSummary).not.toContain('ghp_');
+    expect(event?.promptSummary).toHaveLength(200);
+    expect(event?.correction).toBe(true);
+  });
+
+  it.each(['not JSON', '[]', '[{"answer":42}]', '[{"answer":"Yes"},{}]', '[{"answer":""}]'])('preserves unsupported Codex reply payloads: %s', async (payload) => {
+    const prompt = '<send_user_message_question_reply>' + payload + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe(prompt);
+  });
+
+  it('preserves ordinary prompts and wrappers from other tools', async () => {
+    const wrapper = '<send_user_message_question_reply>[{"answer":"Yes"}]</send_user_message_question_reply>';
+    for (const [tool, prompt] of [['claude', wrapper], ['codex', 'Explain ' + wrapper], ['codex', 'A normal prompt']]) {
+      const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+      expect(event?.promptSummary).toBe(prompt);
+    }
+  });
+
   it('flags a correction prompt on UserPromptSubmit', async () => {
     const raw = JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'wrong, redo it' });
     const event = await parseHookEvent(raw, 'claude');
@@ -1456,6 +1501,83 @@ describe('parseHookEvent', () => {
       cacheReadTokens: 8,
       cacheEligibleInputTokens: 24,
     });
+  });
+});
+
+// Records trimmed from a Muse Code 1.4.6 session.jsonl.
+describe('parseHookEvent: Muse Code session tokens', () => {
+  const sessionId = '01a131de-7a62-70c3-bc37-60b3e2c6575b';
+  const usageRecord = (family: string, input: number, output: number, cached: number) => JSON.stringify({
+    schema_version: 1,
+    stream: { kind: 'session', id: sessionId },
+    record_type: 'event',
+    payload_type: 'runtime.session',
+    payload: {
+      kind: 'run',
+      event: {
+        kind: 'goal_usage_attribution',
+        record: {
+          usage_family: family,
+          quantity: { unit: 'tokens', reported: family === 'provider', input_tokens: input, output_tokens: output, cached_tokens: cached, reasoning_tokens: 0 },
+          owner: { requester_kind: 'main', session_id: sessionId, owner_type: 'main_root' },
+        },
+      },
+    },
+  });
+  const sessionDir = () => path.join(tmpDir, '.local', 'share', 'muse', 'sessions', '2026', '10', '12', sessionId);
+  const stop = () => parseHookEvent(JSON.stringify({
+    hook_event_name: 'Stop', session_id: sessionId, cwd: '/work/project', transcript_path: null,
+  }), 'muse');
+
+  it('sums the main log usage into session tokens, cached input apart', async () => {
+    fs.mkdirSync(path.join(sessionDir(), 'subagent', 'child-1'), { recursive: true });
+    fs.writeFileSync(path.join(sessionDir(), 'session.jsonl'), [
+      JSON.stringify({ schema_version: 1, stream: { kind: 'session', id: sessionId }, payload: { kind: 'user_message', text: 'hello' } }),
+      usageRecord('provider', 111, 22, 10),
+      usageRecord('tool', 0, 0, 0),
+      usageRecord('provider', 111, 22, 0),
+    ].join('\n') + '\n');
+    fs.writeFileSync(path.join(sessionDir(), 'subagent', 'child-1', 'session.jsonl'), usageRecord('provider', 5000, 500, 0) + '\n');
+
+    const event = await stop();
+
+    expect(event).toEqual(expect.objectContaining({
+      type: 'stop',
+      tool: 'muse',
+      tokens: { input: 212, output: 44, cacheRead: 10, cacheCreation: 0 },
+      tokenScope: 'session',
+    }));
+  });
+
+  it('records no tokens when the session has no log', async () => {
+    const event = await stop();
+
+    expect(event?.type).toBe('stop');
+    expect(event?.tokens).toBeUndefined();
+  });
+
+  it('finds the log under $XDG_DATA_HOME when muse relocated its data (#1138)', async () => {
+    // muse 1.4.6 keeps sessions under $XDG_DATA_HOME/muse; the default
+    // ~/.local/share tree is empty and must not be consulted.
+    const xdgRoot = path.join(tmpDir, 'xdg-data');
+    vi.stubEnv('XDG_DATA_HOME', xdgRoot);
+    try {
+      const dir = path.join(xdgRoot, 'muse', 'sessions', '2026', '10', '12', sessionId);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'session.jsonl'), usageRecord('provider', 111, 22, 10) + '\n');
+
+      const event = await stop();
+
+      expect(event).toEqual(expect.objectContaining({
+        type: 'stop',
+        // Muse reports input inclusive of cached tokens; the reader moves the
+        // cached part to cacheRead, so input is 111-10.
+        tokens: { input: 101, output: 22, cacheRead: 10, cacheCreation: 0 },
+        tokenScope: 'session',
+      }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -2145,6 +2267,47 @@ describe('compactEvents', () => {
     const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line).sessionId);
     expect(kept).toEqual(['pid-live', 'pid-live']);
   });
+
+  it('keeps only the first launched event of a session teamai launched, so a member resume of it stays cut off however often the log compacts (#1384)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const old = Date.now() - 3_600_000;
+    const at = (sessionId: string, type: string, second: number, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ type, timestamp: new Date(old + second * 1_000).toISOString(), sessionId, tool: 'claude', runMode: 'attended', ...extra });
+    const fillers = Array.from({ length: 5_000 }, (_, i) => at(`filler-${i}`, 'session_end', 0));
+    fs.writeFileSync(eventsPath, [
+      at('continued', 'stop', 1), at('continued', 'stop', 2, { launchedBy: 'workflow' }), at('continued', 'session_end', 3, { launchedBy: 'workflow' }),
+      at('member', 'stop', 1), at('member', 'session_end', 2),
+      at('step', 'stop', 1, { launchedBy: 'workflow' }), at('step', 'session_end', 2, { launchedBy: 'workflow' }),
+      at('month-old step', 'stop', -31 * 24 * 3_600, { launchedBy: 'workflow' }),
+      ...fillers,
+    ].join('\n') + '\n');
+
+    await compactEvents(eventsPath);
+    fs.appendFileSync(eventsPath, fillers.join('\n') + '\n');
+    await compactEvents(eventsPath);
+
+    const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as DashboardEvent);
+    expect(kept.map((event) => [event.sessionId, event.timestamp])).toEqual([
+      ['continued', new Date(old + 2_000).toISOString()], ['step', new Date(old + 1_000).toISOString()],
+    ]);
+    const resumed = (sessionId: string): DashboardEvent => ({ type: 'stop', timestamp: new Date().toISOString(), sessionId, tool: 'claude', runMode: 'attended' });
+    expect(memberEvents([...kept, resumed('continued'), resumed('step')])).toEqual([]);
+  });
+
+  it('keeps every event of a launched session that stopped a moment ago, so the dashboard does not list it again (#1384)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const at = (type: string, minutesAgo: number) =>
+      JSON.stringify({ type, timestamp: new Date(Date.now() - minutesAgo * 60_000).toISOString(), sessionId: 'step', tool: 'claude', launchedBy: 'workflow' });
+    const filler = JSON.stringify({ type: 'session_end', timestamp: new Date(Date.now() - 3_600_000).toISOString(), sessionId: 'filler', tool: 'claude' });
+    fs.writeFileSync(eventsPath, [at('session_start', 10), at('session_end', 1), ...Array.from({ length: 5_000 }, () => filler)].join('\n') + '\n');
+
+    await compactEvents(eventsPath);
+
+    const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as DashboardEvent);
+    expect(rebuildSessions(kept)).toEqual([]);
+  });
 });
 
 // ─── events file lock (#804) ────────────────────────────
@@ -2630,5 +2793,170 @@ describe('dedupeEvents', () => {
     ];
     const out = dedupeEvents(events).map(e => e.timestamp);
     expect(out).toEqual([...out].sort());
+  });
+});
+
+// ─── git state at session start ─────────────────────────
+
+describe('dashboard-report records the git state a session started on', () => {
+  /** A user-scope config under HOME, so the hook resolves a scope for any cwd. */
+  function configureUserScope(): void {
+    const dir = path.join(tmpDir, '.teamai');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'config.yaml'), [
+      'username: tester',
+      'scope: user',
+      'repo:',
+      '  kind: git',
+      `  localPath: ${path.join(dir, 'team-repo')}`,
+      '  remote: https://example.test/acme/team.git',
+      'additionalRoles: []',
+      '',
+    ].join('\n'));
+  }
+
+  function git(cwd: string, ...args: string[]): string {
+    const run = spawnSync('git', [
+      '-c', 'user.name=Tester', '-c', 'user.email=tester@example.test', '-c', 'commit.gpgsign=false',
+      ...args,
+    ], { cwd, encoding: 'utf-8' });
+    if (run.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${run.stderr}`);
+    return run.stdout.trim();
+  }
+
+  /** A repo with one committed file; returns its path and the commit sha. */
+  function committedRepo(): { repo: string; head: string } {
+    const repo = path.join(tmpDir, 'repo');
+    fs.mkdirSync(repo, { recursive: true });
+    git(repo, 'init', '-q');
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'one\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '-q', '-m', 'init');
+    return { repo, head: git(repo, 'rev-parse', 'HEAD') };
+  }
+
+  /** Run `teamai dashboard-report --stdin` the way a hook does, with `payload` on STDIN. */
+  async function runHook(payload: Record<string, unknown>, tool = 'claude'): Promise<void> {
+    const fake = Readable.from([Buffer.from(JSON.stringify(payload), 'utf-8')]) as Readable & { isTTY?: boolean };
+    fake.isTTY = false;
+    const orig = Object.getOwnPropertyDescriptor(process, 'stdin')!;
+    Object.defineProperty(process, 'stdin', { value: fake, configurable: true });
+    try {
+      await dashboardReport(tool);
+    } finally {
+      Object.defineProperty(process, 'stdin', orig);
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.realpathSync.native(tmpDir);
+    configureUserScope();
+  });
+
+  it('records the commit and a clean tree', async () => {
+    const { repo, head } = committedRepo();
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-clean', cwd: repo });
+
+    const [start] = await readEvents();
+    expect(start.type).toBe('session_start');
+    expect(start.gitAtStart).toEqual({ head, dirty: false });
+  });
+
+  it('marks the tree dirty when a tracked file is modified', async () => {
+    const { repo, head } = committedRepo();
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'two\n');
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-modified', cwd: repo });
+
+    const [start] = await readEvents();
+    expect(start.gitAtStart).toEqual({ head, dirty: true });
+  });
+
+  it('marks the tree dirty when a change is staged', async () => {
+    const { repo } = committedRepo();
+    fs.writeFileSync(path.join(repo, 'added.txt'), 'new\n');
+    git(repo, 'add', 'added.txt');
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-staged', cwd: repo });
+
+    const [start] = await readEvents();
+    expect(start.gitAtStart?.dirty).toBe(true);
+  });
+
+  it('does not count untracked files as dirty', async () => {
+    const { repo, head } = committedRepo();
+    fs.writeFileSync(path.join(repo, 'scratch.txt'), 'untracked\n');
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-untracked', cwd: repo });
+
+    const [start] = await readEvents();
+    expect(start.gitAtStart).toEqual({ head, dirty: false });
+  });
+
+  it('still writes the event without git state outside git, and logs why', async () => {
+    const plain = path.join(tmpDir, 'plain');
+    fs.mkdirSync(plain, { recursive: true });
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'no-git', cwd: plain });
+
+    const [start] = await readEvents();
+    expect(start.type).toBe('session_start');
+    expect(start).not.toHaveProperty('gitAtStart');
+    expect(fs.readFileSync(path.join(tmpDir, '.teamai', 'debug.log'), 'utf-8'))
+      .toContain(`could not read the git state of ${plain} at session_start`);
+  });
+
+  it('records no git state in a repo with no commits', async () => {
+    const repo = path.join(tmpDir, 'empty-repo');
+    fs.mkdirSync(repo, { recursive: true });
+    git(repo, 'init', '-q');
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'no-commits', cwd: repo });
+
+    const [start] = await readEvents();
+    expect(start.type).toBe('session_start');
+    expect(start).not.toHaveProperty('gitAtStart');
+  });
+
+  it('runs git only for session_start', async () => {
+    const { repo } = committedRepo();
+
+    await runHook({ hook_event_name: 'PostToolUse', session_id: 'git-tool', cwd: repo, tool_name: 'Edit' });
+    await runHook({ hook_event_name: 'Stop', session_id: 'git-tool', cwd: repo });
+
+    const events = await readEvents();
+    expect(events.map((e) => e.type)).toEqual(['tool_use', 'stop']);
+    for (const e of events) {
+      expect(e).not.toHaveProperty('gitAtStart');
+    }
+  });
+
+  it('takes the git state the session start already read, and reads none itself', async () => {
+    const plain = path.join(tmpDir, 'plain');
+    fs.mkdirSync(plain, { recursive: true });
+    const read = { head: 'c'.repeat(40), dirty: true };
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-read', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: read });
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-none', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: null });
+
+    expect((await readEvents()).map((e) => e.gitAtStart)).toEqual([read, undefined]);
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'debug.log')) ? fs.readFileSync(path.join(tmpDir, '.teamai', 'debug.log'), 'utf-8') : '')
+      .not.toContain('could not read the git state');
+  });
+
+  it('records each start on its own, and collectSession reports the earliest', async () => {
+    const { repo, head: first } = committedRepo();
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-resume', cwd: repo });
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'two\n');
+    git(repo, 'commit', '-q', '-am', 'second');
+    const second = git(repo, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'three\n');
+    // A resume fires SessionStart again and records the state it resumed on.
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-resume', cwd: repo, source: 'resume' });
+
+    const events = await readEvents();
+    expect(events.map((e) => e.gitAtStart)).toEqual([{ head: first, dirty: false }, { head: second, dirty: true }]);
+    expect(collectSession('git-resume', events)?.gitAtStart).toEqual({ head: first, dirty: false });
   });
 });

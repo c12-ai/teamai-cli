@@ -20,10 +20,16 @@ vi.mock('../config.js', async (importOriginal) => ({
   saveStateForScope: vi.fn(),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // The real one: the docs prune reads the team history (#993).
+  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
   listWorktrees: vi.fn().mockResolvedValue([]),
+  // Git cannot name the repository: every other checkout's record is kept.
+  gitCommonDir: vi.fn().mockResolvedValue(null),
+  nearestGitEntry: vi.fn().mockResolvedValue(null),
+  resolveAnchors: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -50,9 +56,12 @@ vi.mock('../source.js', () => ({ pullSources: vi.fn().mockResolvedValue(undefine
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
   reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
+  deliveredHookFiles: vi.fn().mockResolvedValue([]),
+  unreadableHookFiles: vi.fn().mockResolvedValue([]),
 }));
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
+  describeKeptMemberServer: vi.fn(() => ''),
 }));
 vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(true) }));
 vi.mock('../usage-tracker.js', () => ({
@@ -72,6 +81,7 @@ import type { TeamaiConfig, LocalConfig } from '../types.js';
 import { recordGitHookFailure, readGitHookFailure } from '../git-hook.js';
 import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 describe('pull reports what reached the tool directory (#585)', () => {
   let tmpDir: string;
@@ -211,6 +221,11 @@ describe('pull reports what reached the tool directory (#585)', () => {
       state.lastPullTargets = [];
       await fse.outputFile(path.join(homeDir, 'docs', 'stale.md'), 'stale');
       await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: DOCS_TEST\n    value: delivered\n');
+      // docs/stale.md was a team doc the team since removed, so the prune may delete the copy (#993).
+      await fse.outputFile(path.join(repoPath, 'docs', 'stale.md'), 'stale');
+      commitTeamRepo(repoPath, 'stale');
+      await fse.remove(path.join(repoPath, 'docs', 'stale.md'));
+      commitTeamRepo(repoPath, 'remove stale');
       if (failure === 'copy') ioSpy = vi.spyOn(fse, 'copy').mockRejectedValueOnce(new Error('copy failed'));
       if (failure === 'prune') ioSpy = vi.spyOn(fse, 'unlink').mockRejectedValueOnce(new Error('prune failed'));
       if (failure === 'unsafe destination') teamConfig.sharing.docs.localDir = homeDir;
@@ -248,7 +263,7 @@ describe('pull reports what reached the tool directory (#585)', () => {
     },
   );
 
-  it.each(['user', 'project', 'none'])('aggregates inherited scope completion when docs fail in %s', async (failure) => {
+  it.each(['user', 'workspace', 'none'])('aggregates inherited scope completion when docs fail in %s', async (failure) => {
     const projectRoot = path.join(tmpDir, 'project');
     await fse.ensureDir(projectRoot);
     vi.mocked(detectProjectConfig).mockResolvedValue({
@@ -260,7 +275,7 @@ describe('pull reports what reached the tool directory (#585)', () => {
     const outcome = { completed: false };
     await pull({ silent: true, force: true }, outcome);
     expect(outcome.completed).toBe(failure === 'none');
-    for (const scope of ['user', 'project']) {
+    for (const scope of ['user', 'workspace']) {
       const succeeded = scope !== failure;
       expect(successLines().includes(`[${scope}] Synced 1 docs`)).toBe(succeeded);
       if (!succeeded) {
@@ -280,11 +295,15 @@ describe('pull reports what reached the tool directory (#585)', () => {
 
     await pull({ silent: true, force: true });
 
-    expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining('[project] Failed to sync docs:'));
+    expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining('[workspace] Failed to sync docs:'));
     // The marker stays cleared for a retry, and the record keeps its rev.
     expect(state.lastPullRev).toBeNull();
     // It also records what the pull delivered, docs failure or not (#822).
-    expect(state.lastPullByWorkspace?.[key]).toEqual({ rev: 'old1234', targets: [], pushBaseRevs: ['abc1234'], delivered: {} });
+    // And what it delivered there, for teamai's git exclude block (#915): nothing here.
+    // And that its tool roots were seeded, once (#1041).
+    // And each tool's skills, rules, instruction blocks and agents, and session tools' homes (#1221): no tool takes them here.
+    // And the selection it delivered for (#1178).
+    expect(state.lastPullByWorkspace?.[key]).toEqual({ rev: 'old1234', root: projectRoot, targets: [], pushBaseRevs: ['abc1234'], delivered: {}, gitExcludePaths: {}, places: { skills: {}, rules: {}, blocks: {}, agents: {} }, sessionToolHomes: {}, rootsSeeded: true, selection: { scope: 'project', additionalRoles: [] } });
   });
 
   it.each(['empty', 'missing'])('prunes only stale empty directories when the team bundle is %s', async (state) => {
@@ -303,6 +322,8 @@ describe('pull reports what reached the tool directory (#585)', () => {
   });
 
   it.each(['empty', 'missing'])('prunes docs through pull when the team bundle is %s (#794)', async (state) => {
+    // The copy pull delivers is a team version by the history, so the prune may delete it (#993).
+    commitTeamRepo(repoPath);
     await pull({ silent: true, force: true });
     await fse.remove(path.join(repoPath, 'docs'));
     if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));

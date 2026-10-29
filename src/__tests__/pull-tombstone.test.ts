@@ -19,7 +19,10 @@ vi.mock('../config.js', async (importOriginal) => ({
 /** The rev `refreshTeamRepo` resolves for the fake team repo in these tests. */
 const { HEAD_REV } = vi.hoisted(() => ({ HEAD_REV: 'rev-unchanged' }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // Real git: an unrecorded copy is proved from the team repo's history (#993),
+  // and a project pull asks whether its directory is a repository.
+  ...(await importOriginal<typeof import('../utils/git.js')>()),
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
   // Needed by the unchanged-rev fast path: without a rev, pull always does a
   // full sync and that branch is unreachable.
@@ -46,9 +49,10 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { pull, cleanupInactiveNamespaceSkills, checkoutKey } from '../pull.js';
-import { fileHash, listFilesRecursive } from '../utils/fs.js';
+import { fileHash } from '../utils/fs.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 vi.mock('../roles.js', () => ({
   loadRolesManifest: vi.fn().mockResolvedValue({
@@ -178,25 +182,12 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.remove(tmpDir);
   });
 
-  /**
-   * State on which each file at `paths` (every file under a directory) is
-   * what teamai delivered: tombstone cleanup removes only those (c12 fork).
-   */
-  const deliveredState = async (paths: string[], extra: Record<string, unknown> = {}): Promise<void> => {
-    const delivered: Record<string, string> = {};
-    for (const p of paths) {
-      const files = (await fse.stat(p)).isDirectory() ? (await listFilesRecursive(p)).map((rel) => path.join(p, rel)) : [p];
-      for (const file of files) delivered[file] = (await fileHash(file))!;
-    }
-    const key = await checkoutKey(homeDir);
-    vi.mocked(loadStateForScope).mockImplementation(async () => ({
-      lastPull: null,
-      ...extra,
-      lastPullByWorkspace: { [key]: { rev: 'old', targets: [], delivered } },
-    }) as unknown as Awaited<ReturnType<typeof loadStateForScope>>);
-  };
-
   it('should clean up local rule files that are tombstoned', async () => {
+    // The rule teamai delivered, before the team removed it: with no record
+    // of the copies, the history proves them teamai's (#993).
+    await fse.writeFile(path.join(repoPath, 'rules', 'old-rule.md'), '# Old');
+    commitTeamRepo(repoPath, 'old-rule');
+    await fse.remove(path.join(repoPath, 'rules', 'old-rule.md'));
     // Tombstone for "old-rule"
     await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'old-rule\n');
 
@@ -204,11 +195,39 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.writeFile(path.join(homeDir, '.claude/rules', 'old-rule.md'), '# Old');
     await fse.writeFile(path.join(homeDir, '.codex/rules', 'old-rule.md'), '# Old');
 
-    await deliveredState([path.join(homeDir, '.claude/rules', 'old-rule.md'), path.join(homeDir, '.codex/rules', 'old-rule.md')]);
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'old-rule.md'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.codex/rules', 'old-rule.md'))).toBe(false);
+  });
+
+  it('removes a verbatim tombstoned rule from a project directory a none-channel tool no longer writes, and keeps a member edit of another there (#993)', async () => {
+    const projectRoot = path.join(tmpDir, 'proj');
+    const user = await loadLocalConfigForScope('user');
+    const teamConfig = await loadTeamConfig(repoPath);
+    if (user === null || teamConfig === null) throw new Error('fixture config is missing');
+    vi.mocked(detectProjectConfig).mockResolvedValue({ ...user, scope: 'project', projectRoot });
+    vi.mocked(loadTeamConfig).mockResolvedValue({
+      ...teamConfig,
+      toolPaths: { ...teamConfig.toolPaths, hermes: { rules: '.hermes/rules' } },
+    });
+    // Blank, so the installed gate is the temporary ~/.hermes below, not a home this shell already set.
+    vi.stubEnv('HERMES_HOME', '');
+    await fse.writeFile(path.join(repoPath, 'rules', 'old-rule.md'), '# Old');
+    await fse.writeFile(path.join(repoPath, 'rules', 'kept-rule.md'), '# Kept');
+    commitTeamRepo(repoPath, 'rules');
+    await fse.remove(path.join(repoPath, 'rules', 'old-rule.md'));
+    await fse.remove(path.join(repoPath, 'rules', 'kept-rule.md'));
+    await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'old-rule\nkept-rule\n');
+    await fse.ensureDir(path.join(homeDir, '.hermes'));
+    const rulesDir = path.join(projectRoot, '.hermes', 'rules');
+    await fse.outputFile(path.join(rulesDir, 'old-rule.md'), '# Old');
+    await fse.outputFile(path.join(rulesDir, 'kept-rule.md'), 'Edited by the member.\n');
+
+    await pull({});
+
+    expect(await fse.pathExists(path.join(rulesDir, 'old-rule.md'))).toBe(false);
+    expect(await fse.readFile(path.join(rulesDir, 'kept-rule.md'), 'utf8')).toBe('Edited by the member.\n');
   });
 
   it("cleans up a tombstoned rule's flat OMP copy on record, not a member's file of that name or a live root rule (#946)", async () => {
@@ -239,6 +258,11 @@ describe('pull role-aware sync and cleanup', () => {
   });
 
   it('should clean up local skill directories that are tombstoned', async () => {
+    // The skill teamai delivered, before the team removed it: with no record
+    // of the copies, the history proves them teamai's (#993).
+    await fse.outputFile(path.join(repoPath, 'skills', 'old-skill', 'SKILL.md'), '# Old');
+    commitTeamRepo(repoPath, 'old-skill');
+    await fse.remove(path.join(repoPath, 'skills', 'old-skill'));
     // Tombstone for "old-skill"
     await fse.writeFile(path.join(repoPath, 'skills', '.removed'), 'old-skill\n');
 
@@ -248,7 +272,6 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.ensureDir(path.join(homeDir, '.codex/skills/old-skill'));
     await fse.writeFile(path.join(homeDir, '.codex/skills/old-skill/SKILL.md'), '# Old');
 
-    await deliveredState([path.join(homeDir, '.claude/skills/old-skill'), path.join(homeDir, '.codex/skills/old-skill')]);
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/skills/old-skill'))).toBe(false);
@@ -280,6 +303,11 @@ describe('pull role-aware sync and cleanup', () => {
   /** Writes a tombstone for `foo` plus one stale render per tool. */
   const seedTombstonedAgent = async (): Promise<void> => {
     await fse.ensureDir(path.join(repoPath, 'agents'));
+    // The legacy agent teamai delivered verbatim, before the team removed it:
+    // with no record of the copies, the history proves them teamai's (#993).
+    await fse.writeFile(path.join(repoPath, 'agents', 'foo.md'), 'stale');
+    commitTeamRepo(repoPath, 'foo');
+    await fse.remove(path.join(repoPath, 'agents', 'foo.md'));
     await fse.writeFile(path.join(repoPath, 'agents', '.removed'), 'foo\n');
 
     for (const [dir, file] of [
@@ -291,12 +319,6 @@ describe('pull role-aware sync and cleanup', () => {
       await fse.writeFile(path.join(homeDir, dir, file), 'stale');
     }
   };
-
-  const agentRenders = (): string[] => [
-    path.join(homeDir, '.claude/agents', 'foo.md'),
-    path.join(homeDir, '.codex/agents', 'foo.toml'),
-    path.join(homeDir, '.kiro/agents', 'foo.json'),
-  ];
 
   const expectAgentRendersGone = async (): Promise<void> => {
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'foo.md'))).toBe(false);
@@ -310,10 +332,25 @@ describe('pull role-aware sync and cleanup', () => {
     useAgentToolPaths();
     await seedTombstonedAgent();
 
-    await deliveredState(agentRenders());
     await pull({});
 
     await expectAgentRendersGone();
+  });
+
+  it('keeps a member\'s file of a tombstoned agent in a team-defined tool, and removes teamai\'s verbatim copy (#993)', async () => {
+    useAgentToolPaths();
+    const base = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...base, toolPaths: { ...base.toolPaths, mytool: { agents: '.mytool/agents' } } });
+    await seedTombstonedAgent();
+    await fse.ensureDir(path.join(homeDir, '.mytool/agents'));
+    await fse.writeFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'MY OWN AGENT');
+
+    await pull({});
+
+    expect(await fse.readFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'utf8')).toBe('MY OWN AGENT');
+    await fse.writeFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'stale');
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.mytool/agents', 'foo.md'))).toBe(false);
   });
 
   it('should clean up tombstoned agents even when the repo rev is unchanged', async () => {
@@ -322,7 +359,11 @@ describe('pull role-aware sync and cleanup', () => {
     // and its stored rev never moves again, so the fast path must clean too.
     useAgentToolPaths();
     await seedTombstonedAgent();
-    await deliveredState(agentRenders(), { lastPullRev: HEAD_REV, lastPullTargets: ['claude', 'codex', 'kiro'] });
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      lastPullRev: HEAD_REV,
+      lastPullTargets: ['claude', 'codex', 'kiro'],
+    }) as Awaited<ReturnType<typeof loadStateForScope>>);
 
     await pull({});
 

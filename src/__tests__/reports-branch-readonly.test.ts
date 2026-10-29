@@ -22,17 +22,22 @@ const mocks = vi.hoisted(() => ({
   isGitRepo: vi.fn(),
 }));
 
-vi.mock('../utils/git.js', () => ({
-  createGit: vi.fn((cwd: string) => (
-    cwd.endsWith(`${path.sep}reports-wt`) ? mocks.worktreeGit : mocks.repoGit
-  )),
-  isGitRepo: mocks.isGitRepo,
-  getDefaultBranch: vi.fn(),
-  hasCommits: vi.fn(),
-  isDedicatedRepoRoot: vi.fn().mockResolvedValue(true),
-  commitSkippingHooks: (git: { commit: (...args: unknown[]) => unknown }, message: string) =>
-    git.commit(message, { '--no-verify': null }),
-}));
+vi.mock('../utils/git.js', () => {
+  const fakeGit = (cwd: string) => (cwd.endsWith(`${path.sep}reports-wt`) ? mocks.worktreeGit : mocks.repoGit);
+  return {
+    createGit: vi.fn(fakeGit),
+    createGitWithBlockTimeout: vi.fn(fakeGit),
+    isGitRepo: mocks.isGitRepo,
+    getDefaultBranch: vi.fn(),
+    hasCommits: vi.fn(),
+    isDedicatedRepoRoot: vi.fn().mockResolvedValue(true),
+    // No cached answer: the common dir is asked of the fake checkouts below.
+    gitCommonDir: vi.fn().mockResolvedValue(null),
+    checkoutLocation: vi.fn().mockResolvedValue(null),
+    commitSkippingHooks: (git: { commit: (...args: unknown[]) => unknown }, message: string) =>
+      git.commit(message, { '--no-verify': null }),
+  };
+});
 
 vi.mock('../utils/fs.js', () => ({
   ensureDir: vi.fn(),
@@ -54,11 +59,6 @@ function mockCheckoutOfBusinessRepo(): void {
   mocks.worktreeGit.revparse.mockImplementation(answer);
   mocks.repoGit.revparse.mockImplementation(answer);
 }
-
-// The team repo opts in to reports (`usageReport: true`).
-vi.mock('../config.js', () => ({
-  loadTeamConfig: vi.fn().mockResolvedValue({ usageReport: true }),
-}));
 
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn(),
@@ -109,6 +109,7 @@ describe('ensureReportsWorktree read-only cold start', () => {
     await ensureReportsWorktree(config);
 
     expect(mocks.worktreeGit.push).toHaveBeenCalledWith([
+      '--progress',
       '-u',
       'origin',
       'teamai-reports',
@@ -143,7 +144,7 @@ describe('ensureReportsWorktree read-only cold start', () => {
 
     await ensureReportsWorktree(config);
 
-    expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai-reports']);
+    expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['--progress', '-u', 'origin', 'teamai-reports']);
   });
 });
 
@@ -184,7 +185,7 @@ describe('commitAndPushReports', () => {
     stageInWorktree([]);
     expect(await commitAndPushReports(config, 'retry stats', ['stats/alice.yaml'], { pushIfUnchanged: true })).toBe(true);
     expect(mocks.worktreeGit.commit).not.toHaveBeenCalled();
-    expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['origin', 'teamai-reports']);
+    expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['--progress', 'origin', 'teamai-reports']);
     expect(releaseLock).toHaveBeenCalled();
   });
 
@@ -296,7 +297,7 @@ describe('updateReports', () => {
   it('does not run the write callback when another reports write holds the lock', async () => {
     const write = vi.fn();
 
-    expect(await updateReports(config, write)).toBe(false);
+    expect(await updateReports(config, write)).toEqual({ status: 'busy' });
 
     expect(write).not.toHaveBeenCalled();
     expect(releaseLock).not.toHaveBeenCalled();

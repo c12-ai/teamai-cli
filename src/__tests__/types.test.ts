@@ -9,6 +9,7 @@ import {
   StateSchema,
   LocalConfigSchema,
   resolveLegacyProjectHookScope,
+  DEFAULT_TOOL_PATHS,
 } from '../types.js';
 import type { LocalConfig } from '../types.js';
 
@@ -147,6 +148,64 @@ describe('TeamaiConfigSchema', () => {
     });
   });
 
+  it('should export DEFAULT_TOOL_PATHS matching default parse', () => {
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+    });
+    expect(result.toolPaths).toEqual(DEFAULT_TOOL_PATHS);
+    expect(DEFAULT_TOOL_PATHS.codebuddy.mcpProject).toBe('.mcp.json');
+    expect(DEFAULT_TOOL_PATHS.claude.mcpProject).toBe('.mcp.json');
+  });
+
+  it('merges custom toolPaths over defaults tool by tool (#1185)', () => {
+    // When a team config provides custom toolPaths for one tool,
+    // that tool is overridden while other built-in tools retain their defaults
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+      toolPaths: {
+        codebuddy: {
+          skills: '.codebuddy/skills',
+          rules: '.codebuddy/rules',
+          mcpProject: '.mcp.json',
+        },
+      },
+    });
+
+    // The specified tool has the declared paths
+    expect(result.toolPaths.codebuddy).toEqual({
+      skills: '.codebuddy/skills',
+      rules: '.codebuddy/rules',
+      mcpProject: '.mcp.json',
+    });
+
+    // Other built-in tools remain intact with their default paths
+    expect(result.toolPaths.claude).toEqual(DEFAULT_TOOL_PATHS.claude);
+    expect(result.toolPaths.cursor).toEqual(DEFAULT_TOOL_PATHS.cursor);
+    expect(result.toolPaths.codex).toEqual(DEFAULT_TOOL_PATHS.codex);
+    expect(result.toolPaths.trae).toEqual(DEFAULT_TOOL_PATHS.trae);
+  });
+
+  it('retains default toolPaths when custom tool adds a third-party agent', () => {
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+      toolPaths: {
+        'custom-agent': {
+          skills: '.custom/skills',
+          rules: '.custom/rules',
+        },
+      },
+    });
+
+    expect(result.toolPaths['custom-agent']).toEqual({
+      skills: '.custom/skills',
+      rules: '.custom/rules',
+    });
+    expect(result.toolPaths.codebuddy).toEqual(DEFAULT_TOOL_PATHS.codebuddy);
+    expect(result.toolPaths.claude).toEqual(DEFAULT_TOOL_PATHS.claude);
+  });
 });
 
 describe('TeamaiConfigSchema reviewers', () => {
@@ -282,6 +341,26 @@ describe('TeamaiConfigSchema autoUpdate', () => {
 
   it('rejects non-boolean autoUpdate', () => {
     expect(() => TeamaiConfigSchema.parse({ ...base, autoUpdate: 'nope' })).toThrow();
+  });
+});
+
+describe('TeamaiConfigSchema language (#1014)', () => {
+  const base = {
+    team: 'test-team',
+    repo: 'https://git.woa.com/test/repo.git',
+  };
+
+  it('leaves language undefined when omitted', () => {
+    expect(TeamaiConfigSchema.parse(base).language).toBeUndefined();
+  });
+
+  it('accepts language en and zh', () => {
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'en' }).language).toBe('en');
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'zh' }).language).toBe('zh');
+  });
+
+  it('rejects any other language value', () => {
+    expect(() => TeamaiConfigSchema.parse({ ...base, language: 'english' })).toThrow();
   });
 });
 

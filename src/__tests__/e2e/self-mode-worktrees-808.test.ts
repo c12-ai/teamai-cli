@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import YAML from 'yaml';
 import { projectSlug } from '../../utils/partition.js';
 import { queueLockPath } from '../../utils/pending-learnings.js';
 
@@ -49,8 +50,12 @@ function runCLI(args: string[], cwd: string, home: string, env: NodeJS.ProcessEn
   });
 }
 
-function git(args: string[], cwd: string): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ENV } });
+/**
+ * Pass `home` when the command fires teamai's git hooks: they run the CLI, and
+ * a member's hooks share the member's HOME.
+ */
+function git(args: string[], cwd: string, home?: string): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ENV, ...(home ? { HOME: home } : {}) } });
 }
 
 interface Project {
@@ -927,7 +932,17 @@ describe('self mode with a linked worktree (#808)', () => {
     expect(downvote.output).toContain('Document not found in votes: foreign-doc');
     expect(downvote.output).not.toContain('Negative signal recorded');
 
-    // Nor does an index build: contribute's, then recall's own.
+    // Earlier recalls created one local recall credit. A foreign reports
+    // checkout must not hide this project's pending votes (#1233), nor add
+    // the other team's three recall credits and three upvotes.
+    const selfDocId = selfNote.replace(/\.md$/, '');
+    const localVotes = YAML.parse(fs.readFileSync(path.join(partition, 'votes', 'ci-808.yaml'), 'utf8'));
+    expect(localVotes.deltas[selfDocId]).toMatchObject({ recalled_delta: 1, upvoted_delta: 0 });
+    const feedback = await runCLI(['recall', 'feedback', '--positive', selfDocId], projectRoot, home);
+    expect(feedback.code, feedback.output).toBe(0);
+    expect(feedback.output).toContain(`Upvoted: ${selfDocId}`);
+
+    // Both rebuild paths retain exactly the local recall + feedback (1.3).
     const indexPath = path.join(partition, 'workspaces', workspaceId(projectRoot), 'search-index.json');
     const selfNoteVotes = (): number | undefined => {
       const index: unknown = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
@@ -936,10 +951,10 @@ describe('self mode with a linked worktree (#808)', () => {
       return entry && typeof entry === 'object' && 'votes' in entry && typeof entry.votes === 'number' ? entry.votes : undefined;
     };
     await runCLI(['contribute', '--title', 'another-note', '--file', note(project, 'another', 'Another note')], projectRoot, home);
-    expect(selfNoteVotes()).toBe(0);
+    expect(selfNoteVotes()).toBe(1.3);
     fs.rmSync(indexPath, { force: true });
     await runCLI(['recall', 'note'], projectRoot, home);
-    expect(selfNoteVotes()).toBe(0);
+    expect(selfNoteVotes()).toBe(1.3);
   });
 
   it('refuses and keeps a learnings checkout whose repository is gone, and indexes none of it', async () => {
@@ -1129,6 +1144,8 @@ describe('self mode with a linked worktree (#808)', () => {
     // The main checkout switches the project to the team repo.
     const init = await runCLI(['init', teamUrl, '--scope', 'project', '--force'], projectRoot, home);
     expect(init.code, init.output).toBe(0);
+    const pulled = await runCLI(['pull'], projectRoot, home);
+    expect(pulled.code, pulled.output).toBe(0);
     const partition = partitionOf(project);
     // A git install: its config names the team repo and no kind.
     const partitionConfig = fs.readFileSync(path.join(partition, 'config.yaml'), 'utf8');
@@ -1224,6 +1241,8 @@ describe('self mode with a linked worktree (#808)', () => {
     fs.writeFileSync(path.join(home, '.gitconfig'), `[url "${teamRemote}"]\n\tinsteadOf = ${teamUrl}\n`);
     const init = await runCLI(['init', teamUrl, '--scope', 'project', '--force'], projectRoot, home);
     expect(init.code, init.output).toBe(0);
+    const pulled = await runCLI(['pull'], projectRoot, home);
+    expect(pulled.code, pulled.output).toBe(0);
     const partition = partitionOf(project);
     for (const dir of ['learnings-wt', 'reports-wt']) git(['worktree', 'remove', path.join(partition, dir)], projectRoot);
 
@@ -1343,6 +1362,8 @@ function writeGitInstall(install: { teamRemote: string }, checkout: string): str
     '',
   ].join('\n'));
   fs.writeFileSync(path.join(legacyDir, 'state.json'), JSON.stringify({ lastPullRev: null }));
+  // A release with #964 stamps each fetch beside the clone.
+  fs.writeFileSync(path.join(legacyDir, 'last-fetch.json'), JSON.stringify({ lastFetch: new Date().toISOString() }));
   return legacyDir;
 }
 
@@ -1447,7 +1468,7 @@ describe('a checkout an older git-mode install left (#808)', () => {
 
     // The worktree's branch takes the knowledge init committed on main, next
     // to its own old install.
-    git(['merge', '-q', 'main'], worktree);
+    git(['merge', '-q', 'main'], worktree, home);
     const teamaiYaml = fs.readFileSync(path.join(worktree, '.teamai', 'teamai.yaml'), 'utf8');
     expect(teamaiYaml).toContain('mode: self');
     expect(fs.existsSync(path.join(legacyDir, 'config.yaml'))).toBe(true);
@@ -1484,9 +1505,14 @@ describe('a checkout an older git-mode install left (#808)', () => {
     const { home, projectRoot } = install;
     const teamA = serveTeamRepo(install, 'team-a');
     const teamB = serveTeamRepo(install, 'team-b');
+    // Both URL forms below must resolve to the same local fixture.
+    git(['config', '--file', path.join(home, '.gitconfig'), '--add',
+      `url.${teamA.bare}.insteadOf`, teamA.url.replace(/\.git$/, '')], projectRoot);
 
     const initA = await runCLI(['init', teamA.url, '--scope', 'project', '--force'], projectRoot, home);
     expect(initA.code, initA.output).toBe(0);
+    const pulledA = await runCLI(['pull'], projectRoot, home);
+    expect(pulledA.code, pulledA.output).toBe(0);
     // Team A rejects the push, so the learning stays queued for it.
     const queued = await withPushesRejected({ ...install, remote: teamA.bare }, () => runCLI(
       ['contribute', '--title', 'team-a-note', '--file', note(install, 'team-a', 'Note for team A')],
@@ -1501,20 +1527,38 @@ describe('a checkout an older git-mode install left (#808)', () => {
     const index = path.join(partitionOf(install), 'search-index.json');
     fs.writeFileSync(index, '{"version":6,"entries":[],"built":"team-a"}\n');
 
-    // The same team repo written another way changes nothing.
+    // The same team repo written another way changes nothing: the index stays
+    // team A's, rebuilt from what team A delivers, its queued note included (#1006).
     const initSame = await runCLI(['init', teamA.url.replace(/\.git$/, '/'), '--scope', 'project', '--force'], projectRoot, home);
     expect(initSame.code, initSame.output).toBe(0);
     expect(initSame.output).not.toContain('Set aside');
-    expect(partitionQueue(install)).toContain(name);
-    expect(fs.readFileSync(index, 'utf8')).toContain('"built":"team-a"');
+    const samePull = await runCLI(['pull'], projectRoot, home);
+    expect(samePull.code, samePull.output).toBe(0);
+    expect(partitionQueue(install)).not.toContain(name);
+    expect(published({ ...install, remote: teamA.bare })).toContain(`learnings/${name}`);
+    const indexed = (JSON.parse(fs.readFileSync(index, 'utf8')) as { entries: Array<{ filename: string }> }).entries;
+    expect(indexed.map((entry) => entry.filename)).toContain(name);
+
+    // Queue another Team A learning so the A -> B switch still exercises the
+    // set-aside boundary after the same-repo pull published the first one.
+    const queuedForSwitch = await withPushesRejected({ ...install, remote: teamA.bare }, () => runCLI(
+      ['contribute', '--title', 'team-a-switch-note', '--file', note(install, 'team-a-switch', 'Set aside for Team A')],
+      projectRoot,
+      home,
+    ));
+    expect(queuedForSwitch.output).toContain('Saved locally');
+    const [switchName] = partitionQueue(install).filter((f) => f.startsWith('team-a-switch-note-'));
+    expect(switchName, partitionQueue(install).join('\n')).toBeDefined();
 
     const initB = await runCLI(['init', teamB.url, '--scope', 'project', '--force'], projectRoot, home);
     expect(initB.code, initB.output).toBe(0);
+    const switched = await runCLI(['pull'], projectRoot, home);
+    expect(switched.code, switched.output).toBe(0);
     const partition = partitionOf(install);
     const aside = path.join(partition, 'pending-learnings.git-git.example.com-team-team-a');
-    expect(fs.readFileSync(path.join(aside, name), 'utf8')).toContain('Note for team A');
+    expect(fs.readFileSync(path.join(aside, switchName), 'utf8')).toContain('Set aside for Team A');
     expect(initB.output).toContain(`Set aside 1 queued learning(s) from the previous git install in ${aside}`);
-    expect(partitionQueue(install)).not.toContain(name);
+    expect(partitionQueue(install)).not.toContain(switchName);
     expect(fs.existsSync(index)).toBe(false);
 
     const pull = await runCLI(['pull'], projectRoot, home);
@@ -1726,13 +1770,18 @@ describe('a checkout an older git-mode install left (#808)', () => {
     // The new clone sits where team A's did, and has no registration of the old checkout.
     expect(git(['remote', 'get-url', 'origin'], path.join(partition, 'team-repo')).trim()).toBe(teamB.url);
 
-    const refusal = `${checkout} is a teamai-learnings checkout teamai cannot show to be ${path.join(partition, 'team-repo')}'s`;
     const contribute = await runCLI(
       ['contribute', '--title', 'team-b-note', '--file', note(install, 'team-b', 'Note for team B')],
       projectRoot,
       home,
     );
+    // Replacing the clone preserves the dirty checkout with its backing clone,
+    // so later commands correctly identify that preserved clone in the warning.
+    const preservedClone = path.join(partition, 'team-repo.previous');
+    const refusal = `${checkout} is a teamai-learnings checkout of ${preservedClone}, ` +
+      `not of ${path.join(partition, 'team-repo')}, left by an install in another mode.`;
     expect(contribute.output.split(refusal).length - 1, contribute.output).toBe(1);
+    expect(fs.existsSync(path.join(preservedClone, '.git'))).toBe(true);
     expect(contribute.output).toContain('Saved locally');
     expect(fs.readFileSync(draft, 'utf8')).toBe('# Team A draft nobody committed\n');
     expect(git(['log', '--all', '--name-only', '--format='], teamB.bare)).not.toContain('team-a-');

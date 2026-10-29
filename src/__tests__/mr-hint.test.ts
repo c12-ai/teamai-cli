@@ -71,6 +71,24 @@ describe('buildHintMessage', () => {
     expect(msg).toContain('[teamai:mr-hint]');
   });
 
+  it('is English-only when the team language is en (#1014)', () => {
+    const msg = buildHintMessage(sampleMRs, 'en');
+    expect(msg).toContain('[teamai:mr-hint]');
+    expect(msg).toContain('feat: add new feature');
+    expect(msg).toContain('teamai import --from-mr');
+    expect(msg).toContain('https://git.woa.com/owner/repo/merge_requests/42');
+    expect(msg).toContain('2024-06-01');
+    expect(msg).toContain('1');
+    expect(msg).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+
+  it('stays byte-identical to the bilingual hint when language is omitted or zh (#1014)', () => {
+    const omitted = buildHintMessage(sampleMRs);
+    expect(buildHintMessage(sampleMRs, 'zh')).toBe(omitted);
+    expect(omitted).toContain('发现');
+    expect(omitted).toContain('Found merged MR(s) not yet imported');
+  });
+
   it('handles multiple MRs', () => {
     const mrs: MRSummary[] = [
       { id: '1', title: 'MR One', url: 'https://git.woa.com/a/b/merge_requests/1', mergedAt: '2024-06-01T00:00:00Z' },
@@ -80,6 +98,23 @@ describe('buildHintMessage', () => {
     expect(msg).toContain('2');
     expect(msg).toContain('MR One');
     expect(msg).toContain('MR Two');
+  });
+
+  it.each(['en', 'zh'] as const)('prints one import command for every MR, not one per MR (#1104, %s)', (language) => {
+    const mrs: MRSummary[] = [
+      { id: '1', title: 'MR One', url: 'https://git.woa.com/a/b/merge_requests/1', mergedAt: '2024-06-01T00:00:00Z' },
+      { id: '2', title: 'MR Two', url: 'https://git.woa.com/a/b/merge_requests/2', mergedAt: '2024-06-02T00:00:00Z' },
+    ];
+    const msg = buildHintMessage(mrs, language);
+    const commands = msg.split('\n').filter((line) => line.includes('teamai import --from-mr http'));
+    expect(commands).toEqual([
+      '  teamai import --from-mr https://git.woa.com/a/b/merge_requests/1 https://git.woa.com/a/b/merge_requests/2',
+    ]);
+  });
+
+  it.each(['en', 'zh'] as const)('no longer promises a codebase.md update (#1104, %s)', (language) => {
+    // `import --from-mr` refreshes teamwiki only where that repo already has evidence.
+    expect(buildHintMessage(sampleMRs, language)).not.toContain('codebase.md');
   });
 });
 

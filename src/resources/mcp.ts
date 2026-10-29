@@ -4,6 +4,7 @@ import { ResourceHandler } from './base.js';
 import type { ResourceItem, TeamaiConfig, LocalConfig, McpServerDef } from '../types.js';
 import { readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { pushRepoResourceItem, scanRepoResourceForPush } from './repo-resource.js';
 import {
   entryFileAbsolutePath, entryFilePath, listEntryFiles, missingTopLevelKeyReason, readEntryFileText, unknownEntryKeys,
   type EntryReader,
@@ -78,6 +79,12 @@ function parseMcpContent(content: string | null): McpYamlRead {
   }
 }
 
+/** The servers one MCP file's text declares, or null when it does not parse: for reading a past revision. */
+export function parseTeamMcpServers(content: string): TeamMcpServer[] | null {
+  const read = parseMcpContent(content);
+  return read.ok ? read.yaml?.servers ?? [] : null;
+}
+
 /** How `mcp/mcp.yaml` and `mcp/<ns>/mcp.yaml` are read for delivery. */
 export const mcpEntryReader: EntryReader<TeamMcpServer> = {
   type: 'mcp',
@@ -114,12 +121,8 @@ export function teamMcpToDef(s: TeamMcpServer): McpServerDef {
 export class McpHandler extends ResourceHandler {
   readonly type = 'mcp' as const;
 
-  /**
-   * MCP servers are contributed by editing mcp/mcp.yaml directly (same as hooks),
-   * so there is nothing to discover on the local side for push.
-   */
-  async scanLocalForPush(): Promise<ResourceItem[]> {
-    return [];
+  async scanLocalForPush(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
+    return scanRepoResourceForPush('mcp', 'mcp', teamConfig, localConfig);
   }
 
   /**
@@ -150,8 +153,8 @@ export class McpHandler extends ResourceHandler {
     return items;
   }
 
-  async pushItem(): Promise<void> {
-    // Servers live in a single mcp.yaml committed directly; nothing per-item to copy.
+  async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    await pushRepoResourceItem(item, localConfig);
   }
 
   async pullItem(): Promise<void> {

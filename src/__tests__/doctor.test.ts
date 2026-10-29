@@ -1,3 +1,4 @@
+import { getCopilotHome } from '../types.js';
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import path from 'node:path';
 
@@ -28,6 +29,7 @@ vi.mock('../utils/fs.js', () => ({
     listFiles: vi.fn().mockResolvedValue([]),
     listFilesRecursive: vi.fn().mockResolvedValue([]),
     expandHome: vi.fn((p: string) => p),
+    symlinkTarget: vi.fn(async (p: string) => p),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -39,6 +41,8 @@ vi.mock('../utils/logger.js', () => ({
         debug: vi.fn(),
     },
     setStderrOnly: vi.fn(),
+    isSilent: () => false,
+    setSilent: vi.fn(),
 }));
 
 // This suite isolates hook/config checks from disk delivery. Docs now compare
@@ -48,6 +52,14 @@ vi.mock('../resources/docs.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../resources/docs.js')>()),
     listDocFiles: vi.fn().mockResolvedValue([]),
     resolveDocsDestination: vi.fn().mockReturnValue('/tmp/team-docs'),
+}));
+
+// The zombie-lock check walks the real HOME; a developer machine (unlike CI)
+// can legitimately hold leftover locks, so the doctor suite pins it empty.
+vi.mock('../update.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../update.js')>()),
+    listZombieLocks: vi.fn().mockResolvedValue([]),
+    removeZombieLocks: vi.fn().mockResolvedValue([]),
 }));
 
 // Mock the tgit provider to avoid side effects
@@ -61,6 +73,8 @@ vi.mock('../providers/tgit/index.js', () => ({
 vi.mock('../hooks.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../hooks.js')>()),
     readCodexHookTrustForScope: vi.fn().mockResolvedValue(null),
+    // The hook entries a pull keeps as the member's (#993): covered end to end by config-entry-ownership-993.
+    keptTeamHookEntries: vi.fn().mockResolvedValue([]),
 }));
 
 // ── Imports (after mocks) ────────────────────────────────
@@ -86,6 +100,7 @@ const mockLocalConfig = {
     repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
     username: 'testuser',
     updatePolicy: 'auto',
+    scope: 'user',
 };
 
 const mockTeamConfig = {
@@ -283,9 +298,9 @@ describe('doctor — hook checks', () => {
         expect(copilotLine).toContain('✔');
     });
 
-    it('reports missing project hooks for explicitly selected Copilot', async () => {
+    it('reports missing global hooks for explicitly selected project Copilot', async () => {
         const projectRoot = '/tmp/teamai-doctor-copilot-project';
-        const hookPath = path.join(projectRoot, '.github', 'hooks', 'teamai.json');
+        const hookPath = path.join(getCopilotHome(), 'hooks', 'teamai.json');
         mockedLoadLocalConfig.mockResolvedValue({
             ...mockLocalConfig,
             scope: 'project',
@@ -296,7 +311,7 @@ describe('doctor — hook checks', () => {
             ...mockTeamConfig,
             sharing: { env: { injectShellProfile: false } },
             toolPaths: {
-                copilot: { hooks: '.github/hooks/teamai.json' },
+                copilot: { hooks: '.github/hooks/teamai.json', userScope: { hooks: 'hooks/teamai.json' } },
             },
         });
         mockedPathExists.mockImplementation(async (filePath: string) => (
@@ -312,12 +327,9 @@ describe('doctor — hook checks', () => {
         expect(allPassed).toBe(false);
     });
 
-    // Non-self project scope: `hooks inject` writes copilot at
-    // <projectRoot>/.github/hooks/teamai.json (the config's own scope), so doctor
-    // must probe that file — not userScope.hooks joined onto projectRoot.
-    it('checks project Copilot hooks where inject wrote them when userScope.hooks is set', async () => {
+    it('checks global Copilot hooks for a project when userScope.hooks is set', async () => {
         const projectRoot = '/tmp/teamai-doctor-copilot-project-userscope';
-        const hookPath = path.join(projectRoot, '.github', 'hooks', 'teamai.json');
+        const hookPath = path.join(getCopilotHome(), 'hooks', 'teamai.json');
         mockedLoadLocalConfig.mockResolvedValue({
             ...mockLocalConfig,
             scope: 'project',
@@ -368,10 +380,10 @@ describe('doctor — hook checks', () => {
             },
         });
         // No project MCP config exists: one at a tool's built-in location that cannot be read would fail the git exclude check.
-        const { TeamaiConfigSchema } = await import('../types.js');
-        const mcpConfigs = Object.values(TeamaiConfigSchema.shape.toolPaths.parse(undefined))
-            .flatMap((paths) => paths.mcpProject ? [path.join(projectRoot, paths.mcpProject)] : []);
-        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome && !mcpConfigs.includes(filePath));
+        const { TeamaiConfigBaseSchema } = await import('../types.js');
+        const mcpConfigs = new Set(Object.values(TeamaiConfigBaseSchema.shape.toolPaths.parse(undefined))
+            .flatMap((paths) => paths.mcpProject ? [path.join(projectRoot, paths.mcpProject)] : []));
+        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome && !mcpConfigs.has(filePath));
 
         let allPassed: boolean;
         try {
@@ -480,6 +492,27 @@ describe('doctor — hook checks', () => {
             expect(fix).toContain('then open a new session');
         });
 
+        it('fails "Codex builds agree" naming each build when they hash a teamai hook differently', async () => {
+            const skew = {
+                chosen: { path: '/Applications/Codex.app/Contents/Resources/codex', version: '0.163.0' },
+                others: [{ path: '/usr/local/bin/codex', version: '0.142.5' }],
+            };
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [], skew });
+            const ok = await doctor({});
+            expect(ok).toBe(false);
+            const lines = consoleSpy.mock.calls.map((c) => String(c[0]));
+            expect(lines.filter((msg) => msg.includes('Codex builds agree'))).toEqual([expect.stringContaining('✖')]);
+            const fix = lines.find((msg) => msg.includes('Codex builds disagree:'));
+            expect(fix).toContain('/Applications/Codex.app/Contents/Resources/codex (codex-cli 0.163.0)');
+            expect(fix).toContain('/usr/local/bin/codex (codex-cli 0.142.5) hashes some of them differently');
+        });
+
+        it('adds no build check when the builds agree', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [] });
+            await doctor({});
+            expect(consoleSpy.mock.calls.some((c) => String(c[0]).includes('Codex builds'))).toBe(false);
+        });
+
         it('includes the app-server failure cause in the note', async () => {
             mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'failed', reason: 'hooks/list: boom' });
             await doctor({});
@@ -524,6 +557,34 @@ describe('doctor — hook checks', () => {
         expect(allCalls.some((msg: string) => msg.includes('codex-internal'))).toBe(false);
         // Should still show claude check
         expect(allCalls.some((msg: string) => msg.includes('claude'))).toBe(true);
+    });
+
+    it.each([
+        [{ CI: 'true' }, '  ✔ Run mode: unattended (CI)'],
+        [{ TEAMAI_MODE: 'robot' }, '  ⚠ Run mode: attended (default). TEAMAI_MODE="robot" is not attended or unattended, so it is ignored.'],
+    ])('prints the run mode with %o as a row that fails nothing (#1384)', async (env, row) => {
+        for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+        try {
+            const allPassed = await doctor({});
+
+            expect(consoleSpy.mock.calls.map((c) => String(c[0]))).toContain(row);
+            expect(allPassed).toBe(true);
+        } finally {
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('prints the run mode before initialization (#1384)', async () => {
+        mockedLoadLocalConfig.mockResolvedValue(null);
+        mockedLoadTeamConfig.mockResolvedValue(null);
+        vi.stubEnv('CI', 'true');
+        try {
+            await doctor({});
+
+            expect(consoleSpy.mock.calls.map((c) => String(c[0]))).toContain('  ✔ Run mode: unattended (CI)');
+        } finally {
+            vi.unstubAllEnvs();
+        }
     });
 
     it('does not assume a provider before initialization', async () => {
@@ -630,6 +691,46 @@ describe('doctor — JSON report', () => {
         expect(failing?.fix).toContain('teamai hooks inject');
     });
 
+    it('notes that usage reporting is off and that the member turned it off', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, usageReportEnabled: false });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContainEqual(
+            expect.stringMatching(/^Usage reporting: off, from usageReportEnabled: false in .+config\.yaml\.$/));
+    });
+
+    it('notes that usage reporting is off when the team turned it off', async () => {
+        mockedLoadTeamConfig.mockResolvedValue({ ...mockTeamConfig, usageReport: false });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContain("Usage reporting: off, from usageReport: false in the team's teamai.yaml.");
+    });
+
+    it('notes that usage reporting is off for an HTTP team repo', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, repo: { ...mockLocalConfig.repo, kind: 'http' } });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContain('Usage reporting: off, from HTTP mode (no team repo to report to).');
+    });
+
+    it.each([
+        [{ CI: 'true' }, { mode: 'unattended', source: 'CI' }],
+        [{ CI: 'true', TEAMAI_MODE: 'attended' }, { mode: 'attended', source: 'TEAMAI_MODE' }],
+        [{}, { mode: 'attended', source: 'default' }],
+    ])('reports the run mode %o resolves, and what set it (#1384)', async (env, runMode) => {
+        for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+        try {
+            await doctor({ json: true });
+
+            expect(emittedReport().runMode).toEqual(runMode);
+        } finally {
+            vi.unstubAllEnvs();
+        }
+    });
+
     it('emits the same envelope before initialization', async () => {
         mockedLoadLocalConfig.mockResolvedValue(null);
         mockedLoadTeamConfig.mockResolvedValue(null);
@@ -640,6 +741,7 @@ describe('doctor — JSON report', () => {
         expect(allPassed).toBe(false);
         expect(report.ok).toBe(false);
         expect(report.scope).toBeNull();
+        expect(report.runMode).toEqual({ mode: 'attended', source: 'default' });
         expect(report.checks).toHaveLength(1);
         expect(report.checks[0]).toMatchObject({ name: 'TeamAI is not initialized', ok: false });
         expect(report.checks[0].fix).toContain('teamai init');
@@ -693,6 +795,24 @@ describe('buildChecks', () => {
         // warning already says it, with the push error, so the post-pull pass
         // skips this one rather than repeat it — see pull-post-checks.test.ts.
         expect(check?.reportedByPull).toBe('pending-learnings');
+    });
+
+    it('reports score labels that are kept but not published, next to learnings', async () => {
+        mockedLoadLocalConfig.mockResolvedValue(mockLocalConfig);
+        mockedLoadTeamConfig.mockResolvedValue(mockTeamConfig);
+
+        const ctx = await resolveDoctorContext();
+        if (!ctx) throw new Error('expected a resolved doctor context');
+
+        const names = (await buildChecks(ctx)).map((c) => c.name);
+        expect(names.slice(names.indexOf('Contributed learnings are published'), names.indexOf('Contributed learnings are published') + 2))
+            .toEqual(['Contributed learnings are published', 'Score labels are published']);
+        const check = (await buildChecks(ctx)).find((c) => c.name === 'Score labels are published');
+        expect(check?.fix).toContain('teamai score --push');
+        const { LabelStore } = await import('../scorers/label-store.js');
+        vi.spyOn(LabelStore, 'unpublished').mockResolvedValueOnce(2).mockResolvedValueOnce(0);
+        expect(await check?.check()).toBe(false);
+        expect(await check?.check()).toBe(true);
     });
 
     it('flags only the queue check as one the pull reports itself', async () => {

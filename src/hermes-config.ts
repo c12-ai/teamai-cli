@@ -18,6 +18,21 @@ export function getHermesSoulPath(): string {
   return path.join(getHermesHome(), 'SOUL.md');
 }
 
+/** Hermes uses an explicit cap, or a model-dependent cap with a 20,000-character floor. */
+export async function hermesContextFileBudget(): Promise<{ limit: number; explicit: boolean; error?: string }> {
+  const raw = await readFileSafe(getHermesConfigPath());
+  try {
+    const config = raw ? YAML.parse(raw) as { context_file_max_chars?: unknown } | null : null;
+    const value = config?.context_file_max_chars;
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return { limit: Math.trunc(value), explicit: true };
+    }
+    return { limit: 20_000, explicit: false };
+  } catch (error) {
+    return { limit: 20_000, explicit: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 /**
  * Read the Hermes config.yaml as a YAML Document, preserving comments and
  * formatting. Returns an empty Document when the file is missing or empty.
@@ -274,6 +289,17 @@ export async function addHermesAllowlist(event: string, command: string): Promis
   data.approvals.push({ event, command });
   await writeJson(filePath, data);
   return true;
+}
+
+/** Whether these exact managed commands remain in hooks or their approvals. */
+export async function hasHermesHookCommands(commands: readonly string[]): Promise<boolean> {
+  const doc = await readConfigDoc();
+  const raw = doc.getIn(['hooks']);
+  const hooks = YAML.isMap(raw) ? raw.toJSON() as Record<string, unknown> : {};
+  if (Object.values(hooks).some(entries => Array.isArray(entries)
+    && entries.some((entry: HookEntry) => entry && typeof entry === 'object' && commands.includes(entry.command)))) return true;
+  const approvals = await readJson<AllowlistFile>(getHermesAllowlistPath());
+  return Array.isArray(approvals?.approvals) && approvals.approvals.some(entry => commands.includes(entry.command));
 }
 
 /**

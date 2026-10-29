@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
-import { acquireLock, releaseLock } from '../update.js';
+import { acquireLock, releaseLock, sweepHeldLocksOnExit, listZombieLocks, removeZombieLocks } from '../update.js';
 
 // ─── Real-filesystem tests for the atomic lock (issue #374 P0) ──────────────
 //
@@ -254,6 +254,152 @@ describe('acquireLock never takes over a lock another live process may hold (#76
   });
 });
 
+describe('acquireLock filesystem failures (#999)', () => {
+  it('rejects when the parent path is a file, rather than reporting contention', async () => {
+    const parent = path.join(tmpDir, 'not-a-directory');
+    fs.writeFileSync(parent, 'keep');
+    await expect(acquireLock(path.join(parent, '.lock'))).rejects.toThrow(parent);
+    expect(fs.readFileSync(parent, 'utf-8')).toBe('keep');
+  });
+
+  it.each(['EACCES', 'ENOSPC'])('rejects a temp-file write failure (%s)', async (code) => {
+    const error = Object.assign(new Error(`${code}: cannot write`), { code });
+    const write = vi.spyOn(fse, 'writeFile').mockRejectedValueOnce(error);
+    try {
+      await expect(acquireLock(lockPath)).rejects.toMatchObject({ cause: error, message: expect.stringContaining(lockPath) });
+      expect(fs.existsSync(lockPath)).toBe(false);
+      await releaseLock(lockPath);
+      expect(await acquireLock(lockPath)).toBe(true);
+      await releaseLock(lockPath);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('rejects an exclusive-create permission failure on a filesystem without hard links', async () => {
+    const error = Object.assign(new Error('EACCES: cannot create lock'), { code: 'EACCES' });
+    const link = vi.spyOn(fse, 'link').mockRejectedValueOnce(Object.assign(new Error('ENOTSUP'), { code: 'ENOTSUP' }));
+    const write = vi.spyOn(fse, 'writeFile').mockImplementation(async (file, data) => {
+      if (file === lockPath) throw error;
+      fs.writeFileSync(file, data);
+    });
+    try {
+      await expect(acquireLock(lockPath)).rejects.toMatchObject({ cause: error });
+      expect(fs.readdirSync(tmpDir)).toEqual([]);
+    } finally {
+      link.mockRestore();
+      write.mockRestore();
+    }
+  });
+
+  it('rejects a reclaim-sentinel rename failure and preserves the stale lock', async () => {
+    const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
+    fs.writeFileSync(lockPath, dead);
+    fs.writeFileSync(`${lockPath}.sentinel`, dead);
+    const error = Object.assign(new Error('EPERM: cannot rename sentinel'), { code: 'EPERM' });
+    const rename = vi.spyOn(fse, 'rename').mockRejectedValueOnce(error);
+    try {
+      await expect(acquireLock(lockPath)).rejects.toMatchObject({ cause: error });
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
+      expect(fs.readFileSync(`${lockPath}.sentinel`, 'utf-8')).toBe(dead);
+    } finally {
+      rename.mockRestore();
+    }
+  });
+
+  it('still backs off when another reclaimer removes the stale sentinel first', async () => {
+    const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
+    fs.writeFileSync(lockPath, dead);
+    fs.writeFileSync(`${lockPath}.sentinel`, dead);
+    const rename = vi.spyOn(fse, 'rename').mockImplementationOnce(async () => {
+      fs.rmSync(`${lockPath}.sentinel`);
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    try {
+      expect(await acquireLock(lockPath)).toBe(false);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
+    } finally {
+      rename.mockRestore();
+    }
+  });
+
+  it('rejects a stale-lock replacement failure and releases its reclaim sentinel', async () => {
+    const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
+    fs.writeFileSync(lockPath, dead);
+    const error = Object.assign(new Error('EPERM: cannot replace lock'), { code: 'EPERM' });
+    const rename = vi.spyOn(fse, 'rename').mockRejectedValueOnce(error);
+    try {
+      await expect(acquireLock(lockPath)).rejects.toMatchObject({ cause: error });
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
+      expect(fs.existsSync(`${lockPath}.sentinel`)).toBe(false);
+    } finally {
+      rename.mockRestore();
+    }
+  });
+});
+
+describe('acquireLock dry-run filesystem errors (#999)', () => {
+  it.each(['ENOTDIR', 'EISDIR', 'EIO'])('reports a read failure (%s) without writing a lock', async (code) => {
+    const error = Object.assign(new Error(`${code}: cannot read lock`), { code });
+    const read = vi.spyOn(fse, 'readFile').mockRejectedValueOnce(error);
+    try {
+      await expect(acquireLock(lockPath, { dryRun: true })).rejects.toMatchObject({
+        cause: error, message: expect.stringContaining(`Cannot acquire lock ${lockPath}:`),
+      });
+      expect(fs.readdirSync(tmpDir)).toEqual([]);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it('rejects a directory at the lock path and leaves its contents untouched', async () => {
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'keep'), 'keep');
+    await expect(acquireLock(lockPath, { dryRun: true })).rejects.toThrow(lockPath);
+    await releaseLock(lockPath);
+    expect(fs.readdirSync(tmpDir)).toEqual(['.test-lock']);
+    expect(fs.readFileSync(path.join(lockPath, 'keep'), 'utf-8')).toBe('keep');
+  });
+
+  it.each(['EACCES', 'EPERM'])('still treats a permission-denied existing lock as held (%s)', async (code) => {
+    const payload = JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' });
+    fs.writeFileSync(lockPath, payload);
+    const read = vi.spyOn(fse, 'readFile').mockRejectedValueOnce(Object.assign(new Error(code), { code }));
+    try {
+      expect(await acquireLock(lockPath, { dryRun: true })).toBe(false);
+      await releaseLock(lockPath);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(payload);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it('does not create a missing parent directory', async () => {
+    const nested = path.join(tmpDir, 'missing', '.lock');
+    expect(await acquireLock(nested, { dryRun: true })).toBe(true);
+    await releaseLock(nested);
+    expect(fs.readdirSync(tmpDir)).toEqual([]);
+  });
+
+  it.each([{ pid: process.pid, available: false }, { pid: 999999, available: true }])(
+    'preserves a lock owned by pid $pid, including after release', async ({ pid, available }) => {
+      const payload = JSON.stringify({ pid, owner: 'other', startedAt: 'x' });
+      fs.writeFileSync(lockPath, payload);
+      expect(await acquireLock(lockPath, { dryRun: true })).toBe(available);
+      await releaseLock(lockPath);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(payload);
+      expect(fs.readdirSync(tmpDir)).toEqual(['.test-lock']);
+    },
+  );
+
+  it('still treats an ownerless lock as held', async () => {
+    fs.writeFileSync(lockPath, '');
+    expect(await acquireLock(lockPath, { dryRun: true })).toBe(false);
+    await releaseLock(lockPath);
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe('');
+  });
+});
+
 describe('releaseLock (real fs)', () => {
   it('removes a lock this process owns', async () => {
     await acquireLock(lockPath);
@@ -285,5 +431,65 @@ describe('releaseLock (real fs)', () => {
     await releaseLock(lockPath);
     expect(await acquireLock(lockPath)).toBe(true);
     await releaseLock(lockPath);
+  });
+});
+
+describe('sweepHeldLocksOnExit (#1027)', () => {
+  it('removes the locks this process still holds when it exits', async () => {
+    await acquireLock(lockPath);
+    expect(fs.existsSync(lockPath)).toBe(true);
+    sweepHeldLocksOnExit();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('leaves a lock that now names a different owner', async () => {
+    await acquireLock(lockPath);
+    // Another process reclaimed ours while we were dying: the file on disk
+    // names its owner now, not ours.
+    const payload = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+    fs.writeFileSync(lockPath, JSON.stringify({ ...payload, owner: 'someone-else' }));
+    sweepHeldLocksOnExit();
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it('is a no-op when the process holds nothing', () => {
+    expect(() => sweepHeldLocksOnExit()).not.toThrow();
+  });
+});
+
+describe('listZombieLocks / removeZombieLocks (#1027)', () => {
+  it('lists only locks whose owning process is provably dead', async () => {
+    const dead = path.join(tmpDir, '.sync-lock');
+    const live = path.join(tmpDir, '.update-lock');
+    const ownerless = path.join(tmpDir, 'nested', 'events.jsonl.lock');
+    const insideGit = path.join(tmpDir, '.git', 'config.lock');
+    fs.mkdirSync(path.join(tmpDir, 'nested'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, '.git'), { recursive: true });
+    fs.writeFileSync(dead, JSON.stringify({ pid: 999999, owner: 'gone', startedAt: 'x' }));
+    fs.writeFileSync(live, JSON.stringify({ pid: process.pid, owner: 'me', startedAt: 'x' }));
+    // The dashboard's raw-O_EXCL locks carry no pid: never provably stale (#760).
+    fs.writeFileSync(ownerless, '');
+    fs.writeFileSync(insideGit, JSON.stringify({ pid: 999999, owner: 'gone', startedAt: 'x' }));
+
+    expect(await listZombieLocks([tmpDir])).toEqual([dead]);
+  });
+
+  it('returns nothing for a missing root', async () => {
+    expect(await listZombieLocks([path.join(tmpDir, 'nope')])).toEqual([]);
+  });
+
+  it('removes only the dead ones, through the serialized reclaim path', async () => {
+    const dead = path.join(tmpDir, 'votes', 'alice.yaml.lock');
+    const live = path.join(tmpDir, '.reports-lock');
+    fs.mkdirSync(path.join(tmpDir, 'votes'), { recursive: true });
+    fs.writeFileSync(dead, JSON.stringify({ pid: 999999, owner: 'gone', startedAt: 'x' }));
+    fs.writeFileSync(live, JSON.stringify({ pid: process.pid, owner: 'me', startedAt: 'x' }));
+
+    expect(await removeZombieLocks([tmpDir])).toEqual([dead]);
+    expect(fs.existsSync(dead)).toBe(false);
+    expect(fs.existsSync(live)).toBe(true);
+    // The reclaim's sentinel is cleaned up behind the removal.
+    expect(fs.existsSync(`${dead}.sentinel`)).toBe(false);
+    expect(fs.existsSync(`${dead}.lock`)).toBe(false);
   });
 });

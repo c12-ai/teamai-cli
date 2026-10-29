@@ -4,6 +4,7 @@ const originalArgv = process.argv;
 
 afterEach(() => {
   process.argv = originalArgv;
+  process.exitCode = undefined;
   vi.restoreAllMocks();
   vi.resetModules();
 });
@@ -19,7 +20,9 @@ async function readCodebaseHelp(): Promise<string> {
     throw new Error(`process.exit(${code})`);
   }) as never);
 
-  await expect(import('../index.js')).rejects.toThrow('process.exit(0)');
+  // The help text is on stdout by now. The entry reports the throw from the
+  // mocked exit as an error and resolves instead of rejecting (#1270).
+  await import('../index.js');
   return output;
 }
 
@@ -32,5 +35,10 @@ describe('codebase command registration', () => {
   it('lists the public deep-enrich option', async () => {
     const output = await readCodebaseHelp();
     expect(output).toContain('--deep-enrich');
+  });
+
+  it('no longer offers --extract: teamai import extracts code knowledge', async () => {
+    const output = await readCodebaseHelp();
+    expect(output).not.toContain('--extract');
   });
 });

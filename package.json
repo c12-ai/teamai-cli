@@ -1,6 +1,6 @@
 {
   "name": "teamai-cli",
-  "version": "0.27.0",
+  "version": "0.28.1",
   "description": "TeamAI — Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {
@@ -82,6 +82,7 @@
     "@types/node": "^20.17.0",
     "@types/semver": "^7.8.0",
     "@vitest/coverage-v8": "^3.2.7",
+    "acorn": "^8.16.0",
     "esbuild": "^0.27.3",
     "fast-check": "^4.10.2",
     "opencode-ai": "1.18.23",
@@ -89,7 +90,7 @@
     "oxlint-tsgolint": "7.0.2003",
     "standard-version": "^9.5.0",
     "tsup": "^8.3.0",
-    "typescript": "^5.7.0",
+    "typescript": "^7.0.2",
     "vitest": "^3.2.7"
   },
   "main": "index.js",

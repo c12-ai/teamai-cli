@@ -1,10 +1,10 @@
 # TeamAI MR Knowledge Extract — GitHub Actions
 #
-# 在 PR 创建/更新时自动提炼知识建议并以 comment 贴到 PR 上；
-# PR 合入后自动将 learning 和 codebase 建议写入团队知识仓库。
+# When a PR is opened or updated, extracts knowledge suggestions automatically and posts them as comments on the PR;
+# after the PR is merged, writes the learning and codebase suggestions to the team knowledge repo automatically.
 #
-# 使用前请配置：
-#   修改下方 env 中的占位符，并在 Repository Settings 中配置对应 Secrets / Variables
+# Configure before use:
+#   Change the placeholders in the env below, and set the matching Secrets / Variables in Repository Settings
 
 name: TeamAI MR Knowledge Extract
 
@@ -23,7 +23,7 @@ env:
   ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.ANTHROPIC_DEFAULT_OPUS_MODEL }}
 
 jobs:
-  # ── PR 创建/更新时：提炼知识并以 comment 形式展示 ──────────
+  # ── When a PR is opened or updated: extract knowledge and show it as comments ──
   comment:
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
@@ -50,11 +50,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
 
-  # ── PR 合入后：将知识写入团队仓库 ─────────────────────────
+  # ── After the PR is merged: write knowledge to the team repo ──
+  # teamwiki follows the same flow as `teamai import --dir . --incremental`: it runs in the merged source
+  # checkout, re-extracts only the changed files, writes to
+  # team-repo/teamwiki/evidence/code/github__<owner>__<repo>/, and the CLI commits and pushes itself.
+  # The two repos are checked out side by side: the team repo cannot sit inside the source checkout, or it would be extracted as source.
   write:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 2
+          path: source
+
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.TEAMAI_KNOWLEDGE_REPO }}
@@ -73,22 +83,13 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Write Knowledge to Repo
+        working-directory: source
         run: |
           teamai ci extract-mr \
             --url "${{ github.event.pull_request.html_url }}" \
             --mode write \
-            --team-repo ./team-repo \
+            --team-repo ../team-repo \
             --write-mode direct
         env:
           GITHUB_TOKEN: ${{ secrets.TEAMAI_SYNC_TOKEN }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-
-      - name: Commit and Push
-        run: |
-          cd team-repo
-          git config user.name "teamai-ci"
-          git config user.email "teamai-ci@users.noreply.github.com"
-          git add learnings/ docs/ .teamai/ teamwiki/
-          git diff --cached --quiet || \
-            git commit -m "[teamai] Extract knowledge from PR #${{ github.event.pull_request.number }}"
-          git push

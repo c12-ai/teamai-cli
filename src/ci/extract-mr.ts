@@ -1,11 +1,11 @@
 // -*- coding: utf-8 -*-
 /**
- * CI MR 知识提炼主编排。
+ * CI MR knowledge extraction orchestration.
  *
- * 复用 importFromMR 的 AI 提炼逻辑，根据 mode 执行：
- * - comment: 幂等发布/更新 MR comment
- * - write: 将 learning 和 codebase 建议写入团队仓库
- * - both: 两者都执行
+ * Reuses the importFromMR AI extraction and, depending on mode:
+ * - comment: posts or updates the MR comment idempotently
+ * - write: writes the learning and codebase suggestions to the team repo
+ * - both: does both
  */
 
 import fs from 'node:fs/promises';
@@ -14,14 +14,14 @@ import path from 'node:path';
 import { importFromMR } from '../import-mr.js';
 // applyCodebaseSuggestions removed: codebase updates now handled by teamwiki/ graph engine
 import { appendPendingReview } from '../review-store.js';
-import { pushRepoDirectly } from '../utils/git.js';
+import { getDefaultBranch, pushRepoDirectly } from '../utils/git.js';
 import { log } from '../utils/logger.js';
 import type { LearningDraft, CodebaseSuggestion } from '../types.js';
 import { postOrUpdateMrComment, postIndividualComments, postCodebaseGraphComment, parseMrUrl } from './mr-comment.js';
 import { readRejections, shouldWrite } from './read-rejections.js';
 import { tgitFetch } from '../providers/tgit/rest-auth.js';
 
-// ─── 类型 ────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────
 
 export interface CiExtractMrOptions {
   url: string;
@@ -32,18 +32,21 @@ export interface CiExtractMrOptions {
   output?: string;
   dryRun?: boolean;
   individualComments?: boolean;
+  /** Read the MR's review threads into the extraction; `--no-discussions` sets false (#1187) */
+  discussions?: boolean;
 }
 
-// ─── Git User 配置 ───────────────────────────────────────
+// ─── Git user setup ───────────────────────────────────────
 
 /**
- * 自动配置 git user.name 和 user.email。
+ * Sets git user.name and user.email automatically.
  *
- * 通过 provider API 获取当前 token 对应的用户信息：
+ * Looks up the user behind the current token through the provider API:
  * - GitHub: GITHUB_TOKEN → GET /user
+ * - GitLab: GITLAB_TOKEN → GET /api/v4/user
  * - TGit: TGIT_TOKEN → GET /api/v3/user
  */
-async function configureGitUser(repoPath: string, provider: 'github' | 'tgit'): Promise<void> {
+async function configureGitUser(repoPath: string, provider: 'github' | 'tgit' | 'gitlab'): Promise<void> {
   const { execFileSync } = await import('node:child_process');
   let name = 'teamai-ci';
   let email = 'teamai-ci@noreply';
@@ -62,6 +65,13 @@ async function configureGitUser(repoPath: string, provider: 'github' | 'tgit'): 
           email = user.email ?? `${user.login}@users.noreply.github.com`;
         }
       }
+    } else if (provider === 'gitlab') {
+      const { gitlabWhoami } = await import('../providers/gitlab/gitlab-api.js');
+      const username = await gitlabWhoami();
+      if (username) {
+        name = username;
+        email = `${username}@users.noreply.gitlab`;
+      }
     } else {
       // tgitFetch throws when no TGit credential is available; the outer
       // catch below logs and falls back to the default git user.
@@ -73,7 +83,7 @@ async function configureGitUser(repoPath: string, provider: 'github' | 'tgit'): 
       }
     }
   } catch {
-    log.debug('无法获取用户信息，使用默认 git user');
+    log.debug('Could not fetch the user info; using the default git user');
   }
 
   try {
@@ -81,14 +91,14 @@ async function configureGitUser(repoPath: string, provider: 'github' | 'tgit'): 
     execFileSync('git', ['config', 'user.email', email], { cwd: repoPath, stdio: 'ignore' });
     log.debug(`Git user: ${name} <${email}>`);
   } catch {
-    log.debug('git config 失败（非 git 仓库），跳过');
+    log.debug('git config failed (not a git repo); skipping');
   }
 }
 
-// ─── 写入逻辑 ────────────────────────────────────────────
+// ─── Write logic ────────────────────────────────────────────
 
 /**
- * 将 learning 和 codebase 建议写入团队仓库。
+ * Writes the learning and codebase suggestions to the team repo.
  */
 async function writeKnowledgeToRepo(
   teamRepo: string,
@@ -105,7 +115,7 @@ async function writeKnowledgeToRepo(
     changedFiles.push('teamwiki');
   }
 
-  // 写入 learning
+  // Write the learning
   if (learning) {
     const safeTitle = learning.title
       .replace(/[^a-zA-Z0-9一-鿿_-]/g, '-')
@@ -121,18 +131,18 @@ async function writeKnowledgeToRepo(
       await fs.mkdir(learningsDir, { recursive: true });
       await fs.writeFile(learningPath, learning.content, 'utf-8');
     }
-    log.success(`Learning 写入: learnings/${filename}`);
+    log.success(`Learning written: learnings/${filename}`);
     changedFiles.push(`learnings/${filename}`);
   }
 
-  // 处理 codebase suggestions
-  // NOTE: direct 模式的 AI 重写已被 teamwiki/ 图谱增量更新替代（Phase 3.3）
-  // suggestions 仅在 pending-review 模式下写入 jsonl 供人工审阅
+  // Handle codebase suggestions
+  // NOTE: the incremental teamwiki/ graph update replaced the direct-mode AI rewrite (Phase 3.3).
+  // Suggestions go to the jsonl for human review only in pending-review mode.
   if (suggestions && suggestions.length > 0) {
     if (writeMode === 'direct') {
-      log.debug('Codebase suggestions (direct mode): 图谱变更已在 comment/write 阶段处理，跳过 AI 重写');
+      log.debug('Codebase suggestions (direct mode): graph changes are handled in the comment/write stage; skipping the AI rewrite');
     } else {
-      // pending-review 模式
+      // pending-review mode
       for (const s of suggestions) {
         if (!dryRun) {
           await appendPendingReview(teamRepo, {
@@ -143,25 +153,66 @@ async function writeKnowledgeToRepo(
           });
         }
       }
-      log.success(`${suggestions.length} 条建议已加入 pending-review 队列`);
+      log.success(`${suggestions.length} suggestion(s) added to the pending-review queue`);
       changedFiles.push('.teamai/pending-review.jsonl');
     }
   }
 
-  // 提交并推送
+  // Commit and push
   if (!dryRun && changedFiles.length > 0) {
     try {
-      const provider = mrUrl.includes('github.com') ? 'github' as const : 'tgit' as const;
+      const provider = mrUrl.includes('github.com') ? 'github' as const
+        : mrUrl.includes('git.woa.com') ? 'tgit' as const
+          : 'gitlab' as const;
       await configureGitUser(teamRepo, provider);
       await pushRepoDirectly(teamRepo, `[teamai] CI extract knowledge from MR`, changedFiles);
-      log.success('已推送到团队仓库');
+      log.success('Pushed to the team repo');
     } catch (err) {
-      log.warn(`推送失败: ${(err as Error).message}，文件已写入本地`);
+      log.warn(`Push failed: ${(err as Error).message}; the files are written locally`);
     }
   }
 }
 
-// ─── 输出 artifacts ─────────────────────────────────────
+// ─── Incremental teamwiki update ───────────────────────────────────
+
+/**
+ * Import the merged checkout (the working directory) into the team repo's
+ * teamwiki, as `teamai import --dir . --incremental` does, under the slug
+ * `teamai import --from-repo` and `--from-mr` use for this repo. The baseline
+ * published with that codebase's evidence makes the run incremental, even on a
+ * fresh CI clone of the team repo.
+ *
+ * Non-blocking: a failure is logged and leaves the teamwiki as it was.
+ *
+ * @returns whether the teamwiki changed
+ */
+async function importMergedCheckout(teamRepo: string, repoUrl: string, mrUrl: string): Promise<boolean> {
+  const sourceDir = process.cwd();
+  const teamRepoDir = path.resolve(teamRepo);
+  const relative = path.relative(sourceDir, teamRepoDir);
+  if (!relative || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+    log.warn(`Skipped the teamwiki update: the team repo (${teamRepoDir}) is inside the source checkout `
+      + `(${sourceDir}), so its files would be extracted as source. Clone it outside the checkout (see examples/ci/).`);
+    return false;
+  }
+  try {
+    const { repoSlugForUrl } = await import('../import-repo.js');
+    const { importLocalCheckout } = await import('../import-codebase.js');
+    return await importLocalCheckout({
+      sourceDir,
+      slug: repoSlugForUrl(repoUrl),
+      wikiRoot: path.join(teamRepoDir, 'teamwiki'),
+      incremental: true,
+      repoUrl,
+      sourceMrUrl: mrUrl,
+    });
+  } catch (err) {
+    log.warn(`teamwiki update failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+// ─── Output artifacts ─────────────────────────────────────
 
 async function writeArtifacts(
   outputDir: string,
@@ -183,38 +234,46 @@ async function writeArtifacts(
   }
 }
 
-// ─── 主入口 ─────────────────────────────────────────────
+// ─── Main entry ─────────────────────────────────────────────
 
 /**
- * CI MR 知识提炼主函数。
+ * Runs the CI MR knowledge extraction.
  *
- * @param opts  命令选项
- * @throws     参数校验失败或 AI 调用失败时抛出 Error
+ * @param opts  command options
+ * @throws     Error when argument validation or the AI call fails
  */
 export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
-  // 参数校验
+  // Validate arguments
   if ((opts.mode === 'write' || opts.mode === 'both') && !opts.teamRepo) {
-    throw new Error('write 模式需要 --team-repo 参数');
+    throw new Error('write mode requires --team-repo');
   }
 
-  // AI 提炼（复用 importFromMR）
+  // AI extraction (reuses importFromMR)
   let learning: LearningDraft | undefined;
 
+  // The team repo's `language: en` makes the learning English (#1187).
+  const language = opts.teamRepo
+    ? (await import('../config.js').then(({ loadTeamConfig }) => loadTeamConfig(opts.teamRepo!)))?.language
+    : undefined;
   const result = await importFromMR({
     url: opts.url,
     all: true,
     // learnings-root ok: CI runs against a bare checkout, with no LocalConfig
     learningsDirs: opts.teamRepo ? [path.join(opts.teamRepo, 'learnings')] : undefined,
-    dryRun: true, // 不让 importFromMR 自己写文件，我们自己控制写入
+    dryRun: true, // importFromMR writes nothing; this function controls the writes
+    discussions: opts.discussions,
+    // A custom marker's comments are teamai's own too: keep them out of the threads.
+    commentMarker: opts.commentMarker,
+    language,
   });
   learning = result.learning;
 
-  // 执行 comment
-  // NOTE: codebase suggestions 不再作为独立 comment 发布，已被图谱变更 comment 替代
+  // Run comment
+  // NOTE: codebase suggestions are no longer posted as their own comment; the graph change comment replaced it
   if (opts.mode === 'comment' || opts.mode === 'both') {
     if (opts.individualComments) {
       const { posted } = await postIndividualComments(opts.url, learning, undefined, opts.dryRun);
-      log.success(`已发布 ${posted} 条独立建议 comment`);
+      log.success(`Posted ${posted} individual suggestion comment(s)`);
     } else {
       const result = await postOrUpdateMrComment(
         opts.url,
@@ -224,9 +283,9 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
         opts.dryRun,
       );
       if (result.created) {
-        log.success('MR comment 已发布');
+        log.success('MR comment posted');
       } else {
-        log.success('MR comment 已更新');
+        log.success('MR comment updated');
       }
       if (result.url) {
         log.info(`Comment URL: ${result.url}`);
@@ -234,37 +293,41 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
     }
   }
 
-  // ── Codebase 图谱变更 ──────────────────────────────────────
+  // ── Codebase graph changes ──────────────────────────────────────
   let graphChangeSummary: { added: string[]; removed: string[] } | undefined;
+  // The merge touched a source file (added, changed or deleted) in a git checkout.
+  let sourceChanged = false;
   try {
     const { collectCode, extractCodeFacts, buildCodeGraph } = await import('../wiki-engine/adapters/index.js');
     const { execFileSync } = await import('node:child_process');
     const businessRepo = process.cwd();
 
-    // 从 git 获取当前 MR/PR 的变更文件列表
-    // 尝试多种方式，兼容 shallow clone（depth=1 时 HEAD~1 不存在）
+    // Get the files this MR/PR changed from git
+    // Try several ways, to cope with a shallow clone (HEAD~1 does not exist at depth=1)
     let changedFiles: string[] = [];
+    const defaultBranch = await getDefaultBranch(businessRepo).catch(() => 'master');
     const diffCommands = [
       ['diff', '--name-only', 'HEAD~1', 'HEAD'],
       ['show', '--name-only', '--format=', 'HEAD'],
-      ['diff', '--name-only', 'origin/master...HEAD'],
+      ['diff', '--name-only', `origin/${defaultBranch}...HEAD`],
     ];
     for (const args of diffCommands) {
       try {
         const diffOutput = execFileSync(
           'git', args,
-          { cwd: businessRepo, encoding: 'utf-8', timeout: 10_000 },
+          { cwd: businessRepo, encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] },
         );
         changedFiles = diffOutput.trim().split('\n')
-          .filter(f => f && /\.(ts|tsx|js|jsx|py|go|rs|java)$/.test(f));
+          .filter(f => f && /\.(ts|tsx|js|jsx|py|go|rs|java|swift|scala)$/.test(f));
         if (changedFiles.length > 0) break;
       } catch {
         continue;
       }
     }
     if (changedFiles.length === 0) {
-      log.debug('[codebase-graph] 所有 git diff 方式均失败或无源文件变更');
+      log.debug('[codebase-graph] every git diff attempt failed or no source file changed');
     }
+    sourceChanged = changedFiles.length > 0;
 
     if (changedFiles.length > 0) {
       const { files } = await collectCode({ root: businessRepo, changedFiles, maxFiles: 50 });
@@ -277,10 +340,10 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
         };
 
         if ((opts.mode === 'comment' || opts.mode === 'both') && graphChangeSummary.added.length > 0) {
-          // 推断受影响模块，附加到 graph comment 作为知识库更新预览
+          // Infer the affected modules and attach them to the graph comment as a teamwiki update preview
           const affectedModules = [...new Set(changedFiles.map(f => f.split('/')[0]))];
           const wikiUpdatePreview = affectedModules.length > 0
-            ? `**📚 Teamwiki 知识库将增量更新以下模块：**\n${affectedModules.map(m => `- \`${m}\` (evidence + G-document)`).join('\n')}`
+            ? `**📚 The teamwiki will be updated incrementally for these modules:**\n${affectedModules.map(m => `- \`${m}\` (evidence + G-document)`).join('\n')}`
             : '';
           await postCodebaseGraphComment(
             opts.url,
@@ -291,12 +354,12 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
       }
     }
   } catch (err) {
-    log.debug(`[codebase-graph] 图谱变更提取失败（非阻塞）: ${err instanceof Error ? err.message : err}`);
+    log.debug(`[codebase-graph] graph change extraction failed (non-blocking): ${err instanceof Error ? err.message : err}`);
   }
 
-  // 执行 write
+  // Run write
   if (opts.mode === 'write' || opts.mode === 'both') {
-    // 当使用 individual comments 时，读取 rejection 状态进行过滤
+    // With individual comments, read the rejection state to filter what is written
     let filteredLearning = learning;
 
     if (opts.individualComments && !opts.dryRun) {
@@ -304,76 +367,31 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
       const rejections = await readRejections(opts.url);
 
       if (rejections.allIds.size > 0) {
-        // 过滤 learning
+        // Filter the learning
         if (learning && !shouldWrite('learning', rejections, parsed.provider)) {
-          log.info('Learning 被 reject，跳过写入');
+          log.info('Learning rejected; skipping the write');
           filteredLearning = undefined;
         }
       }
     }
 
-    // ── 图谱变更写入 team-repo/teamwiki/ ───────────────────
+    // ── Write graph changes to <team-repo>/teamwiki/ (incrementally, through the same flow as teamai import) ──
+    // Gated on any changed source file, not on graph nodes added: a merge that
+    // only deletes or empties files still has to prune them from the teamwiki.
     let graphWritten = false;
-    if (graphChangeSummary && graphChangeSummary.added.length > 0 && !opts.dryRun) {
+    if (sourceChanged && !opts.dryRun) {
       let graphRejected = false;
       if (opts.individualComments) {
         const parsed = parseMrUrl(opts.url);
         const rejections = await readRejections(opts.url);
         if (!shouldWrite('codebase-graph', rejections, parsed.provider)) {
           graphRejected = true;
-          log.info('Codebase 图谱变更被 reject，跳过写入');
+          log.info('Codebase graph changes rejected; skipping the write');
         }
       }
 
       if (!graphRejected) {
-        try {
-          const { extractCodebase } = await import('../codebase-extract.js');
-          const businessRepo = process.cwd();
-          const parsed = parseMrUrl(opts.url);
-          const projectName = parsed.repo;
-
-          await extractCodebase({ path: businessRepo, project: projectName });
-
-          const fse = await import('fs-extra');
-          const srcWiki = path.join(businessRepo, 'teamwiki');
-          const teamWikiRoot = path.join(path.resolve(opts.teamRepo!), 'teamwiki');
-          try {
-            if (await fse.pathExists(srcWiki)) {
-              const evidenceSrc = path.join(srcWiki, 'evidence', 'code', projectName);
-              const evidenceDest = path.join(teamWikiRoot, 'evidence', 'code', projectName);
-              if (await fse.pathExists(evidenceSrc)) {
-                await fse.ensureDir(evidenceDest);
-                await fse.copy(evidenceSrc, evidenceDest, { overwrite: true });
-              }
-              const srcGraph = path.join(srcWiki, '.indices', 'graph-index.json');
-              if (await fse.pathExists(srcGraph)) {
-                const destGraphDir = path.join(evidenceDest, '.indices');
-                await fse.ensureDir(destGraphDir);
-                await fse.copy(srcGraph, path.join(destGraphDir, 'graph-index.json'));
-              }
-              const { aggregateGlobalGraph } = await import('../graph-aggregate.js');
-              await aggregateGlobalGraph(teamWikiRoot);
-              try {
-                const { deepEnrich } = await import('../deep-enrich.js');
-                await deepEnrich({
-                  project: projectName,
-                  evidenceDir: evidenceDest,
-                  wikiRoot: teamWikiRoot,
-                  cacheDir: businessRepo,
-                });
-                log.success(`teamwiki/ deep enrich 完成: ${projectName}`);
-              } catch (enrichErr) {
-                log.debug(`[deep-enrich] 失败（非阻塞）: ${enrichErr instanceof Error ? enrichErr.message : enrichErr}`);
-              }
-              graphWritten = true;
-              log.success(`teamwiki/ 知识库增量更新完成`);
-            }
-          } finally {
-            await fse.remove(srcWiki).catch(() => {});
-          }
-        } catch (err) {
-          log.debug(`[codebase-graph] 图谱写入失败（非阻塞）: ${err instanceof Error ? err.message : err}`);
-        }
+        graphWritten = await importMergedCheckout(opts.teamRepo!, result.repoUrl, opts.url);
       }
     }
 
@@ -388,9 +406,9 @@ export async function ciExtractMr(opts: CiExtractMrOptions): Promise<void> {
     );
   }
 
-  // 输出 artifacts
+  // Output artifacts
   if (opts.output) {
     await writeArtifacts(opts.output, learning, undefined);
-    log.success(`Artifacts 已输出到: ${opts.output}`);
+    log.success(`Artifacts written to: ${opts.output}`);
   }
 }

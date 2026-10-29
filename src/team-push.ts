@@ -4,19 +4,14 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { readUsageEvents, truncateUsageAfterReport } from './usage-tracker.js';
 import { aggregateUsage } from './stats.js';
-import { readEvents, aggregateSessionMetrics, dataHomeKey } from './dashboard-collector.js';
-import {
-  createGit,
-  pushRepoDirectly,
-  pullRepo,
-  resetToCleanMaster,
-  isDedicatedRepoRoot,
-  getFileContentAtRev,
-} from './utils/git.js';
+import { collectTeamRepoSkills } from './agent-skills.js';
+import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import { readEvents, aggregateSessionMetrics, dataHomeKey, memberEvents, sessionRuns } from './dashboard-collector.js';
+import { RUN_MODES, type RunMode, type SessionRun } from './launch-context.js';
 import { writeFile, readFileSafe, ensureDir, pathExists, readJson, writeJson } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type {
-  UserStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics,
+  UserStats, UserModeStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2,
 } from './types.js';
 import { getVotesDir, getDataHome, getReportsDir, emptyTokenUsage, addTokenUsage, usesBranchWorktree } from './types.js';
 import { filterEventsByScope, runsOfLog } from './dashboard-scope.js';
@@ -55,7 +50,7 @@ interface PromptTokenDelta {
 //  [reportUsageToTeam()]
 //      │
 //      ▼
-//  [git pull latest] ── get freshest remote state ──
+//  [update teamai-reports branch]
 //      │
 //      ▼
 //  [read scope usage file] ─has events?─▶ merge stats
@@ -120,18 +115,50 @@ export function mergeStats(
     }
   }
 
+  // Every field this report does not refresh carries over, so a partial report
+  // never drops another writer's data (#425, #1170). Callers overwrite
+  // interventions/prompts/tokens/daily when that report carries a delta.
   return {
+    ...existing,
     username,
     updatedAt: new Date().toISOString(),
     skills,
-    // Preserve session metrics across partial reports (Issue #425).
-    // mergeStats only refreshes skills/username/updatedAt; callers overwrite
-    // interventions/prompts/tokens when that report carries a non-empty delta.
-    ...(existing?.interventions !== undefined ? { interventions: existing.interventions } : {}),
-    ...(existing?.prompts !== undefined ? { prompts: existing.prompts } : {}),
-    ...(existing?.tokens !== undefined ? { tokens: existing.tokens } : {}),
-    ...(existing?.daily !== undefined ? { daily: existing.daily } : {}),
   };
+}
+
+/**
+ * The set of skill names that may be published in stats: the team repo's
+ * shared catalog plus the CLI's built-in skills (deployed by the CLI itself
+ * and served via `teamai skill get`, never present in `skills/` — without
+ * them, adoption of the built-in `teamai` skill would silently disappear
+ * from the digest, #1056 review). The catalog is enumerated from the team
+ * repo's default-branch checkout. The reports branch is an orphan branch and
+ * never carries `skills/`, so the catalog must always be enumerated from the
+ * main repo path, not from the worktree stats are written into (#1055).
+ */
+export async function teamSharedSkillNames(repoRoot: string): Promise<Set<string>> {
+  const names = new Set((await collectTeamRepoSkills(repoRoot)).keys());
+  for (const name of BUILTIN_SKILL_NAMES) names.add(name);
+  return names;
+}
+
+/**
+ * Merge usage stats into the published file, filtering new usage to skill
+ * names the team actually shares (#1055). `stats/<user>.yaml` is visible to
+ * everyone who pulls, so a member's local-only skills, slash-command names and
+ * stray SKILL.md reads must not be published; the local `usage.jsonl` keeps
+ * full fidelity. Names published before this filter existed are kept as-is:
+ * they remain in the git history either way, and rewriting that history is
+ * costly (maintainer call on #1056). An empty catalog (a team that shares no
+ * skills) therefore only blocks new additions.
+ */
+export function mergeStatsWithinTeamSkills(
+  existing: UserStats | null,
+  username: string,
+  newEvents: { name: string; count: number; lastUsed: Date }[],
+  teamSkills: ReadonlySet<string>,
+): UserStats {
+  return mergeStats(existing, username, newEvents.filter((s) => teamSkills.has(s.name)));
 }
 
 // ─── Human Intervention reporting (Issue #34) ──────────
@@ -887,6 +914,46 @@ export function adoptBareKeys<T>(
   return adopted;
 }
 
+/** What one report adds to a member's counters, in total or in one run mode. */
+type UsageDelta = {
+  interventions: UserInterventionStats;
+  promptTokens: PromptTokenDelta;
+  daily: ReturnType<typeof computeDailyStatsDelta>['delta'];
+};
+
+/**
+ * The deltas of the sessions whose run mode is `mode`, against the same per-session baselines the top-level counters
+ * use: a session's change counts in the mode its latest event recorded, so no turn is reported twice, and a session
+ * with no recorded mode adds to neither.
+ */
+function modeDelta(
+  mode: RunMode,
+  runs: Map<string, SessionRun>,
+  current: { interventions: Map<string, ReportedInterventions[string]>; metrics: Map<string, SessionMetrics>; daily: Map<string, DailySessionSnapshot> },
+  reported: { interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions },
+  dropped: Map<string, DroppedRollout[]>,
+): UsageDelta {
+  const inMode = <T>(sessions: Map<string, T>) => new Map([...sessions].filter(([sid]) => runs.get(sid)?.runMode === mode));
+  return {
+    interventions: computeInterventionDelta(inMode(current.interventions), reported.interventions).delta,
+    promptTokens: computePromptTokenDelta(inMode(current.metrics), reported.promptTokens, dropped).delta,
+    daily: computeDailyStatsDelta(inMode(current.daily), reported.daily).delta,
+  };
+}
+
+/** The counters `delta` changes, each as `existing` holds it with `delta` added. A counter it leaves alone is absent. */
+function changedCounters(existing: UserModeStats | undefined, delta: UsageDelta): UserModeStats {
+  const changed: UserModeStats = {};
+  if (hasInterventionDelta(delta.interventions)) changed.interventions = mergeInterventionStats(existing?.interventions, delta.interventions);
+  if (hasPromptTokenDelta(delta.promptTokens)) {
+    const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, delta.promptTokens);
+    changed.prompts = pt.prompts;
+    changed.tokens = pt.tokens;
+  }
+  if (hasDailyDelta(delta.daily)) changed.daily = mergeDailyStats(existing?.daily, delta.daily);
+  return changed;
+}
+
 /**
  * Auto-report usage data to team repo during pull.
  * Merges new events with existing stats to preserve historical data.
@@ -899,31 +966,29 @@ export function adoptBareKeys<T>(
 export async function reportUsageToTeam(
   repoPath: string,
   username: string,
-  options?: { skipTruncate?: boolean; selfConfig?: LocalConfig },
+  options: { skipTruncate?: boolean; selfConfig: LocalConfig },
 ): Promise<boolean> {
-  // Non-HTTP repos: stats + votes are report data → the teamai-reports orphan
-  // branch (isolated worktree). We must NOT resetToCleanMaster / pullRepo /
-  // pushRepoDirectly on the default branch (or, in self mode, the business
-  // working tree). The dedicated writer handles the worktree + rebase race.
-  const reportsConfig = options?.selfConfig;
-  const useReportsBranch = !!reportsConfig && usesBranchWorktree(reportsConfig);
+  const reportsConfig = options.selfConfig;
+  if (!usesBranchWorktree(reportsConfig)) {
+    log.debug(`Skipping report for HTTP repo ${repoPath}`);
+    return false;
+  }
   let restoreStats: (() => Promise<void>) | undefined;
 
   // Reports-branch writes use the reports-lock, not the partition sync-lock
-  // (non-reentrant; pull() already holds it). The else-branch clone reset is
-  // only for callers that did not pass a config.
+  // (non-reentrant; pull() already holds it).
 
   try {
     // This scope's own skill usage (#748); a caller without a scope reports none.
-    const events = reportsConfig ? await readUsageEvents(reportsConfig) : [];
+    const events = await readUsageEvents(reportsConfig);
     // This scope's own votes (#787), likewise.
-    const votesDir = reportsConfig ? getVotesDir(reportsConfig) : undefined;
+    const votesDir = getVotesDir(reportsConfig);
     const filesToPush: string[] = [];
 
     // Fold the local dashboard event log into per-session metrics once, then derive
     // both the intervention delta and the prompt-count/token delta from it.
-    // Only the sessions recorded in this scope (#785).
-    const dashboardEvents = await filterEventsByScope(await readEvents(), reportsConfig);
+    // Only the member's own sessions recorded in this scope (#785).
+    const dashboardEvents = memberEvents(await filterEventsByScope(await readEvents(), reportsConfig));
     const metrics = aggregateSessionMetrics(dashboardEvents);
 
     const currentInterventions = interventionCounts(metrics);
@@ -949,14 +1014,17 @@ export async function reportUsageToTeam(
       effective.daily,
       reportedDailySessions,
     );
+    const runs = sessionRuns(dashboardEvents);
+    const modeDeltas = RUN_MODES.map((mode) => [mode, modeDelta(
+      mode, runs, { interventions: effective.interventions, metrics, daily: effective.daily },
+      { interventions: reportedInterventions, promptTokens: reportedPromptTokens, daily: reportedDailySessions }, dropped,
+    )] as const);
     // This scope's sessions, and those of its snapshots no owner claims yet
     // (a project whose data home is in its workspace, which the seed may miss).
-    if (reportsConfig) {
-      await recordSessionOwners([
-        ...dashboardEvents.map((e) => e.sessionId),
-        ...await reportedBeyondShared(reportedPromptTokens, reportedInterventions, reportedDailySessions),
-      ], await dataHomeKey(getDataHome(reportsConfig)));
-    }
+    await recordSessionOwners([
+      ...dashboardEvents.map((e) => e.sessionId),
+      ...await reportedBeyondShared(reportedPromptTokens, reportedInterventions, reportedDailySessions),
+    ], await dataHomeKey(getDataHome(reportsConfig)));
 
     const hasUsage = events.length > 0;
     const hasInterventions = hasInterventionDelta(interventionDelta);
@@ -970,7 +1038,14 @@ export async function reportUsageToTeam(
         ? `[teamai] Update session stats for ${username}`
         : `[teamai] Update votes for ${username}`;
 
-    const writeReportFiles = async (writeRoot: string): Promise<void> => {
+    const writeReportFiles = async (
+      writeRoot: string,
+      votesStaged: { syncedDeltas?: UserVotesV2['deltas'] },
+    ): Promise<void> => {
+      // The team's shared-skill catalog for the #1055 privacy filter. Always
+      // enumerated from repoPath (the default-branch checkout): writeRoot may
+      // be the orphan reports-branch worktree, which never carries skills/.
+      const teamSkillNames = await teamSharedSkillNames(repoPath);
       // Process usage and/or intervention/prompt/token stats if anything is new to report.
       if (hasStats) {
         const statsDir = path.join(writeRoot, 'stats');
@@ -979,38 +1054,47 @@ export async function reportUsageToTeam(
 
         // See also: stats.ts mergeLocalAndReported() — same merge logic for display.
         // mergeStats with [] preserves existing skills while refreshing username/updatedAt,
-        // and carries interventions/prompts/tokens so partial reports do not clobber them (#425).
+        // and carries every other field so partial reports do not clobber them (#425, #1170).
         const existing = await readExistingStats(statsPath);
-        if (useReportsBranch) {
-          const previousContent = await readFileSafe(statsPath);
-          // A failed push can leave an already-incremented file in the reports
-          // worktree. Restore its input so a normal retry does not add it twice.
-          restoreStats = () => writeFile(statsPath, previousContent ?? '');
-        }
+        const previousContent = await readFileSafe(statsPath);
+        // A failed push can leave an already-incremented file in the reports
+        // worktree. Restore its input so a normal retry does not add it twice.
+        restoreStats = () => writeFile(statsPath, previousContent ?? '');
         const newStats = hasUsage ? aggregateUsage(events) : [];
-        const merged = mergeStats(existing, username, newStats);
-        if (hasInterventions) {
-          merged.interventions = mergeInterventionStats(existing?.interventions, interventionDelta);
-        }
-        if (hasPromptTokens) {
-          const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, promptTokenDelta);
-          merged.prompts = pt.prompts;
-          merged.tokens = pt.tokens;
-        }
-        if (hasDaily) {
-          merged.daily = mergeDailyStats(existing?.daily, dailyDelta);
+        // #1055: new usage is filtered to names the team actually shares (plus
+        // CLI built-ins); names published before this filter existed are kept
+        // as-is (maintainer call on #1056). The catalog comes from the
+        // default-branch repo path, never from writeRoot (the reports branch
+        // is an orphan without skills/).
+        const merged = mergeStatsWithinTeamSkills(existing, username, newStats, teamSkillNames);
+        Object.assign(merged, changedCounters(existing ?? undefined, { interventions: interventionDelta, promptTokens: promptTokenDelta, daily: dailyDelta }));
+        for (const [mode, delta] of modeDeltas) {
+          const counters = { ...existing?.[mode], ...changedCounters(existing?.[mode], delta) };
+          if (Object.keys(counters).length > 0) merged[mode] = counters;
         }
 
         await writeFile(statsPath, YAML.stringify(merged));
         filesToPush.push(`stats/${username}.yaml`);
       }
 
-      // Always stage pending local votes (V2 delta-aware merge)
+      // Always stage pending local votes (V2 delta-aware merge). Through the
+      // reports branch the deltas are NOT cleared here: they are cleared by
+      // confirmVotesSynced once the push is confirmed delivered (#1027), so a
+      // failed push or a crash keeps them pending instead of losing the sync
+      // trigger forever.
       try {
-        if (votesDir && await pathExists(votesDir)) {
-          const { syncVotesToTeam } = await import('./votes.js');
-          const synced = await syncVotesToTeam(writeRoot, username, votesDir);
-          if (synced) {
+        if (await pathExists(votesDir)) {
+          const { stageVotesMerge, readUserVotesFromContent } = await import('./votes.js');
+          const { readReportsOriginFile } = await import('./utils/reports-branch.js');
+          const origin = await readReportsOriginFile(writeRoot, `votes/${username}.yaml`);
+          const staged = await stageVotesMerge(
+            writeRoot,
+            username,
+            votesDir,
+            origin === null ? null : readUserVotesFromContent(origin),
+          );
+          if (staged) {
+            votesStaged.syncedDeltas = staged.syncedDeltas;
             filesToPush.push(`votes/${username}.yaml`);
           }
         }
@@ -1021,85 +1105,40 @@ export async function reportUsageToTeam(
 
     // Keep push and acknowledgement in the same operation. A caller timing out
     // must not abandon the success bookkeeping below.
-    if (useReportsBranch && reportsConfig) {
-      let hasVotes = false;
-      if (!hasStats && votesDir && await pathExists(votesDir)) {
-        const { hasPendingVoteDeltas } = await import('./votes.js');
-        hasVotes = await hasPendingVoteDeltas(votesDir, username);
+    let hasVotes = false;
+    if (!hasStats && await pathExists(votesDir)) {
+      const { hasPendingVoteDeltas } = await import('./votes.js');
+      hasVotes = await hasPendingVoteDeltas(votesDir, username);
+    }
+    if (!hasStats && !hasVotes) {
+      log.debug('No usage events or votes to report');
+      return true;
+    }
+    const { updateReports } = await import('./utils/reports-branch.js');
+    const { isPublished } = await import('./utils/branch-worktree.js');
+    const votesStaged: { syncedDeltas?: UserVotesV2['deltas'] } = {};
+    const result = await updateReports(reportsConfig, async (wt, { onDelivered }) => {
+      filesToPush.length = 0;
+      await writeReportFiles(wt, votesStaged);
+      if (votesStaged.syncedDeltas) {
+        // Clear the staged deltas only once origin holds them, under the
+        // reports lock (see the votes-sync handler) — a busy lock, a failed
+        // push, or a crash keeps them pending for the next report (#1027).
+        onDelivered(() => import('./votes.js').then(({ confirmVotesSynced }) =>
+          confirmVotesSynced(path.join(votesDir, `${username}.yaml`), votesStaged.syncedDeltas!)));
       }
-      if (!hasStats && !hasVotes) {
-        log.debug('No usage events or votes to report');
-        return true;
-      }
-      const { updateReports } = await import('./utils/reports-branch.js');
-      const pushed = await updateReports(reportsConfig, async (wt) => {
-        filesToPush.length = 0;
-        await writeReportFiles(wt);
-        return filesToPush.length > 0 ? { files: [...filesToPush], message: commitMsg } : null;
-      }, { pushIfUnchanged: true });
-      if (!pushed) {
-        log.debug('Auto-report push was not confirmed; keeping local report data');
-        await restoreStats?.();
-        return false;
-      }
-    } else {
-      // The team repo is a disposable cache clone here — safe to discard local state
-      // and reset to the default branch before pulling (same pattern as push.ts).
-      //
-      // Defense-in-depth: this whole else-branch assumes repoPath is a dedicated clone
-      // ROOT with its own .git. If it is not the git top level, git commands here bubble
-      // up to the nearest enclosing .git and act on the USER'S BUSINESS REPO instead —
-      // reset --hard wipes their uncommitted work and checkout switches them off their
-      // branch. Two known ways repoPath ends up inside the business repo:
-      //   - self mode: localPath is `<businessRoot>/.teamai`
-      //   - project scope: localPath is `<projectRoot>/.teamai/team-repo`, and when that
-      //     dir has no dedicated .git (clone missing/incomplete) it resolves to the
-      //     business repo root.
-      // In either case bail out: there is no safe cache root to report into.
-      const git = createGit(repoPath);
-      if (!(await isDedicatedRepoRoot(repoPath))) {
-        log.debug(`Skipping report: ${repoPath} is not a dedicated team-repo root (safety guard)`);
-        return false;
-      }
-      const { isImportInProgress } = await import('./utils/import-lock.js');
-      if (await isImportInProgress(repoPath)) {
-        log.debug(`Skipping report: import in progress for ${repoPath} (would reset uncommitted artifacts)`);
-        return false;
-      }
-      const yamlPath = path.join(repoPath, 'teamai.yaml');
-      const workingContent = await readFileSafe(yamlPath);
-      const committedContent = workingContent === null
-        ? null
-        : await getFileContentAtRev(repoPath, 'HEAD', 'teamai.yaml');
-      const pendingTeamConfig = workingContent !== null
-        && (committedContent === null || committedContent.toString() !== workingContent)
-        ? workingContent
-        : null;
-
-      try {
-        await resetToCleanMaster(git, repoPath);
-        await pullRepo(repoPath);
-      } finally {
-        // `source add` and `source remove` intentionally leave teamai.yaml
-        // uncommitted until `teamai push`. Auto-report must not discard those edits.
-        // Keep the complete local version, matching pushCore: it remains an explicit
-        // working-tree diff for review instead of being silently committed here.
-        if (pendingTeamConfig !== null) {
-          await writeFile(yamlPath, pendingTeamConfig);
-        }
-      }
-
-      await writeReportFiles(repoPath);
-      if (filesToPush.length === 0) {
-        log.debug('No usage events or votes to report');
-        return true;
-      }
-      await pushRepoDirectly(repoPath, commitMsg, filesToPush);
+      return { files: [...filesToPush], message: commitMsg };
+    }, { pushIfUnchanged: true });
+    const pushed = isPublished(result);
+    if (!pushed) {
+      log.debug('Auto-report push was not confirmed; keeping local report data');
+      await restoreStats?.();
+      return false;
     }
     restoreStats = undefined;
 
     // Success — truncate reported usage events (only if caller allows it)
-    if (hasUsage && reportsConfig && !options?.skipTruncate) {
+    if (hasUsage && !options.skipTruncate) {
       await truncateUsageAfterReport(events.length, reportsConfig);
       log.debug(`Reported ${events.length} usage events to team repo`);
     } else if (hasUsage) {

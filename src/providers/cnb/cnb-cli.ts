@@ -43,7 +43,7 @@ export const CNB_HOST = process.env.TEAMAI_CNB_HOST?.trim() || 'cnb.cool';
 /** Run a `cnb` subcommand. Returns { stdout, stderr, status }. */
 export function cnbExec(
   args: string[],
-  options?: { inheritStdio?: boolean; cwd?: string },
+  options?: { inheritStdio?: boolean; cwd?: string; timeoutMs?: number },
 ): { stdout: string; stderr: string; status: number } {
   // Resolve the executable first, then launch it through cross-spawn: on
   // Windows the npm-installed CLI is only a `.cmd` shim, which neither a bare
@@ -58,7 +58,7 @@ export function cnbExec(
 
   log.debug(`cnb exec: ${cnbPath} ${args.join(' ')}`);
   if (options?.inheritStdio) {
-    const r = crossSpawn.sync(cnbPath, args, { stdio: 'inherit', env: { ...process.env }, cwd: options.cwd });
+    const r = crossSpawn.sync(cnbPath, args, { stdio: 'inherit', env: { ...process.env }, cwd: options.cwd, ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}) });
     return { stdout: '', stderr: '', status: r.status ?? 1 };
   }
   const r = crossSpawn.sync(cnbPath, args, {
@@ -66,6 +66,7 @@ export function cnbExec(
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
+    ...(options?.timeoutMs ? { timeout: options.timeoutMs } : {}),
   });
   return {
     stdout: (r.stdout ?? '').toString().trim(),
@@ -102,7 +103,7 @@ export async function ensureCnbInstalled(): Promise<void> {
     log.debug('cnb CLI already installed');
     return;
   }
-  const spin = spinner('Installing cnb CLI (@cnbcool/cnb-cli)...').start();
+  const spin = (await spinner('Installing cnb CLI (@cnbcool/cnb-cli)...')).start();
   try {
     execSync('npm install -g @cnbcool/cnb-cli', { stdio: ['pipe', 'pipe', 'pipe'], timeout: 120_000 });
     if (!isCnbInstalled()) throw new Error('cnb not found on PATH after install');
@@ -231,10 +232,12 @@ export function cnbParseRepoInput(input: string): RepoInfo {
  * itself: `git -c credential.helper=... clone` only applies for that one
  * invocation, so the cloned repo's `remote.origin.url` carries no credentials
  * and the next push/pull falls back to an interactive Username/Password prompt.
- * GitHub/TGit solve this by embedding the token in the clone URL; CNB has no
- * user-readable token in the interactive path, so we persist the helper into
- * the repo's local config instead, making every later git operation on it auth
- * transparently.
+ * CNB has no user-readable token in the interactive path, so we persist the
+ * helper into the repo's local config instead, making every later git operation
+ * on it auth transparently. TGit solves the same problem by embedding the token
+ * in the clone URL; GitHub did that too, but now injects the token with a
+ * one-shot `http.extraHeader` and persists a URL-scoped `credential.helper` —
+ * the same shape used here (see `ghRepoClone`).
  */
 export function cnbRepoClone(repo: string, localPath: string): void {
   const token = getCnbToken();
@@ -337,6 +340,7 @@ export interface CnbPullCreateOptions {
   title: string;
   description?: string;
   cwd?: string;
+  spawnTimeoutMs?: number;
 }
 
 /**
@@ -355,7 +359,7 @@ export function cnbPullCreate(opts: CnbPullCreateOptions): string {
   ];
   if (opts.description) args.push('--body', opts.description);
 
-  const r = cnbExec(args, { cwd: opts.cwd });
+  const r = cnbExec(args, { cwd: opts.cwd, ...(opts.spawnTimeoutMs ? { timeoutMs: opts.spawnTimeoutMs } : {}) });
   if (r.status !== 0) {
     throw new Error(`cnb post-pull failed: ${r.stderr || r.stdout}`);
   }

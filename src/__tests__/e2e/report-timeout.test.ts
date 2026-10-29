@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,14 +10,16 @@ import { dataHomeKey } from '../../dashboard-collector.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const cli = path.join(root, 'dist/index.js');
 const agents = { claude: '.claude', codex: '.codex', codebuddy: '.codebuddy', opencode: '.config/opencode' };
-let sandbox: string;
+// Removed after the file: the slow-push cases run concurrently.
+const sandboxes = new Set<string>();
 
 function git(args: string[], cwd: string, env: NodeJS.ProcessEnv): string {
   return execFileSync('git', args, { cwd, env, encoding: 'utf8', windowsHide: true });
 }
 
 function fixture(agent: keyof typeof agents, provider: string, team: Record<string, unknown> = {}) {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-report-timeout-'));
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-report-timeout-'));
+  sandboxes.add(sandbox);
   const home = path.join(sandbox, 'home');
   const seed = path.join(sandbox, 'seed');
   const remote = path.join(sandbox, 'remote.git');
@@ -28,7 +30,11 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Report Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
     GIT_COMMITTER_NAME: 'Report Test', GIT_COMMITTER_EMAIL: 'test@example.invalid', FORCE_COLOR: '0' };
-  fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'report-test', repo: remote, provider, usageReport: true, ...team }));
+  fs.writeFileSync(path.join(seed, 'teamai.yaml'), YAML.stringify({ team: 'report-test', repo: remote, provider, ...team }));
+  // The 'review' skill the fixture records usage for must be in the team's
+  // shared catalog: #1055 filters published stats to catalog names.
+  fs.mkdirSync(path.join(seed, 'skills', 'review'), { recursive: true });
+  fs.writeFileSync(path.join(seed, 'skills', 'review', 'SKILL.md'), '# review\n');
   git(['init', '-q', '-b', 'main'], seed, env);
   git(['add', '.'], seed, env);
   git(['commit', '-q', '-m', 'fixture'], seed, env);
@@ -54,8 +60,13 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
         tokens: { input: 10, output: 5, cacheRead: 0, cacheCreation: 0 }, dataHomeKey: key },
     ].map((e) => JSON.stringify(e)).join('\n') + '\n');
   }
-  function receiver(mode: 'slow' | 'reject' | 'normal') {
-    fs.writeFileSync(path.join(remote, 'hooks/update'), `#!/bin/sh\nif [ "$1" = "refs/heads/teamai-reports" ]; then\n  ${mode === 'slow' ? 'sleep 7' : mode === 'reject' ? 'exit 1' : ':'}\nfi\nexit 0\n`, { mode: 0o755 });
+  function receiver(mode: 'slow' | 'reject' | 'normal' | 'slow-reject') {
+    // Only the first rejection must outlast pull's wait; later report writes can reject immediately.
+    const delay = mode === 'slow-reject'
+      ? 'if [ ! -f hooks/rejection-delayed ]; then : > hooks/rejection-delayed; sleep 7; fi'
+      : 'sleep 7';
+    const action = `${mode.startsWith('slow') ? `${delay}\n` : ''}${mode.endsWith('reject') ? 'exit 1' : ':'}`;
+    fs.writeFileSync(path.join(remote, 'hooks/update'), `#!/bin/sh\nif [ "$1" = "refs/heads/teamai-reports" ]; then\n  ${action}\nfi\nexit 0\n`, { mode: 0o755 });
   }
   async function pull(onPending?: () => void) {
     return new Promise<string>((resolve, reject) => {
@@ -97,19 +108,29 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
   function run(args: string[]) {
     return execFileSync(process.execPath, [cli, ...args], { cwd: sandbox, env, encoding: 'utf8', windowsHide: true });
   }
-  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run, runId };
+  /** The detached background pass that a host's SessionStart hook spawns, which runs the pull. */
+  function sessionStart() {
+    return execFileSync(process.execPath, [cli, 'hook-dispatch', 'session-start', '--tool', agent, '--bg-only'], {
+      cwd: sandbox, env, encoding: 'utf8', windowsHide: true, timeout: 45_000,
+      input: JSON.stringify({ cwd: sandbox, session_id: 's2' }),
+    });
+  }
+  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run, sessionStart, runId };
 }
 
-afterEach(() => {
-  if (sandbox && path.dirname(sandbox) === os.tmpdir() && path.basename(sandbox).startsWith('teamai-report-timeout-')) {
-    fs.rmSync(sandbox, { recursive: true, force: true });
+afterAll(() => {
+  for (const sandbox of sandboxes) {
+    if (path.dirname(sandbox) === os.tmpdir() && path.basename(sandbox).startsWith('teamai-report-timeout-')) {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   }
 });
 
 describe('real CLI report completion', () => {
   for (const provider of ['git', 'gitlab', 'github']) {
     for (const agent of Object.keys(agents) as Array<keyof typeof agents>) {
-      it(`acknowledges slow pushes once: ${provider}/${agent}`, async () => {
+      // Concurrent: each case mostly waits out the remote's slow push, in its own sandbox.
+      it.concurrent(`acknowledges slow pushes once: ${provider}/${agent}`, async ({ expect }) => {
         const f = fixture(agent, provider);
         await f.pull(); // Warm reports worktree without any session data.
         await f.seedEvents();
@@ -157,6 +178,53 @@ describe('real CLI report completion', () => {
     expect(stats.prompts).toBe(1);
     expect(stats.tokens.input).toBe(10);
     expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+  }, 60_000);
+
+  // The dispatcher exits once its handlers settle, which must not cut the push the pull stopped waiting for (#1322).
+  it('publishes a slow push started by the session-start hook before the hook process exits', async () => {
+    const f = fixture('claude', 'git');
+    await f.pull(); // Warm reports worktree without any session data.
+    await f.seedEvents();
+    f.receiver('slow');
+    f.sessionStart();
+    expect(f.stats().skills.review.count).toBe(1);
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+    expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(false);
+  }, 60_000);
+
+  it('keeps a rejected session-start report retryable and releases its locks', async () => {
+    const f = fixture('claude', 'git');
+    await f.pull();
+    await f.seedEvents();
+    f.receiver('slow-reject');
+    f.sessionStart();
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
+    for (const lock of ['.reports-lock', '.sync-lock']) {
+      expect(fs.existsSync(path.join(f.home, '.teamai', lock)), lock).toBe(false);
+    }
+    f.receiver('normal');
+    await f.pull();
+    const stats = f.stats();
+    expect(stats.skills.review.count).toBe(1);
+    expect(stats.prompts).toBe(1);
+    expect(stats.tokens.input).toBe(10);
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeDefined();
+    await f.pull();
+    expect(f.stats()).toEqual(stats);
+  }, 60_000);
+
+  it('does not report for a member who set usageReportEnabled: false', async () => {
+    const f = fixture('claude', 'git');
+    const configPath = path.join(f.home, '.teamai/config.yaml');
+    const config = YAML.parse(fs.readFileSync(configPath, 'utf8'));
+    fs.writeFileSync(configPath, YAML.stringify({ ...config, usageReportEnabled: false }));
+    await f.seedEvents();
+    await f.pull();
+    expect(() => f.stats()).toThrow();
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+    expect(f.run(['stats'])).toMatch(/review\s+1 uses/);
   }, 60_000);
 });
 
@@ -225,7 +293,9 @@ describe('real CLI usage cap (#788)', () => {
     f.receiver('slow');
     await f.pull(() => fs.appendFileSync(f.usage, line('late') + '\n' + line('late') + '\n'));
     expect(lines(f.usage)).toEqual([expect.stringContaining('"late"'), expect.stringContaining('"late"')]);
-    expect(f.stats().skills.legacy.count).toBe(100);
+    // #1056: `legacy` is not in the team's shared catalog, so the privacy filter keeps it
+    // out of the published stats; the events read before the append still reported `review`.
+    expect(f.stats().skills.legacy).toBeUndefined();
     expect(f.stats().skills.review.count).toBe(cap);
   }, 60_000);
 });

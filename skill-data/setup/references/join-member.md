@@ -11,7 +11,7 @@ A member joins an **existing** repo. You need its full URL from the admin.
 
 If the user has not given a full URL, ask for it:
 *"Paste the full team repo URL your admin gave you (e.g.
-https://github.com/yourorg/yourrepo)."* Do not proceed with `owner/repo` short
+https://github.com/your-org/your-repo)."* Do not proceed with `owner/repo` short
 form.
 
 **If the user does not have the URL, STOP here.** Do not guess a URL, do not probe
@@ -33,7 +33,12 @@ If it fails, Node.js ≥ 20 is missing — have them install Node 20+ first.
 ## Step 2 — Choose scope (ASK)
 
 - **This project only** (default): `cd` into the project directory first.
+  Inside Git, init uses the repository root. If it already has a workspace config, re-run init at that root; a plain subfolder cannot replace it, even with `--force`. Nested repositories and linked worktrees keep their own roots.
 - **Whole machine**: add `--scope user`.
+- **A folder holding several repos** (a workspace): set up each repo from
+  inside it, then run the same `init` in the folder. The folder also receives
+  what each repo inside selects; pass `--project` there only for a project the
+  folder itself belongs to.
 
 ## Step 3 — Log in to the same platform as the URL
 
@@ -63,6 +68,9 @@ Match the login to the URL's host (do NOT create a second repo):
   the token: add `--provider git` to the `init` in Step 4. Git then uses their
   existing SSH key or credential helper, and `push` leaves the MR for them to open
   on the web.
+- **Other Git hosts, including Azure Repos** → use the existing Git credential
+  helper or SSH key. Keep the clone path as provided, including whether it ends
+  in `.git`; do not embed HTTPS credentials in the URL.
 
 If they have no account on that platform, they register there, then ask the admin
 to add them to the repo.
@@ -126,12 +134,11 @@ section "Which tools actually get hooks".
 
 ## Step 6 — Confirm the skills actually arrived
 
-`teamai init` ends with a pull, so the team's skills, rules and MCP servers are
-already in place in user scope, and in project scope for each tool named with
-`--agent` or picked in init's interactive tool picker. A project-scope init run
-without a terminal and without `--agent` creates no tool directory; a
-tool's directory fills when the user first opens that tool in the project. To
-confirm:
+`teamai init` does not copy team skills, rules or MCP. They arrive on the next
+session start, or when you run `teamai pull`. A workspace-scope init run without a
+terminal and without `--agent` creates no tool directory; that directory appears
+when the user first opens that tool in the project, and that session start pulls.
+To confirm after a session start or a pull:
 
 ```bash
 teamai list        # see the team skills / rules / docs you now have

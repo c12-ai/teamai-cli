@@ -27,11 +27,12 @@
  */
 import path from 'node:path';
 import fse from 'fs-extra';
-import type { SimpleGit } from 'simple-git';
-import { createGit, isGitRepo, commitSkippingHooks, isDedicatedRepoRoot } from './git.js';
+import { GitPluginError, type SimpleGit, type StatusResult } from 'simple-git';
+import { createGitWithBlockTimeout, isGitRepo, commitSkippingHooks, isDedicatedRepoRoot, gitCommonDir, checkoutLocation } from './git.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { ensureDir, writeFile, pathExists } from './fs.js';
 import { isSilent, log } from './logger.js';
+import { projectsRootDir } from './partition.js';
 import {
   WORKTREE_DIRNAMES,
   getBusinessRoot,
@@ -73,11 +74,21 @@ export function isPublished(result: PublishResult): boolean {
 }
 
 /**
+ * True when origin provably holds the data: `published`, or the exact content
+ * was already there (`already-present`). `busy` and `failed` are NOT delivery.
+ * Callers that keep a durable local copy until delivery (the votes deltas of
+ * #1027) may drop it exactly on this predicate.
+ */
+export function isDelivered(result: PublishResult): boolean {
+  return result.status === 'published' || result.status === 'already-present';
+}
+
+/**
  * Git repository that owns the worktree.
  * - self: the business repo (knowledge lives in `.teamai/` inside it)
  * - git: the dedicated team clone (`localPath` itself)
  */
-function gitRoot(localConfig: LocalConfig): string {
+export function gitRoot(localConfig: LocalConfig): string {
   if (isSelfMode(localConfig)) {
     return getBusinessRoot(localConfig);
   }
@@ -115,13 +126,14 @@ async function nothingLeftToPush(git: SimpleGit, spec: BranchWorktreeSpec): Prom
   }
 }
 
-async function remoteBranchExists(spec: BranchWorktreeSpec, repoRoot: string): Promise<boolean> {
-  const git = createGit(repoRoot);
+/** Whether origin has the branch; null when git could not ask it. */
+async function remoteBranchExists(spec: BranchWorktreeSpec, repoRoot: string): Promise<boolean | null> {
+  const git = createGitWithBlockTimeout(repoRoot);
   try {
     const res = await git.listRemote(['--heads', 'origin', spec.branch]);
     return typeof res === 'string' && res.trim().length > 0;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -135,9 +147,13 @@ async function remoteBranchExists(spec: BranchWorktreeSpec, repoRoot: string): P
  * `rebase origin/<branch>` and `merge --ff-only origin/<branch>` all fail or read
  * stale. An explicit refspec creates and updates that tracking ref in every
  * clone (#706). Used by both the reports and learnings branches.
+ *
+ * `--progress`: on a pipe git prints nothing until it finishes, and the block
+ * timeout kills a silent git, so a slow fetch of a large branch that is still
+ * moving data would be killed with a stalled one.
  */
 export async function fetchTrackingRef(git: SimpleGit, branch: string): Promise<void> {
-  await git.fetch(['origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  await git.fetch(['--progress', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
 }
 
 /**
@@ -166,8 +182,21 @@ async function ensureWorktree(
   localConfig: LocalConfig,
   options: EnsureWorktreeOptions = {},
 ): Promise<string> {
+  return (await openWorktree(spec, localConfig, options)).wt;
+}
+
+/**
+ * {@link ensureWorktree}, and whether the checkout matches origin already:
+ * created just now from a fetch this call made, pushed by it, or created while
+ * origin has no such branch. A sync right after would only repeat that fetch.
+ */
+async function openWorktree(
+  spec: BranchWorktreeSpec,
+  localConfig: LocalConfig,
+  options: EnsureWorktreeOptions = {},
+): Promise<{ wt: string; current: boolean }> {
   if (!usesBranchWorktree(localConfig)) {
-    return getWorktreeDir(localConfig, spec.worktreeDirname);
+    return { wt: getWorktreeDir(localConfig, spec.worktreeDirname), current: false };
   }
 
   const wt = worktreePath(spec, localConfig);
@@ -185,16 +214,10 @@ async function ensureWorktree(
   // after the clone is deleted and cloned again its registration
   // (`<clone>/.git/worktrees/<dirname>`) is gone, and it is refused and kept.
   if (await isGitRepo(wt)) {
-    let valid = false;
-    try {
-      await createGit(wt).revparse(['--is-inside-work-tree']);
-      valid = true;
-    } catch {
-      // stale/dangling worktree link — recreated below if this repo registers it.
-    }
-    if (valid) {
+    // A stale/dangling worktree link is recreated below if this repo registers it.
+    if (await gitOpensCheckout(wt)) {
       await refuseForeignCheckout(spec, wt, repoRoot);
-      return wt;
+      return { wt, current: false };
     }
     await refuseUnprovenCheckout(spec, wt, repoRoot);
   }
@@ -205,7 +228,14 @@ async function ensureWorktree(
   }
 
   await ensureDir(path.dirname(wt));
-  const git = createGit(repoRoot);
+  const git = createGitWithBlockTimeout(repoRoot);
+
+  // Whether origin has the branch depends on none of the local steps below, so
+  // it is asked while they run. Self mode asks after removing old checkouts: a
+  // refusal there stops before origin is asked.
+  let onOriginAnswer = isSelfMode(localConfig)
+    ? null
+    : remoteBranchExists(spec, repoRoot);
 
   // Prune any dangling worktree registration left from a previous removal.
   try {
@@ -213,20 +243,27 @@ async function ensureWorktree(
   } catch {
     // best effort
   }
-  if (isSelfMode(localConfig)) await removeOldCheckoutsInDotTeamai(spec, git, wt);
+  if (isSelfMode(localConfig)) {
+    await removeOldCheckoutsInDotTeamai(spec, git, wt);
+    onOriginAnswer = remoteBranchExists(spec, repoRoot);
+  }
 
-  if (await remoteBranchExists(spec, repoRoot)) {
+  // Local branches only, which the fetch below does not change.
+  const branches = await git.branchLocal();
+  const onOrigin = await onOriginAnswer;
+  if (onOrigin !== null && onOrigin) {
     // Remote branch exists: fetch and check it out into the worktree.
+    let fetched = false;
     try {
       // Explicit refspec, not `fetch origin <branch>`: a --single-branch clone
       // would otherwise only move FETCH_HEAD, leaving origin/<branch> absent and
       // the checkout below failing (#706).
       await fetchTrackingRef(git, spec.branch);
+      fetched = true;
     } catch {
       // fetch may fail offline; worktree add can still work if we have it locally
     }
     // If a local branch of the same name exists, add tracking it; otherwise create branch.
-    const branches = await git.branchLocal();
     if (branches.all.includes(spec.branch)) {
       await git.raw(['worktree', 'add', wt, spec.branch]);
     } else {
@@ -237,46 +274,63 @@ async function ensureWorktree(
       // git's upstream config — every sync references `origin/<branch>` directly —
       // so branching off it without tracking is correct in every clone (#706).
       await git.raw(['worktree', 'add', wt, '--no-track', '-b', spec.branch, `origin/${spec.branch}`]);
+      return { wt, current: fetched };
     }
   } else {
     // Remote branch absent. A read-only cold start (or a failed first push)
     // leaves an unpublished local branch; reuse it, because creating the orphan
     // branch again fails with "a branch named '<branch>' already exists".
-    const branches = await git.branchLocal();
     if (branches.all.includes(spec.branch)) {
       await git.raw(['worktree', 'add', wt, spec.branch]);
     } else {
       await createOrphanWorktree(spec, repoRoot, wt);
       await writeWorktreeGitignore(wt);
-      const wtGit = createGit(wt);
+      const wtGit = createGitWithBlockTimeout(wt);
       await wtGit.add(['.gitignore']);
-      await commitSkippingHooks(wtGit, spec.initCommitMessage);
+      await commitSkippingHooks(wtGit, spec.initCommitMessage, undefined, { identityFallback: true });
     }
     if (options.pushIfCreated !== false) {
       try {
-        await createGit(wt).push(['-u', 'origin', spec.branch]);
+        // `--progress` keeps a slow upload alive under the block timeout, as in fetchTrackingRef.
+        await createGitWithBlockTimeout(wt).push(['--progress', '-u', 'origin', spec.branch]);
+        return { wt, current: true };
       } catch (e) {
         log.debug(`[${spec.logTag}] initial push skipped: ${(e as Error).message}`);
       }
+    } else if (onOrigin === false) {
+      // Origin said just now it has no such branch: nothing to sync from.
+      return { wt, current: true };
     }
   }
 
-  return wt;
+  return { wt, current: false };
 }
 
 /**
- * Self mode used to check this branch out in each checkout's own `.teamai/`
- * (#808). Git checks a branch out in one worktree only, so a checkout left
- * there by an older teamai blocks the shared one at `wt`, from every checkout
- * of the repo. Remove it the way a member would: without --force, so a checkout
- * with uncommitted changes stays, and the member is told what to do with them.
- * Its commits are on the branch, which the new checkout reuses.
+ * A side branch is checked out in one worktree only, and a user-scope install
+ * and a single-repo project partition of the same repository compute different
+ * worktree paths. Remove a checkout only when it is a path teamai manages:
+ * the legacy `<checkout>/.teamai/<dirname>` or a partition under teamai's
+ * real projects root (`~/.teamai/projects/<slug>/<dirname>`). An arbitrary
+ * worktree a member placed elsewhere is left alone: git will refuse the second
+ * checkout, and the caller reports it instead of silently deleting the member's
+ * checkout (#1443, #808).
+ * Remove the way a member would: without --force, so a checkout with
+ * uncommitted changes stays, and the member is told what to do with them. Its
+ * commits are on the branch, which the new checkout reuses.
  */
 async function removeOldCheckoutsInDotTeamai(spec: BranchWorktreeSpec, git: SimpleGit, wt: string): Promise<void> {
   const oldSuffix = `${path.sep}${path.join('.teamai', spec.worktreeDirname)}`;
+  const projectsRoot = await fse.realpath(projectsRootDir()).catch(() => path.resolve(projectsRootDir()));
   for (const checkout of await checkoutsOfBranch(spec, git)) {
-    // resolve: git prints forward slashes on Windows too.
-    if (!path.resolve(checkout).endsWith(oldSuffix) || path.resolve(checkout) === path.resolve(wt)) continue;
+    // resolve: git prints forward slashes on Windows too. realpath: git records
+    // the path a symlink resolves to, so compare the same form as the root.
+    const resolved = path.resolve(checkout);
+    const real = await fse.realpath(resolved).catch(() => resolved);
+    if (resolved === path.resolve(wt)) continue;
+    const projectPartition = path.dirname(path.dirname(real)) === projectsRoot
+      && path.basename(real) === spec.worktreeDirname;
+    if (!resolved.endsWith(oldSuffix) && !projectPartition) continue;
     try {
       await git.raw(['worktree', 'remove', checkout]);
       log.debug(`[${spec.logTag}] removed the old checkout at ${checkout}`);
@@ -314,8 +368,131 @@ async function checkoutsOfBranch(spec: BranchWorktreeSpec, git: SimpleGit): Prom
  */
 async function registeredCheckoutImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig): Promise<string | null> {
   if (!usesBranchWorktree(localConfig)) return null;
-  const [checkout] = await checkoutsOfBranch(spec, createGit(gitRoot(localConfig)));
+  const [checkout] = await checkoutsOfBranch(spec, createGitWithBlockTimeout(gitRoot(localConfig)));
   return checkout ?? null;
+}
+
+/** Whether the managed path is registered to this repository for this branch. */
+async function ownsCheckoutImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig): Promise<boolean> {
+  if (!usesBranchWorktree(localConfig)) return false;
+  const wt = worktreePath(spec, localConfig);
+  if (!(await pathExists(wt))) return false;
+  const registered = await registeredCheckoutImpl(spec, localConfig);
+  return registered !== null && (await fse.realpath(registered)) === (await fse.realpath(wt));
+}
+
+/**
+ * Remove this repository's side-branch checkout before its dedicated clone is
+ * replaced. Push first so a clean checkout with local-only commits is not
+ * silently discarded; dirty or unprovable checkouts are left untouched.
+ */
+async function retireImpl(
+  spec: BranchWorktreeSpec,
+  localConfig: LocalConfig,
+  whileLocked: () => Promise<void> = async () => {},
+): Promise<void> {
+  if (!usesBranchWorktree(localConfig)) return;
+  await withLockImpl(spec, localConfig, async () => {
+    await retireWhileLockedImpl(spec, localConfig);
+    await whileLocked();
+  });
+}
+
+/** Retire one checkout after its writer lock has already been acquired. */
+async function retireWhileLockedImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig): Promise<void> {
+  const wt = worktreePath(spec, localConfig);
+    if (await pathExists(wt)) {
+      await checkOwnerImpl(spec, localConfig);
+      const registered = await registeredCheckoutImpl(spec, localConfig);
+      if (registered === null || (await fse.realpath(registered)) !== (await fse.realpath(wt))) {
+        throw new ForeignCheckoutError(
+          `${wt} exists but is not registered to ${gitRoot(localConfig)} as its ${spec.branch} checkout. ` +
+            'teamai left it and the current clone unchanged. Move it aside, or delete it if it holds nothing you need, ' +
+            'then run init again.',
+          `the ${spec.branch} checkout cannot be shown to belong to this repository; see the warning above`,
+        );
+      }
+
+      const wtGit = createGitWithBlockTimeout(wt);
+      if (!(await wtGit.status()).isClean()) {
+        throw new CheckoutRefusedError(
+          `${wt} has uncommitted changes, so teamai left it and the current clone unchanged. ` +
+            'Commit or move those changes, then run init again.',
+          `the ${spec.branch} checkout has uncommitted changes; see the warning above`,
+        );
+      }
+
+      const remoteExists = await remoteBranchExists(spec, wt);
+      if (remoteExists === null) {
+        throw new CheckoutRefusedError(
+          `Could not inspect origin/${spec.branch} before replacing the clone. ` +
+            'The checkout and current clone were left unchanged; restore network access, then run init again.',
+          `the ${spec.branch} checkout could not be compared with origin; see the warning above`,
+        );
+      }
+
+      let localOnly = 1;
+      let remoteOnly = 0;
+      if (remoteExists) {
+        await fetchTrackingRef(wtGit, spec.branch);
+        [localOnly, remoteOnly] = (await wtGit.raw([
+          'rev-list', '--left-right', '--count', `HEAD...refs/remotes/origin/${spec.branch}`,
+        ])).trim().split(/\s+/).map(Number);
+      }
+
+      if (localOnly > 0 && remoteOnly > 0) {
+        throw new CheckoutRefusedError(
+          `${wt} and origin/${spec.branch} have diverged, so teamai left the checkout and current clone unchanged. ` +
+            'Reconcile and push the branch, then run init again.',
+          `the ${spec.branch} checkout has diverged from origin; see the warning above`,
+        );
+      }
+
+      if (localOnly > 0) {
+        try {
+          await wtGit.push(['--progress', 'origin', `HEAD:refs/heads/${spec.branch}`]);
+        } catch (e) {
+          throw new CheckoutRefusedError(
+            `Could not preserve ${wt} on origin before replacing the clone (${failureReason(e).trim()}). ` +
+              'The checkout and current clone were left unchanged; push its commits or restore network access, then run init again.',
+            `the ${spec.branch} checkout could not be pushed; see the warning above`,
+          );
+        }
+      }
+
+      await createGitWithBlockTimeout(gitRoot(localConfig)).raw(['worktree', 'remove', wt]);
+      log.info(`Retired ${spec.branch} checkout at ${wt}`);
+    }
+}
+
+/** Run while holding this branch's writer lock. */
+async function withLockImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig, action: () => Promise<void>): Promise<void> {
+  const wt = worktreePath(spec, localConfig);
+  const lockPath = lockFilePath(spec, localConfig);
+  const locked = await acquireLock(lockPath);
+  if (!locked) {
+    throw new CheckoutRefusedError(
+      `${wt} is being written (${lockPath} is held), so teamai left it and the current clone unchanged. ` +
+        'Run init again when that command finishes.',
+      `the ${spec.branch} checkout is busy; see the warning above`,
+    );
+  }
+  try {
+    await action();
+  } finally {
+    await releaseLock(lockPath);
+  }
+}
+
+/** Whether this repository owns a side checkout with uncommitted changes. */
+async function dirtyImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig): Promise<boolean> {
+  if (!usesBranchWorktree(localConfig)) return false;
+  const wt = worktreePath(spec, localConfig);
+  if (!(await pathExists(wt))) return false;
+  await checkOwnerImpl(spec, localConfig);
+  const registered = await registeredCheckoutImpl(spec, localConfig);
+  if (registered === null || (await fse.realpath(registered)) !== (await fse.realpath(wt))) return false;
+  return !(await createGitWithBlockTimeout(wt).status()).isClean();
 }
 
 /**
@@ -408,18 +585,29 @@ async function checkOwnerImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig
   if (!usesBranchWorktree(localConfig)) return;
   const wt = worktreePath(spec, localConfig);
   if (!(await isGitRepo(wt))) return;
-  try {
-    await createGit(wt).revparse(['--is-inside-work-tree']);
-  } catch {
+  if (!(await gitOpensCheckout(wt))) {
     await refuseUnprovenCheckout(spec, wt, gitRoot(localConfig));
     return;
   }
   await refuseForeignCheckout(spec, wt, gitRoot(localConfig));
 }
 
+/**
+ * Whether git opens `wt` as a checkout. Where it sits, already asked this run
+ * and still the same repository on disk, answers without starting git.
+ */
+async function gitOpensCheckout(wt: string): Promise<boolean> {
+  if (await checkoutLocation(wt) !== null) return true;
+  return createGitWithBlockTimeout(wt).revparse(['--is-inside-work-tree']).then(() => true, () => false);
+}
+
 /** The repository's shared git directory, resolved: every worktree of one repo agrees on it. */
 async function commonDir(dir: string): Promise<string> {
-  const out = (await createGit(dir).revparse(['--git-common-dir'])).trim();
+  // Asked once per directory and run: ensure and the index build both check every checkout.
+  const found = await gitCommonDir(dir);
+  if (found !== null) return found;
+  // Asked again for git's own error, which the refusal shows.
+  const out = (await createGitWithBlockTimeout(dir).revparse(['--git-common-dir'])).trim();
   return fse.realpath(path.resolve(dir, out));
 }
 
@@ -482,7 +670,7 @@ function refuse(error: Error): never {
  * and falls back to the detach + `checkout --orphan` dance for older git.
  */
 async function createOrphanWorktree(spec: BranchWorktreeSpec, repoRoot: string, wt: string): Promise<void> {
-  const git = createGit(repoRoot);
+  const git = createGitWithBlockTimeout(repoRoot);
   try {
     // git 2.42+: create a worktree on a fresh orphan branch directly.
     // The branch name must be given via -b; a positional after <path> is treated
@@ -490,7 +678,7 @@ async function createOrphanWorktree(spec: BranchWorktreeSpec, repoRoot: string, 
     await git.raw(['worktree', 'add', '--orphan', '-b', spec.branch, wt]);
     // The --orphan worktree may inherit the index/files from HEAD in some git
     // versions; clear tracked entries so the branch starts empty.
-    const wtGit = createGit(wt);
+    const wtGit = createGitWithBlockTimeout(wt);
     try {
       await wtGit.raw(['rm', '-rf', '--cached', '.']);
     } catch {
@@ -500,7 +688,7 @@ async function createOrphanWorktree(spec: BranchWorktreeSpec, repoRoot: string, 
   } catch {
     // Older git (<2.42): detach a worktree at HEAD, then orphan-checkout inside it.
     await git.raw(['worktree', 'add', '--detach', wt, 'HEAD']);
-    const wtGit = createGit(wt);
+    const wtGit = createGitWithBlockTimeout(wt);
     await wtGit.raw(['checkout', '--orphan', spec.branch]);
     try {
       await wtGit.raw(['rm', '-rf', '--cached', '.']);
@@ -532,10 +720,22 @@ async function writeWorktreeGitignore(wt: string): Promise<void> {
 }
 
 const MAX_PUSH_RETRIES = 5;
+// Init pushes are non-blocking (init completes and writes local config + skills
+// regardless); a failed push is retried on the next init. Bounding retries to 1
+// during init prevents a stuck remote from holding init for 5× the timeout via
+// the push/fetch/rebase retry loop.
+const INIT_PUSH_MAX_RETRIES = 1;
 
 export interface BranchWrite {
   files: string[];
   message: string;
+}
+
+/** Options threaded through commitAndPushAt and its callers. */
+export interface BranchPushOptions {
+  pushIfUnchanged?: boolean;
+  /** Push once, with no fetch + rebase retry (init pushes). */
+  initPush?: boolean;
 }
 
 /** Commit `files` in an already-locked worktree and push them. */
@@ -544,9 +744,9 @@ async function commitAndPushAt(
   wt: string,
   message: string,
   files: string[],
-  options: { pushIfUnchanged?: boolean } = {},
+  options: BranchPushOptions = {},
 ): Promise<PublishResult> {
-  const git = createGit(wt);
+  const git = createGitWithBlockTimeout(wt);
 
   // Literal: a filename with `[` or `*` would otherwise stage whatever it matches as a pattern.
   await git.raw(['--literal-pathspecs', 'add', '--', ...files]);
@@ -567,21 +767,34 @@ async function commitAndPushAt(
 
   // A retry may reconstruct the same tree as a previously committed
   // but unconfirmed push. It still needs a push, without an empty commit.
-  if (staged > 0) await commitSkippingHooks(git, message, files);
+  if (staged > 0) await commitSkippingHooks(git, message, files, { identityFallback: true });
 
   // Push with fetch+rebase retry. Each member only writes <user>.yaml, so
   // rebase conflicts are effectively impossible; retries handle the pure
   // non-fast-forward race.
-  for (let attempt = 1; attempt <= MAX_PUSH_RETRIES; attempt++) {
+  const maxRetries = options.initPush ? INIT_PUSH_MAX_RETRIES : MAX_PUSH_RETRIES;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       // A push that resolves is a push the remote accepted: git exits non-zero
       // when it refuses one. Do NOT re-check the remote-tracking ref here — it
       // is only updated through the remote's fetch refspec, so a `--single-branch`
       // clone would report failure for every successful side-branch push.
-      await git.push(['origin', spec.branch]);
+      const trackingRef = `refs/remotes/origin/${spec.branch}`;
+      const before = await git.revparse(['--verify', trackingRef]).then(r => r.trim()).catch(() => '');
+      const sent = (await git.revparse([`refs/heads/${spec.branch}`])).trim();
+      await git.push(['--progress', 'origin', spec.branch]);
+      // A narrow fetch refspec does not update this ref on push. Record only
+      // the commit actually accepted by origin, never an unpushed worktree HEAD.
+      // Compare-and-swap preserves a newer concurrent fetch (and a normal push
+      // may already have updated the ref). Failure cannot undo delivery.
+      await git.raw(['update-ref', trackingRef, sent, before || '0'.repeat(sent.length)])
+        .catch(() => { /* Another updater owns the newer tracking snapshot. */ });
       return { status: 'published' };
     } catch (pushErr) {
-      if (attempt === MAX_PUSH_RETRIES) {
+      // Killed by the block timeout: origin stopped answering, which no
+      // fetch + rebase fixes, and each retry would wait on it again.
+      const stalled = pushErr instanceof GitPluginError && pushErr.plugin === 'timeout';
+      if (attempt === maxRetries || stalled) {
         log.debug(`[${spec.logTag}] push failed after ${attempt} attempts: ${(pushErr as Error).message}`);
         return { status: 'failed', reason: (pushErr as Error).message };
       }
@@ -624,7 +837,7 @@ async function commitAndPushImpl(
   localConfig: LocalConfig,
   message: string,
   files: string[],
-  options: { pushIfUnchanged?: boolean } = {},
+  options: BranchPushOptions = {},
 ): Promise<PublishResult> {
   const lockPath = lockFilePath(spec, localConfig);
   const locked = await acquireLock(lockPath);
@@ -645,17 +858,34 @@ async function commitAndPushImpl(
 }
 
 /**
+ * Handed to an `update()` write callback as its second argument.
+ */
+export interface BranchWriteContext {
+  /**
+   * Register work that must run only after the publish is DELIVERED (see
+   * {@link isDelivered}) and still under the branch lock, before any other
+   * writer can enter. The one user today: clearing the local vote deltas a
+   * stage wrote into the worktree — running that clear outside the lock lets a
+   * concurrent sync stage the same deltas between this publish and the clear,
+   * adding them twice (#1027). Never runs on `busy`/`failed`, and an exception
+   * in it is logged, never failing the already-confirmed publish.
+   */
+  onDelivered(fn: () => Promise<void>): void;
+}
+
+/**
  * Under this branch's lock: sync the worktree with origin, run `write`, commit,
  * push. The callback does not run when the lock is busy.
  *
- * `write` receives the worktree root and returns the worktree-relative paths it
- * touched, or null when it decided there was nothing to write.
+ * `write` receives the worktree root (plus a context to register
+ * `onDelivered` work) and returns the worktree-relative paths it touched, or
+ * null when it decided there was nothing to write and nothing to push.
  */
 async function updateImpl(
   spec: BranchWorktreeSpec,
   localConfig: LocalConfig,
-  write: (worktree: string) => Promise<BranchWrite | null>,
-  options: { pushIfUnchanged?: boolean } = {},
+  write: (worktree: string, ctx: BranchWriteContext) => Promise<BranchWrite | null>,
+  options: BranchPushOptions & EnsureWorktreeOptions = {},
 ): Promise<PublishResult> {
   if (!usesBranchWorktree(localConfig)) {
     throw new Error(`update() needs a branch-backed repo, and ${spec.branch} has none for kind: 'http'`);
@@ -668,18 +898,32 @@ async function updateImpl(
   }
 
   try {
-    const wt = await ensureWorktree(spec, localConfig);
+    const { wt, current } = await openWorktree(spec, localConfig, options);
     try {
-      await syncWorktree(spec, wt);
+      if (!current) await syncWorktree(spec, wt);
     } catch (e) {
       log.debug(`[${spec.logTag}] sync before write failed, writing onto the local copy: ${(e as Error).message}`);
     }
 
-    const change = await write(wt);
-    if (!change || change.files.length === 0) {
-      return { status: 'already-present' };
+    let delivered: (() => Promise<void>) | undefined;
+    const change = await write(wt, {
+      onDelivered: (fn) => {
+        if (!delivered) delivered = fn;
+      },
+    });
+    // null writes and pushes nothing, so a read or a refusal under the lock stays without effect on origin. An empty
+    // list still asks commitAndPushAt, which pushes a commit an earlier attempt left unpushed.
+    const result: PublishResult = change === null
+      ? { status: 'already-present' }
+      : await commitAndPushAt(spec, wt, change.message, change.files, options);
+    if (delivered && isDelivered(result)) {
+      try {
+        await delivered();
+      } catch (e) {
+        log.debug(`[${spec.logTag}] onDelivered hook failed (deltas stay pending): ${(e as Error).message}`);
+      }
     }
-    return await commitAndPushAt(spec, wt, change.message, change.files, options);
+    return result;
   } catch (e) {
     log.debug(`[${spec.logTag}] update failed (non-blocking): ${(e as Error).message}`);
     return failedWith(e);
@@ -707,20 +951,22 @@ async function rebaseInProgress(git: SimpleGit): Promise<boolean> {
  * and leave it uncommitted. Does not read or drop `refs/stash`: worktrees of
  * the same repo share that ref, so a refresh must never clean it up.
  * Skip when a rebase is still in progress so a real commit conflict is
- * aborted by the caller instead.
+ * aborted by the caller instead. Returns the status it read when it changed
+ * nothing, or null.
  */
-async function restoreConflictedFiles(spec: BranchWorktreeSpec, git: SimpleGit): Promise<void> {
-  let conflicted: string[] = [];
+async function restoreConflictedFiles(spec: BranchWorktreeSpec, git: SimpleGit): Promise<StatusResult | null> {
+  let status: StatusResult;
   try {
-    conflicted = (await git.status()).conflicted ?? [];
+    status = await git.status();
   } catch {
-    return;
+    return null;
   }
+  const conflicted = status.conflicted ?? [];
   if (conflicted.length === 0) {
-    return;
+    return status;
   }
   if (await rebaseInProgress(git)) {
-    return;
+    return status;
   }
 
   try {
@@ -736,6 +982,7 @@ async function restoreConflictedFiles(spec: BranchWorktreeSpec, git: SimpleGit):
       // best effort: at least try not to leave conflict markers
     }
   }
+  return null;
 }
 
 /**
@@ -898,7 +1145,7 @@ async function restageSnapshotIndex(spec: BranchWorktreeSpec, git: SimpleGit, sh
  *    conflicts restore the original uncommitted files, never conflict markers.
  */
 async function syncWorktree(spec: BranchWorktreeSpec, wt: string): Promise<void> {
-  const git = createGit(wt);
+  const git = createGitWithBlockTimeout(wt);
   const upstream = `origin/${spec.branch}`;
   try {
     // Explicit refspec so the `merge --ff-only`/`rebase` against origin/<branch>
@@ -909,10 +1156,16 @@ async function syncWorktree(spec: BranchWorktreeSpec, wt: string): Promise<void>
     return;
   }
 
-  await restoreConflictedFiles(spec, git);
-
-  const dirty = !(await git.status()).isClean();
-  const ahead = Number.parseInt((await git.raw(['rev-list', '--count', `${upstream}..HEAD`])).trim(), 10);
+  // Counted while conflicted files are restored, which never moves HEAD; the
+  // restore finishes first, so a failed count never leaves it writing unlocked.
+  const counting = git.raw(['rev-list', '--left-right', '--count', `${upstream}...HEAD`]);
+  counting.catch(() => undefined);
+  const status = await restoreConflictedFiles(spec, git) ?? await git.status();
+  const counts = await counting;
+  const dirty = !status.isClean();
+  const [behind, ahead] = counts.trim().split(/\s+/).map((count) => Number.parseInt(count, 10));
+  // Already at origin's commit: nothing to fast-forward or rebase, uncommitted files stay as they are.
+  if (behind === 0 && ahead === 0) return;
 
   let carried: string | null = null;
   if (dirty && ahead > 0) {
@@ -995,8 +1248,8 @@ async function refreshImpl(
       log.debug(`[${spec.logTag}] a write is in progress; reading the local copy`);
       return { status: 'busy', lockPath };
     }
-    const wt = await ensureWorktree(spec, localConfig, options);
-    await syncWorktree(spec, wt);
+    const { wt, current } = await openWorktree(spec, localConfig, options);
+    if (!current) await syncWorktree(spec, wt);
   } catch (e) {
     // A refused checkout throws: the caller's paths are under it, or under the
     // checkout it keeps from being created.
@@ -1026,14 +1279,14 @@ export interface BranchWorktree {
   ensure(localConfig: LocalConfig, options?: EnsureWorktreeOptions): Promise<string>;
   update(
     localConfig: LocalConfig,
-    write: (worktree: string) => Promise<BranchWrite | null>,
-    options?: { pushIfUnchanged?: boolean },
+    write: (worktree: string, ctx: BranchWriteContext) => Promise<BranchWrite | null>,
+    options?: BranchPushOptions & EnsureWorktreeOptions,
   ): Promise<PublishResult>;
   commitAndPush(
     localConfig: LocalConfig,
     message: string,
     files: string[],
-    options?: { pushIfUnchanged?: boolean },
+    options?: BranchPushOptions,
   ): Promise<PublishResult>;
   refresh(localConfig: LocalConfig, options?: EnsureWorktreeOptions): Promise<RefreshResult>;
   /** Throws ForeignCheckoutError when the checkout there is not provably this repository's; creates nothing. */
@@ -1042,6 +1295,16 @@ export interface BranchWorktree {
   isForeignByFiles(localConfig: LocalConfig): Promise<boolean>;
   /** Where this repository has the branch checked out, the old `.teamai/` place included; creates nothing. */
   registeredCheckout(localConfig: LocalConfig): Promise<string | null>;
+  /** Whether the managed checkout path is registered to this repository. */
+  ownsCheckout(localConfig: LocalConfig): Promise<boolean>;
+  /** Whether this repository owns a side checkout with uncommitted changes. */
+  isDirty(localConfig: LocalConfig): Promise<boolean>;
+  /** Run an action while holding this branch's writer lock. */
+  withLock(localConfig: LocalConfig, action: () => Promise<void>): Promise<void>;
+  /** Retire this checkout while its writer lock is already held. */
+  retireWhileLocked(localConfig: LocalConfig): Promise<void>;
+  /** Push and remove this owned checkout, holding its writer lock through the optional replacement callback. */
+  retire(localConfig: LocalConfig, whileLocked?: () => Promise<void>): Promise<void>;
 }
 
 /**
@@ -1071,5 +1334,10 @@ export function createBranchWorktree(spec: BranchWorktreeSpec): BranchWorktree {
     checkOwner: (localConfig) => checkOwnerImpl(spec, localConfig),
     isForeignByFiles: (localConfig) => isForeignByFilesImpl(spec, localConfig),
     registeredCheckout: (localConfig) => registeredCheckoutImpl(spec, localConfig),
+    ownsCheckout: (localConfig) => ownsCheckoutImpl(spec, localConfig),
+    isDirty: (localConfig) => dirtyImpl(spec, localConfig),
+    withLock: (localConfig, action) => withLockImpl(spec, localConfig, action),
+    retireWhileLocked: (localConfig) => retireWhileLockedImpl(spec, localConfig),
+    retire: (localConfig, whileLocked) => retireImpl(spec, localConfig, whileLocked),
   };
 }

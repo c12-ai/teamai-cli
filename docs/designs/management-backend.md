@@ -1,7 +1,5 @@
 # Management backend design
 
-[简体中文](management-backend.zh-CN.md)
-
 Status: proposed design for [#341](https://github.com/Tencent/teamai-cli/issues/341).
 This document describes future behavior. It adds no Go service, Web console, CLI
 option, or change to the current Git or ClawPro HTTP implementation. The issue's
@@ -146,7 +144,9 @@ the signed-in user's identity and requested project access must still match.
 After confirmation, the CLI saves a device credential in OS-protected storage,
 binds the current workspace, verifies the first snapshot, and invokes the existing
 resource handlers. The result shows project, revision and sync status, with no Git
-concepts. Expired codes can be reissued; denied enrollment does not create a binding.
+concepts. 
+
+Expired codes can be reissued; denied enrollment does not create a binding.
 
 **J3: multiple projects.** A member joins a second permitted project through the
 same flow and chooses its workspace or adds it to an existing binding. Selection
@@ -157,7 +157,9 @@ project cannot silently replace another project's cache with an empty snapshot.
 Leaving a project revokes the binding and removes only its unchanged managed
 resources, retaining personal modifications as conflicts. Device unlink and
 uninstall revoke credentials and clear local credentials, indexes and managed
-state without deleting unrelated user files. If offline, local cleanup completes
+state without deleting unrelated user files. 
+
+If offline, local cleanup completes
 and remote revocation remains visibly pending until submitted or done in the console.
 
 **J4: administrator publishes across projects.** An administrator prepares a
@@ -430,7 +432,9 @@ old events with new IDs. Durable acknowledgements identify accepted event revisi
 so retries cannot silently double count. Corrections to a resumed session refer to
 the original event/session and replace its revision rather than incrementing
 successful-session totals again. Learning submissions are reviewable content;
-votes and usage events cannot edit published resources. Offline queues are bounded,
+votes and usage events cannot edit published resources. 
+
+Offline queues are bounded,
 encrypted where sensitive, observable to the user, and discarded only after an
 acknowledged commit or explicit user choice.
 

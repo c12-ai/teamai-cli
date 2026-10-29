@@ -88,6 +88,8 @@ no trailing `.` or space, and not a Windows device name (`CON`, `NUL`, `COM1`, �
 Two namespaces of one resource type may not differ only by case, within a manifest
 or between `roles.yaml` and `projects.yaml`, since case-insensitive filesystems
 would give both the same directory.
+
+
 Win32 strips a trailing period or space from every component, so `.. ` would
 arrive as `..` and `frontend.` as `frontend`, escaping the parent in the first
 case and another namespace's directory in the second; `.` and `..` fall out of the
@@ -95,7 +97,9 @@ same rule. A manifest file that exists but cannot be read, or is empty, is an
 error rather than an absent manifest: treating it as absent would drop the
 filtering the manifest exists to apply. Absence means the path is genuinely not
 there — a dangling symlink, on the file or on `manifest/` itself, reads as ENOENT
-but is an error. The id keeps the
+but is an error. 
+
+The id keeps the
 older, narrower rule it has always had — letters, digits, `.`, `_`, `-`, and not
 `.` or `..` — because it is also typed on the command line and split on commas.
 The namespace guard applies to `manifest/roles.yaml`'s active namespaces
@@ -186,13 +190,18 @@ suggested it does not hold: tags express a personal preference with no external
 basis and need an explicit toggle; a project has an external basis (cwd) and is
 already known at `init` time. Recorded here so it isn't re-proposed.
 
+A workspace also delivers the projects of the repos set up inside it, each still
+selected in its own directory; see [Workspace children](workspace-children.md) (#913).
+
 `--project all` (issue #509) is the one reserved value for the flag: it expands to
 every id the manifest declares, via `listProjectIds(manifest)`, and that snapshot
 is what `config.yaml` records. It keeps a monorepo's onboarding to a single line
 and keeps `projects.yaml` the single source of truth for the project set. Snapshot
 rather than a live alias is deliberate — the active set is re-resolved only by
 re-running `init`, like every other activation — and it stays an explicit operator
-action, not the auto-activation ruled out above. Because the value is reserved, a
+action, not the auto-activation ruled out above. 
+
+Because the value is reserved, a
 project whose id is literally `all` is shadowed: it is still covered by the
 expansion, but selecting only it goes through `teamai projects set all`, which
 takes plain ids.
@@ -281,7 +290,9 @@ catalog and is not delivered by default. A root skill that arrives through a
 subscribed tag is replaced by an active namespace skill of the same name, and
 among tag matches the root skill wins over one in an inactive namespace. A tagged
 skill that exists only in an inactive namespace still reaches a subscribed member:
-tags cross namespaces by design (#337). Installing
+tags cross namespaces by design (#337). 
+
+Installing
 a skill removes the files that another team version of that skill (root or any
 namespace) has and the new one lacks, when they match that version byte for
 byte, so switching versions leaves no team file behind; a file the member added
@@ -313,7 +324,9 @@ id: two active namespaces with the same name cannot both land, and choosing one
 would depend on read order. Rules and claudemd namespaces never share a slot:
 `rules/<ns>/` keeps its own local path and each claudemd file has its own part
 of the managed block (in namespace order), so two namespaces with one name are
-both delivered and only the root item gives way. The root is never a side of a
+both delivered and only the root item gives way. 
+
+The root is never a side of a
 conflict: root plus two namespaces is reported as the two namespaces.
 
 ### Failure policy
@@ -382,10 +395,14 @@ The directory match is case-folded, so `docs/Checkout/` is withheld for an
 inactive `checkout` on every filesystem. When a namespace stops being active,
 pull removes the local copies that are byte-equal to the team file, or to any
 earlier commit of it (`isPastVersionOf`: the team edited it after delivery), and keeps
-edited ones, naming them. The docs mirror (#817) targets this resolved set: it
-copies only the delivered files and prunes every local file the team repo does
-not have, inside a withheld namespace too, but never a local copy of a withheld
-namespace's team doc; those follow the byte-equal rule. The search index and
+edited ones, naming them. 
+
+The docs mirror (#817) targets this resolved set: it
+copies only the delivered files and prunes a local file the team repo no longer
+has only when it is a version of that doc from the team history (#993), inside a
+withheld namespace too, but never a local copy of a withheld namespace's team doc;
+those follow the byte-equal rule. A file at a path the team history never had is
+the member's and stays. The search index and
 `doctor`'s `Team docs delivered` use the same filter as pull: doctor expects
 only the delivered files, and does not report a withheld namespace's team doc
 as stale, since pull names the edited copies it keeps.
@@ -406,7 +423,9 @@ port) of its `base_url`, stored as `team:<id>@<origin>` so several origins of on
 id coexist. When the resolved profile's origin has no key, pull leaves the agents
 switched to it alone and prints a line to run `teamai models switch team:<id>`;
 an override can therefore never send a key to a gateway it was not configured
-for. The binding applies whoever changed the URL, so moving the root profile to
+for. 
+
+The binding applies whoever changed the URL, so moving the root profile to
 another host (legacy mode included) makes each member re-key once. A key stored
 by a 0.26.0 beta as `team:<id>` counts only for the root profile's origin. When
 the namespace deactivates, agents return to the root profile with its key; a
@@ -420,7 +439,9 @@ and never defaulted: saving a manifest writes back the parsed object, so a
 default would add `env: []` to every manifest an admin edits and break members on
 an older CLI. For the same reason `--namespaces` on `teamai roles` and
 `teamai projects` `add`/`update` sets only the older keys (`knowledge`, `skills`,
-`agents`, and `learnings` for projects); the new keys are declared by hand. An unknown `resources:` key now warns instead of failing the
+`agents`, and `learnings` for projects); the new keys are declared by hand. 
+
+An unknown `resources:` key now warns instead of failing the
 scope, and a manifest these commands save keeps it, so the next axis does not break older members again. 0.25.0 and the
 0.26.0 betas still reject unknown keys: every member has to upgrade before a team
 declares one of the new axes.
@@ -433,6 +454,8 @@ one per listed id.
 When `teamai env add` updates a variable still carrying one of these removed
 keys, it preserves the key and warns that pull will not deliver the variable,
 naming the namespace file to move it to.
+
+
 `roles:` on hooks and MCP shipped in 0.25.0 and keeps filtering for one more
 minor release; pull warns once per run and `doctor` has an informational check,
 both naming every target file. Model profiles are strict, so a per-entry key
@@ -440,14 +463,18 @@ fails the file. An env, hook or MCP entry with any other key its schema does not
 know, such as a mistyped `role:`, reaches nobody too. Pull, `status`, `env list`,
 `mcp list`, `hooks list`, `list <env|hooks|mcp> --source repo` and `doctor` name
 the file, the entry and the key (#822); `env add`, `env remove` and `remove mcp`
-keep such a key when they rewrite the file. A key that a later version adds is
+keep such a key when they rewrite the file. 
+
+A key that a later version adds is
 unknown to this one as well, so an entry that uses it is not delivered to a member
 still on this version: every member has to upgrade before the team uses a new
 entry key, as for a new `resources:` key. A hooks or MCP file with none of its
 top-level keys (`server:` for `servers:`, `hook:` for `hooks:`) used to read as
 empty and remove every installed server or hook; it now fails like a file that
 does not parse, naming the keys it found, as `env.yaml` has since #662. An extra
-top-level key beside a known one is still ignored. `pull --dry-run` resolves the hooks
+top-level key beside a known one is still ignored. 
+
+`pull --dry-run` resolves the hooks
 and MCP entries and reports their warnings (an unknown id, a per-entry key, a file
 that does not parse) without writing, so a maintainer can see them before a real
 pull applies them. There is no automatic migration.
@@ -459,8 +486,49 @@ a root one is written to its namespace file, never to the root. The agents
 source order is active namespace, then this machine's placement record, then the
 shared root; in role/project mode a same-stem root file no longer withdraws the
 placement record (legacy mode still does). The skills push scan uses role ∪
-project namespaces, and `push` picks up a change to any `env/<ns>/env.yaml` or `env/<ns>/secrets.yaml`.
+project namespaces. A skill outside them stays out unless the delivery record
+shows teamai wrote that copy, as when pull keeps an edited skill after a switch.
+A copy still exactly as recorded is not an edit and stays out. An edited one goes
+back to the team skill whose history holds the SKILL.md version pull recorded,
+inactive namespace, active namespace or shared root, even after the team changed
+it. When that version matches no single copy, wherever the copies are, it is
+skipped with a warning naming them, so a same-named skill that replaced the
+deleted one is never overwritten (#1020). A copy teamai never delivered matches
+by name only a shared-root or active skill. In legacy mode with no active role
+or project, a delivered duplicate goes back only when its record identifies
+exactly one same-named skill across all namespaces; missing or ambiguous
+records are skipped with a warning. A never-delivered duplicate is also skipped
+instead of taking the first namespace, and the warning names the
+`push --skill <path> --role <ns>` run that sends it. `push --skill` resolves its skill the
+same way, and asks for `--role` rather than taking the first directory that
+holds the name. An open PR is reused for a resource only when it records the
+same destination this push sends the resource to: a resource already in the
+team repo is identified by its path, so same-named skills in two namespaces are
+two resources, and a new one by its name. Otherwise this push opens its own PR
+and leaves that one untouched. A new skill keeps the destination its open PR
+recorded even when a same-named team skill appears elsewhere and the scan would
+call the copy an edit of that skill. Open PRs holding a new skill's name at
+several destinations prove none of them: push leaves the copy out, and
+`--skill <path> --role <ns>` picks the one at that namespace. Edits from several tools of one team skill
+are one candidate, the newest, whether or not each copy has a delivery record.
+Each copy's destination is decided before copies are merged, so a new skill
+awaiting review in one tool and an edit of a same-named team skill in another
+stay two candidates.
+A new skill, rule or
+agent pushed without `--role` or `--project` is placed among the role ∪ active
+project namespaces on its own axis, as pull delivers them. When a role is
+configured but the role and active projects give no namespace, the resource
+stays at the shared root; with no configured role and no active-project
+namespace, the pre-project fallback applies (the skills namespace scan for
+skills, shared root for rules and agents). Active projects the projects
+manifest cannot resolve (an undeclared id, or no `manifest/projects.yaml`) stop
+a push without `--role` or `--project` before it scans anything, so neither the
+skills scan nor `push --skill` treats every namespace as the member's (#1021).
+With a flag the skills scan stays scoped to the role's namespaces rather than
+falling back to the unscoped legacy scan. `push` picks up a change to any `env/<ns>/env.yaml` or `env/<ns>/secrets.yaml`.
 `teamai env add|remove` take `--role` / `--project`, and `--secret` for that namespace's `secrets.yaml`.
+
+
 `teamai remove mcp <name>`
 removes from the root file when it defines the name, otherwise from the one
 namespace file that does, and asks for `--role` / `--project` only when several
@@ -484,24 +552,114 @@ write, through the same state save. A copy is the member's edit only when it
 has a record and no longer matches it. Pull keeps such a copy and names it: an
 info line when the team version is unchanged, a warning when it has moved.
 Push warns about such a copy as well (the SessionStart pull is silent), without
-holding it, since the member may have merged the team change already. A
+holding it, since the member may have merged the team change already. 
+
+A
 skill directory is one unit, and files only the member added are not recorded.
 Tombstone cleanup keeps an edited copy the same way, and so does the rules
 sweep of a rule no longer delivered (deleted from the team repo, or of a
 namespace the member left). `--force` keeps edits;
-deleting the copy and running `pull --force` takes the team version. A record
-without `delivered` (the first pull on this version, a new worktree) protects
-nothing, and a copy teamai never delivered to that path is overwritten as
-before. A forced full sync elsewhere keeps each checkout's `delivered`.
+deleting the copy and running `pull --force` takes the team version. 
+
+A rule or
+agent file, or a skill directory, with no entry in `delivered` (the first pull on this version, a new
+worktree, a restored checkout whose `.git` key changed, the member's own file)
+is teamai's only on proof (#993): its bytes, by git blob id, equal a version of
+the resource's team file in the team repo's history, or teamai's render of one
+for that tool (`isTeamaiCopy`, the target's `origin`). The proof runs only for
+a file that exists without a record. 
+
+Otherwise it is the member's: neither
+written nor deleted, named (with the kept-edit wording when another checkout's
+record lists the path, else `describeMembersFile`), listed by `doctor`, and the
+pull does not count as synced, so the next one retries. No record is carried
+over to a new key. A skill directory (`isTeamaiSkillCopy`) is decided only when
+no file under it has a record: it is teamai's when every file in it but
+CONTRIBUTORS is today's team file or a version of that file of a team skill of
+that name (root or any namespace, SKILL.md also with its frontmatter repaired),
+so one file of the member's makes it the member's, whole. 
+
+The docs mirror keeps
+no record: a file at a team doc's path is teamai's only when it is a version
+of that doc (`membersDocs`), and the mirror prune deletes a file at a removed
+team doc's path only on the same proof (`isPrunableDoc`). teamai writes files,
+never links: a link at any delivered path (skill directory, rule or agent file,
+docs mirror entry, source skill destination), or anywhere inside a delivered
+skill directory, is the member's, never followed, written through, replaced or
+deleted by pull, `remove`, `uninstall` or a cleanup sweep, and pull names it
+(`describeMembersLink`). 
+
+The mirror prune keeps any file or link at a path the
+team never had, and delivery skips a link inside a team or source skill. A forced
+full sync elsewhere keeps each checkout's `delivered`.
 `doctor` does not fail on a kept copy; next to another problem it lists one
-as "changed by you (kept by pull)".
+as "changed by you (kept by pull)". A member's own file fails the delivery
+check, as the team version does not reach that tool: it is listed as "not
+teamai's (kept by pull)" with pull's line for each file.
+
+Codex's shared `.agents/skills/<name>` is a destination only for a copy that
+is teamai's under the same rule (#993): `resolveSkillDestination` takes the
+ownership predicate, `judgeCopy` against the checkout's record in pull, the
+history proof alone (`isTeamaiSkillCopy`) in doctor, and `ownsSkillDir` in
+`teamai remove` and `uninstall` (below). Any other copy there is the member's
+or another tool's, and is
+not "kept" in the sense above: Codex gets `.codex/skills/<name>` instead, the
+team skill is delivered, and every full sync names the conflict (Codex sees two
+skills of that name). 
+
+Source skills use the same rule with the source repo
+as origin (#993 bug 8): a shared copy is the source's when its installation
+manifest records it, or it is the source skill as pulled now or a version in
+the source repo's history (`isTeamaiSkillCopy` against the source cache).
+The built-in stub still takes an existing shared copy as its own.
+
+The commands that delete skill directories by a team skill's name apply the
+same rule in every tool's skills root (#993): `teamai remove skills <name>` and
+`uninstall` delete a directory only when a file under it is on the checkout's
+record (edited or not) or `isTeamaiSkillCopy` proves it (`ownsSkillDir`), and
+name each one they leave; uninstall also deletes a built-in's name and a name
+the local agent's manifest lists. `uninstall` removes from the docs mirror only
+what the history proves teamai's (`removeTeamDocs`: a file or link at `<rel>`
+that is a version of `docs/<rel>`), keeps and names the rest, and leaves the
+directories holding it, inside the data home too. 
+
+Pull's sweep of the namespace-nested copies
+earlier releases left of an excluded skill deletes one only when
+`judgeRemoval` returns `remove`, and leaves the rest silently, as pull never
+delivers there. `judgeRemoval` sorts a copy of a resource no longer
+delivered into `remove`, `edited` (changed since teamai delivered it, or on
+another checkout's record) and `notTeamais` (no record, no team version), so
+each caller names a kept copy for what it is.
+
+Codex's shared `.agents/skills/<name>` is swept with the configured skills
+directory (#915): when a skill stops being delivered (an inactive namespace,
+Step 3b, a tombstone), pull deletes the shared copy only when `judgeRemoval`
+returns `remove`, and names an `edited` or `notTeamais` one. No removal pass of
+pull deletes a path the index of its checkout tracks (#915): the check
+(`keepsTrackedCopy`) sits right before each deletion of a copy no longer
+delivered (inactive namespaces, Step 3b, tombstones, the rules sweep and
+unselected rules, inactive agents, a source dropping a skill), so a later pull
+that proves the copy teamai's keeps it too. Each pull names it once, with
+`git rm -r <path>`; a source's kept copy stays on its installation's record.
+The same check guards layout migrations (a rule's legacy `.md`, the copy a
+namespaced rule supersedes, legacy rule directories, moved nested copies,
+agent format siblings, Codex's configured copy of a skill in `.agents/skills`,
+leftover files of another team version of a skill, the built-in recall agent's
+old format), whose message adds where the resource lives now, the prune of the
+files earlier releases shipped in the CLI's built-in skills, and the explicit
+commands: `teamai remove`,
+`teamai source remove` and `uninstall`, whose summary counts them as
+`Kept (tracked)`. A team repo with no rules left still runs the rules sweep,
+so the copies of a last rule the team deleted go, on the same ownership proof.
 
 ### Known gaps
 
-- `teamai remove`'s rules refresh and local-agent installs deliver rules and
-  skills as before: they overwrite a changed copy and record nothing. If the
-  team changes a copy they wrote before the next pull, that pull keeps it as an
-  edit.
+- `teamai remove`'s rules refresh judges copies against the checkout's record
+  and the team history as pull does (#993), and deletes a copy of the removed
+  rule only when it is on record or proven teamai's (the author's root copy by
+  its placement record); it records nothing. Local-agent installs deliver rules
+  and skills as before: they overwrite a changed copy and record nothing. The
+  next pull judges a skill, rule or agent copy either wrote by the team history.
 - Step 3b and the inactive-namespace cleanup of skills and agents still compare
   with the team source, not the record, so an untouched copy delivered at an
   older revision stays there with a warning.

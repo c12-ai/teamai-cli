@@ -20,12 +20,14 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir } from './utils/fs.js';
+import { ensureDir, writeFileAtomic } from './utils/fs.js';
+import { acquireLock, releaseLock } from './update.js';
 import { redactWithEnv } from './utils/redact.js';
 import { aggregateSessionMetrics } from './dashboard-collector.js';
 import { repoKeys, repoLabel } from './utils/repo-attribution.js';
 import { emptyTokenUsage } from './types.js';
 import type { DashboardEvent, SessionMetrics } from './types.js';
+import type { HeadState } from './utils/git.js';
 
 /** A folded, human-readable summary of a single session. */
 export interface SessionSummary {
@@ -49,6 +51,12 @@ export interface SessionSummary {
   firstPrompt: string;
   /** Whether this session is worth surfacing to the team (see isValuable). */
   valuable: boolean;
+  /**
+   * The commit the session started on and whether tracked files had changes,
+   * from its earliest `session_start` that recorded them. Absent when none did.
+   * Not rendered into the monthly log.
+   */
+  gitAtStart?: HeadState;
 }
 
 /** Max characters kept from the first prompt in a summary. */
@@ -80,8 +88,12 @@ export function collectSession(sessionId: string, events: DashboardEvent[]): Ses
   let firstPromptRaw = '';
   let startedAt = own[0].timestamp;
   let endedAt = own[0].timestamp;
+  let gitStart: { at: string; state: HeadState } | undefined;
 
   for (const e of own) {
+    if (e.type === 'session_start' && e.gitAtStart && (!gitStart || e.timestamp < gitStart.at)) {
+      gitStart = { at: e.timestamp, state: e.gitAtStart };
+    }
     if (e.tool) tool = e.tool;
     if (e.cwd) cwd = e.cwd;
     if (e.timestamp < startedAt) startedAt = e.timestamp;
@@ -126,6 +138,7 @@ export function collectSession(sessionId: string, events: DashboardEvent[]): Ses
     prompts: metrics.prompts,
     firstPrompt,
     valuable: isValuable({ interventionCount, distinctTools }),
+    ...gitStart ? { gitAtStart: gitStart.state } : {},
   };
 }
 
@@ -180,7 +193,8 @@ export function monthKey(summary: SessionSummary): string {
  * already present (matched by its full-session-id `<!-- teamai:session … -->`
  * marker) is not appended again. Returns the file path written, or null when the
  * session was already recorded. Creates the directory and a month header on first
- * write.
+ * write. The read/deduplicate/write transaction is serialized across processes;
+ * a busy or unavailable lock is retried for up to five seconds.
  */
 export async function appendMonthlyLog(
   dir: string,
@@ -192,19 +206,32 @@ export async function appendMonthlyLog(
   const file = path.join(dir, `${month}.md`);
   const block = renderSessionMarkdown(summary, options);
   const marker = `<!-- teamai:session ${summary.sessionId} -->`;
-
-  let existing = '';
-  try {
-    existing = await fs.promises.readFile(file, 'utf-8');
-  } catch {
-    // New month.
+  const lockPath = `${file}.lock`;
+  const deadline = Date.now() + 5_000;
+  while (!(await acquireLock(lockPath))) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`Cannot lock session log ${file}. Retry teamai session save later.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
   }
 
-  if (existing.includes(marker)) return null;
+  try {
+    let existing = '';
+    try {
+      existing = await fs.promises.readFile(file, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
 
-  const header = existing ? '' : `# Session log — ${month}\n\n`;
-  await fs.promises.writeFile(file, existing + header + block, 'utf-8');
-  return file;
+    if (existing.includes(marker)) return null;
+
+    const header = existing ? '' : `# Session log — ${month}\n\n`;
+    await writeFileAtomic(file, existing + header + block);
+    return file;
+  } finally {
+    await releaseLock(lockPath);
+  }
 }
 
 /**

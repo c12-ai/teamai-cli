@@ -4,6 +4,8 @@ import type { Command } from 'commander';
  * `--dry-run` promises that nothing changes. A command that does not keep that
  * promise refuses the flag instead of running for real (#900). The guard reads
  * only this allowlist, so a new command is refused until it is listed here.
+ * Caches in the temporary directory (Node's compile cache, the git answers of
+ * src/utils/git-answers.ts) are not something a dry run changes.
  *
  * Keyed by full command path: leaf names collide (`add`, `remove`, `init`).
  * A path belongs here when its action honors `--dry-run` (forwards it and
@@ -29,6 +31,7 @@ export const DRY_RUN_PREVIEW: ReadonlySet<string> = new Set([
   'packages',
   'packages install',
   'doctor',
+  'update',
   'roles',
   'roles list',
   'roles init',
@@ -75,6 +78,14 @@ export const DRY_RUN_PREVIEW: ReadonlySet<string> = new Set([
   'models switch',
   'models restore',
   'session save',
+  'session platforms',
+  'session migrate',
+  'session push',
+  'session pull',
+  'session list',
+  'session resume',
+  'session search',
+  'session rollback',
   'contribute',
   'stats',
   'recall',
@@ -85,7 +96,7 @@ export const DRY_RUN_PREVIEW: ReadonlySet<string> = new Set([
   'recall maintenance',
   'recall promote',
   'import', // source-specific refusals below
-  'codebase', // `--extract` is refused below
+  'codebase',
   'review',
   'ci extract-mr', // `--output` is refused below
 ]);
@@ -98,12 +109,12 @@ export const DRY_RUN_PREVIEW: ReadonlySet<string> = new Set([
 export const NO_DRY_RUN_PREVIEW: Readonly<Record<string, string>> = {
   digest: 'creates or refreshes the reports worktree; #900 C11',
   init: 'no preview; clones, saves config and injects hooks (single-repo: bootstraps the clone)',
+  'script run': 'runs the team script, which can write files and read the terminal',
   'models add': 'writes the personal profile and its key',
   'models configure': 'writes the key or the personal profile',
   'models remove': 'deletes the personal profile and its key',
   'bind-project': 'writes the local-agent binding',
   'hooks remove': 'edits every AI tool settings file',
-  update: 'no preview until #951 lands',
   dashboard: 'a long-running server that creates its events file',
   'deep-enrich': 'hidden; writes the docs that `codebase --deep-enrich` previews',
   // Hidden commands that hooks run, never with --dry-run.
@@ -115,6 +126,16 @@ export const NO_DRY_RUN_PREVIEW: Readonly<Record<string, string>> = {
   'contribute-check': 'hook-only',
   'todowrite-hint': 'hook-only',
   'mr-hint': 'hook-only',
+  'score-sessions': 'hook-only',
+  'workflow start': 'creates a run and, with --driver local, runs its commands',
+  score: 'leases judge work, runs judges, writes labels and, with --push, publishes them',
+  'workflow next': 'leases a step and writes the run',
+  'workflow report': 'writes the reported step outcome',
+  'workflow respond': 'writes a HITL request answer',
+  'workflow retry': 'reopens steps and writes a new revision',
+  'workflow cancel': 'cancels steps or the run',
+  'workflow resume': 'runs the local driver and writes the run',
+  'workflow publish': 'writes the run to teamai-reports',
 };
 
 /** The refusal printed when a command has no `--dry-run` preview. */
@@ -127,7 +148,6 @@ export function dryRunRefusal(command: Command): string | undefined {
   const names: string[] = [];
   for (let current: Command | null = command; current?.parent; current = current.parent) names.unshift(current.name());
   const path = names.join(' ');
-  if (path === 'codebase' && command.opts().extract !== undefined) return noDryRunPreview('codebase --extract');
   if (path === 'ci extract-mr' && command.opts().output !== undefined) return noDryRunPreview('ci extract-mr --output');
   if (path === 'import') {
     const opts = command.opts();

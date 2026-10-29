@@ -12,6 +12,7 @@ import {
   type ToolName,
 } from '../resources/agent-format.js';
 import { AgentsHandler } from '../resources/agents.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
 
 vi.mock('../utils/logger.js', () => ({
@@ -152,8 +153,11 @@ targets: [copilot]
     await handler.pullItem(item, teamConfig, projectConfig);
     const projectTarget = path.join(projectRoot, '.github', 'agents', `${TEAM_AGENT}.agent.md`);
     expect(await fse.pathExists(projectTarget)).toBe(true);
-    expect(await fse.pathExists(path.join(projectRoot, 'agents', `${TEAM_AGENT}.agent.md`))).toBe(false);
 
+    // Without a delivery record (pullItem ran without a ledger), a copy goes
+    // only as a team version by the history (#993): the delivered one is.
+    await fse.writeFile(userTarget, firstContent);
+    commitTeamRepo(teamRepo);
     const removed = await handler.removeItem(TEAM_AGENT, teamConfig, userConfig);
     expect(removed).toContain(userTarget);
     expect(await fse.pathExists(userTarget)).toBe(false);
@@ -175,7 +179,7 @@ targets: [copilot]
     const defaultScopeDeployments = await deployBuiltinAgents({
       ...teamConfig,
       toolPaths: { claude: { agents: '.claude/agents' } },
-    });
+    }, { ...userConfig, enabledAgents: ['claude'] });
     expect(defaultScopeDeployments).toBeGreaterThan(0);
 
     const roleSource = path.join(teamRepo, 'agents', 'frontend', `${ROLE_AGENT}.yaml`);

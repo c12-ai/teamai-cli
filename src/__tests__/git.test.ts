@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import path from 'node:path';
 
 // Mock simple-git before importing
 const mockGit = {
@@ -20,10 +21,17 @@ const mockGit = {
   pull: vi.fn(),
   fetch: vi.fn(),
   raw: vi.fn(),
+  outputHandler: vi.fn().mockReturnThis(),
 };
 
+// Capture the options every createGit() call passes to simple-git, so tests
+// can assert the hang guards (block timeout + GIT_TERMINAL_PROMPT) are present.
+const simpleGitCalls: unknown[][] = [];
 vi.mock('simple-git', () => ({
-  default: () => mockGit,
+  default: (...args: unknown[]) => {
+    simpleGitCalls.push(args);
+    return mockGit;
+  },
 }));
 
 vi.mock('fs-extra', () => ({
@@ -42,6 +50,15 @@ vi.mock('node:fs', () => ({
 
 vi.mock('node:fs/promises', () => ({ realpath: vi.fn(async (p: string) => p) }));
 
+// The repositories here exist only in the simple-git mock, not on disk.
+vi.mock('../utils/git-discovery.js', () => ({
+  gitFindsNoRepository: vi.fn(async () => false),
+  // A new stamp each time: no list is reused across the mock's answers.
+  linkedWorktreesStamp: vi.fn(async () => crypto.randomUUID()),
+  // No stamp: each question goes to the mock as its own git call.
+  repositoryStamp: vi.fn(async () => null),
+}));
+
 vi.mock('../utils/logger.js', () => ({
   log: {
     info: vi.fn(),
@@ -54,8 +71,121 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin } from '../utils/git.js';
+import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin, gitCommonDir, unusedBranchName } from '../utils/git.js';
 import fse from 'fs-extra';
+import { createGit, createGitWithBlockTimeout, disableGitTerminalPrompt } from '../utils/git.js';
+
+describe('createGit', () => {
+  // The init-hang bug: a push with missing credentials opened an invisible
+  // prompt (no tty) and blocked forever. The credential-prompt guard is set
+  // process-wide by disableGitTerminalPrompt (tested separately), NOT per
+  // simple-git instance — simple-git's .env() replaces the whole child env,
+  // which would drop PATH/HOME and break git. The spawn-level block timeout
+  // is NOT global either — it lives in createGitWithBlockTimeout, so slow
+  // clones/fetches through createGit are never killed.
+  beforeEach(() => {
+    simpleGitCalls.length = 0;
+  });
+
+  it('does NOT add a global spawn timeout (would kill legitimate slow clones/fetches)', () => {
+    createGit('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { timeout?: unknown };
+    expect(options.timeout).toBeUndefined();
+  });
+
+  it('forwards basePath as baseDir', () => {
+    createGit('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { baseDir?: string };
+    expect(options.baseDir).toBe('/some/path');
+  });
+});
+
+describe('createGitWithBlockTimeout', () => {
+  beforeEach(() => {
+    simpleGitCalls.length = 0;
+  });
+
+  it('adds the spawn-level block timeout so a hung init push subprocess is killed', () => {
+    createGitWithBlockTimeout('/some/path');
+    const options = simpleGitCalls.at(-1)![0] as { timeout?: { block?: number } };
+    // simple-git's timeout.block actually kills the spawned process; a
+    // Promise.race-style timeout would leave it running.
+    expect(options.timeout?.block).toBe(30_000);
+  });
+
+  it('honors TEAMAI_INIT_PUSH_TIMEOUT_MS for slow links', () => {
+    const prev = process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS;
+    process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS = '120000';
+    try {
+      createGitWithBlockTimeout('/some/path');
+      const options = simpleGitCalls.at(-1)![0] as { timeout?: { block?: number } };
+      expect(options.timeout?.block).toBe(120_000);
+    } finally {
+      if (prev === undefined) delete process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS;
+      else process.env.TEAMAI_INIT_PUSH_TIMEOUT_MS = prev;
+    }
+  });
+});
+
+describe('disableGitTerminalPrompt', () => {
+  // The credential-prompt guard must be process-wide so every git subprocess
+  // inherits it — but it must not clobber an explicit user override.
+  afterEach(() => {
+    delete process.env.GIT_TERMINAL_PROMPT;
+  });
+
+  it('sets GIT_TERMINAL_PROMPT=0 process-wide so git fails fast on missing credentials', () => {
+    delete process.env.GIT_TERMINAL_PROMPT;
+    disableGitTerminalPrompt();
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('is idempotent and preserves an explicit user override', () => {
+    process.env.GIT_TERMINAL_PROMPT = '1'; // user wants prompts
+    disableGitTerminalPrompt();
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe('1');
+  });
+});
+
+describe('gitCommonDir', () => {
+  it('asks git each time when no repository on disk vouches for the answer', async () => {
+    const cwd = path.resolve('common-dir-unstamped');
+    mockGit.revparse.mockClear().mockResolvedValueOnce('.git').mockResolvedValue('other/.git');
+
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, 'other', '.git'));
+    expect(mockGit.revparse).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries when a repository becomes available after a failed probe', async () => {
+    const cwd = path.resolve('common-dir-retry');
+    mockGit.revparse.mockClear().mockRejectedValueOnce(new Error('not a repository')).mockResolvedValue('.git');
+
+    expect(await gitCommonDir(cwd)).toBeNull();
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
+    expect(mockGit.revparse).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('unusedBranchName', () => {
+  it('is the generated name when no branch has it', async () => {
+    mockGit.raw.mockReset().mockResolvedValue('');
+    expect(await unusedBranchName('/repo', 'alice')).toMatch(/^teamai\/push\/alice\/\d{8}-\d{6}$/);
+  });
+
+  it('takes the first free suffix when a push in the same second has the name, locally or on origin', async () => {
+    mockGit.raw.mockReset().mockImplementation(async (args: string[]) => {
+      const name = args.at(-4)!.slice('refs/heads/'.length);
+      return [`refs/heads/${name}`, `refs/remotes/origin/${name}-2`, ''].join('\n');
+    });
+    expect(await unusedBranchName('/repo', 'alice')).toMatch(/^teamai\/push\/alice\/\d{8}-\d{6}-3$/);
+  });
+
+  it('is the generated name when git cannot list the branches', async () => {
+    mockGit.raw.mockReset().mockRejectedValue(new Error('not a repository'));
+    expect(await unusedBranchName('/repo', 'alice')).toMatch(/^teamai\/push\/alice\/\d{8}-\d{6}$/);
+  });
+});
 
 describe('generateBranchName', () => {
   it('should produce teamai/push/<username>/<timestamp> format', () => {
@@ -368,9 +498,10 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/master', 'master');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/master');
 
     expect(mockGit.reset).not.toHaveBeenCalled();
+    expect(mockGit.clean).not.toHaveBeenCalled();
     expect(mockGit.checkout).not.toHaveBeenCalled();
   });
 
@@ -383,9 +514,10 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/master', 'master');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/master');
 
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
     expect(mockGit.checkout).not.toHaveBeenCalled();
   });
 
@@ -398,9 +530,25 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/master', 'master');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/master');
 
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
+  });
+
+  it('should clean untracked files that reset --hard leaves in place', async () => {
+    mockGit.status.mockResolvedValue({
+      modified: [],
+      not_added: ['skills/stray/SKILL.md'],
+      created: [],
+      conflicted: [],
+    });
+    mockRevparse('origin/master', 'master');
+
+    await resetToCleanMaster(mockGit as any, '/mock/master');
+
+    expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
   });
 
   it('should checkout master when stuck on a stale push branch', async () => {
@@ -412,7 +560,7 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/master', 'teamai/push/jeffyxu/20260411-225746');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/master');
 
     expect(mockGit.checkout).toHaveBeenCalledWith('master');
   });
@@ -426,9 +574,10 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/master', 'teamai/push/user/20260411-123456');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/master');
 
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
     expect(mockGit.checkout).toHaveBeenCalledWith('master');
   });
 
@@ -441,7 +590,7 @@ describe('resetToCleanMaster', () => {
     });
     mockRevparse('origin/main', 'feature/foo');
 
-    await resetToCleanMaster(mockGit as any);
+    await resetToCleanMaster(mockGit as any, '/mock/main');
 
     expect(mockGit.checkout).toHaveBeenCalledWith('main');
   });
@@ -618,6 +767,8 @@ function mockClone({ heads = ['a1', 'a1'], merge }: { heads?: string[]; merge?: 
     }
     if (args[0] === 'diff') return 'skills/a/SKILL.md\nrules/b.md\n';
     if (args[0] === 'rev-list') return '0\n';
+    // On a branch: upstream's detached-HEAD guard (assertAttachedTeamRepo) lets the pull run.
+    if (args[0] === 'symbolic-ref') return 'refs/heads/main\n';
     // No upstream configured: origin/<branch>.
     return '';
   });

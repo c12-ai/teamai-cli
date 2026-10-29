@@ -24,29 +24,12 @@
  */
 
 import path from 'node:path';
-import { writeFile, writeIfChanged, ensureDir, pathExists, readJsonObject, writeJsonAtomic, remove } from './utils/fs.js';
+import { writeFile, writeIfChanged, ensureDir, pathExists, readJsonObject, writeJsonAtomic, remove, symlinkTarget } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import { expandHome, getUserHome } from './utils/home.js';
-
-/**
- * The OpenClaw state dir: `OPENCLAW_STATE_DIR`, else `~/.openclaw-<profile>`
- * for a non-default `OPENCLAW_PROFILE`, else `~/.openclaw`. It holds
- * `openclaw.json`, managed hooks and, by default, the workspace.
- */
-export function resolveOpenclawStateDir(): string {
-  const override = process.env.OPENCLAW_STATE_DIR?.trim();
-  if (override) return path.resolve(expandHome(override));
-  const profile = process.env.OPENCLAW_PROFILE?.trim();
-  const suffix = profile && profile.toLowerCase() !== 'default' ? `-${profile}` : '';
-  return path.join(getUserHome(), `.openclaw${suffix}`);
-}
-
-/** The `openclaw.json` OpenClaw reads: `OPENCLAW_CONFIG_PATH`, else the state dir's. */
-export function resolveOpenclawConfigPath(): string {
-  const override = process.env.OPENCLAW_CONFIG_PATH?.trim();
-  if (override) return path.resolve(expandHome(override));
-  return path.join(resolveOpenclawStateDir(), 'openclaw.json');
-}
+import { debugOnce } from './utils/warn-once.js';
+import { getUserHome } from './utils/home.js';
+import { resolveOpenclawConfigPath, resolveOpenclawStateDir, resolveOpenclawWorkspace } from './openclaw-home.js';
+import { resolveCliEntry } from './builtin-hooks.js';
 
 /**
  * Resolve the managed hooks directory for an OpenClaw-family tool:
@@ -105,7 +88,7 @@ function buildHookMd(tool: string): string {
   ].join('\n');
 }
 
-function buildHandlerTs(tool: string): string {
+function buildHandlerTs(tool: string, entry: string): string {
   // OpenClaw calls the default export with the event itself
   // ({ type, action, sessionKey, context, ... }). Map `${type}:${action}` to a
   // teamai dispatch event and shell out, passing the event's workspace as the
@@ -121,6 +104,8 @@ import { fileURLToPath } from 'node:url';
 
 const EVENT_MAP: Record<string, string> = ${mapLiteral};
 const TOOL = ${JSON.stringify(tool)};
+const NODE = ${JSON.stringify(process.execPath)};
+const ENTRY = ${JSON.stringify(entry)};
 const HOOK_WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 type HookEvent = { type?: unknown; action?: unknown; sessionKey?: unknown; context?: { workspaceDir?: unknown } | null };
@@ -136,8 +121,9 @@ export default async function handler(event?: HookEvent): Promise<void> {
   };
   if (typeof event.sessionKey === 'string' && event.sessionKey) payload.session_id = event.sessionKey;
   try {
-    const child = spawn('teamai', ['hook-dispatch', dispatchEvent, '--tool', TOOL], {
+    const child = spawn(NODE, [ENTRY, 'hook-dispatch', dispatchEvent, '--tool', TOOL], {
       stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
     });
     child.on('error', () => {});
     child.stdin?.on('error', () => {});
@@ -163,6 +149,11 @@ export default async function handler(event?: HookEvent): Promise<void> {
  * @param tool          claw variant (openclaw/qclaw/easyclaw/autoclaw)
  */
 export async function injectOpenClawHooks(workspacePath?: string, tool = 'openclaw'): Promise<void> {
+  const entry = resolveCliEntry();
+  if (!entry) {
+    log.warn('OpenClaw: cannot resolve the teamai CLI entry; run `teamai hooks inject` from the installed CLI.');
+    return;
+  }
   const wsDir = await resolveOpenclawWorkspaceDir(workspacePath);
   if (!wsDir) {
     log.debug(`openclaw: skip hook injection for ${tool} — workspace dir not found`);
@@ -170,7 +161,7 @@ export async function injectOpenClawHooks(workspacePath?: string, tool = 'opencl
   }
   const dir = path.join(wsDir, 'hooks', OPENCLAW_HOOK_DIR);
   const hookMdChanged = await writeIfChanged(path.join(dir, 'HOOK.md'), buildHookMd(tool));
-  const handlerChanged = await writeIfChanged(path.join(dir, 'handler.ts'), buildHandlerTs(tool));
+  const handlerChanged = await writeIfChanged(path.join(dir, 'handler.ts'), buildHandlerTs(tool, entry));
   if (hookMdChanged || handlerChanged) {
     log.success(`Injected teamai OpenClaw hook into ${dir}`);
   } else {
@@ -268,7 +259,7 @@ async function enableOpenClawHookEntry(hookKey: string, source: 'workspace' | 'm
   const hooks = config.hooks && typeof config.hooks === 'object' ? config.hooks as Record<string, unknown> : {};
   config.hooks = { ...hooks, internal: { ...internal, entries: { ...entries, [hookKey]: { ...entry, enabled: true } } } };
   try {
-    await writeJsonAtomic(cfgPath, config);
+    await writeJsonAtomic(await symlinkTarget(cfgPath), config);
     log.success(`Enabled the teamai OpenClaw hook ${hookKey} in ${cfgPath}`);
   } catch (e) {
     log.warn(`OpenClaw: could not enable the teamai hook ${hookKey} in ${cfgPath}: ${(e as Error).message}. Run ${enableCmd}.`);
@@ -310,7 +301,7 @@ export async function removeOpenClawHookEntry(hookKey: string = OPENCLAW_HOOK_KE
   const hooks = cfg.hooks as Record<string, unknown>;
   const nextHooks = nextInternal ? { ...hooks, internal: nextInternal } : withoutKey(hooks, 'internal');
   const next = nextHooks ? { ...cfg, hooks: nextHooks } : withoutKey(cfg, 'hooks') ?? {};
-  await writeJsonAtomic(cfgPath, next);
+  await writeJsonAtomic(await symlinkTarget(cfgPath), next);
   log.success(`Removed the teamai OpenClaw hook entry ${hookKey} from ${cfgPath}`);
 }
 
@@ -427,47 +418,6 @@ export async function removeOpenClawAgentHook(opts: {
   if (tool === 'openclaw') await removeOpenClawHookEntry(agentHookKey(opts.slug));
 }
 
-/** Where OpenClaw's default agent reads its workspace from, as far as teamai can tell (`resolveOpenclawWorkspace`). */
-export type OpenclawWorkspace =
-  | { readonly kind: 'found'; readonly dir: string }
-  | { readonly kind: 'none'; readonly tried: string }
-  /** openclaw.json is there but not plain JSON, so a workspace it sets is unknown. */
-  | { readonly kind: 'unreadable-config'; readonly file: string; readonly error: string; readonly fallback: string | null };
-
-/**
- * Resolve the OpenClaw workspace directory the way OpenClaw resolves its
- * default agent's workspace (agents/agent-scope-config.ts,
- * agents/workspace-default-path.ts):
- * 1. Explicit workspacePath (server-sent), when it exists
- * 2. `agents.defaults.workspace` in the resolved openclaw.json
- * 3. `OPENCLAW_WORKSPACE_DIR`
- * 4. `<state dir>/workspace` (`OPENCLAW_STATE_DIR`, profile, `~/.openclaw`)
- *
- * Found only when the directory from that order exists: another workspace
- * that happens to exist is not the one OpenClaw reads. An openclaw.json
- * teamai cannot parse (OpenClaw reads JSON5) hides step 2, so the result says
- * so, with the directory steps 3-4 give as `fallback`.
- * Per-agent workspaces in `agents.list` are not followed.
- */
-export async function resolveOpenclawWorkspace(workspacePath?: string): Promise<OpenclawWorkspace> {
-  if (workspacePath && await pathExists(workspacePath)) return { kind: 'found', dir: workspacePath };
-  const cfgPath = resolveOpenclawConfigPath();
-  const read = await readJsonObject(cfgPath);
-  const agents = read.kind === 'ok' ? read.value.agents as { defaults?: { workspace?: unknown } } | undefined : undefined;
-  const configured = agents?.defaults?.workspace;
-  const envDir = process.env.OPENCLAW_WORKSPACE_DIR?.trim();
-  const candidate = typeof configured === 'string' && configured.trim()
-    ? path.resolve(expandHome(configured.trim()))
-    : envDir
-      ? path.resolve(expandHome(envDir))
-      : path.join(resolveOpenclawStateDir(), 'workspace');
-  const exists = await pathExists(candidate);
-  if (read.kind === 'invalid') {
-    return { kind: 'unreadable-config', file: cfgPath, error: read.error, fallback: exists ? candidate : null };
-  }
-  return exists ? { kind: 'found', dir: candidate } : { kind: 'none', tried: [workspacePath, candidate].filter(Boolean).join(', ') };
-}
-
 /**
  * The workspace directory OpenClaw's hooks and skills go to, or null
  * (`resolveOpenclawWorkspace`). An unreadable openclaw.json falls back to
@@ -486,8 +436,7 @@ export async function resolveOpenclawWorkspaceDir(workspacePath?: string): Promi
   }
   // A missing workspace dir is the normal case when OpenClaw is not installed;
   // callers treat null as "skip openclaw" and log their own debug line, so keep
-  // this at debug level to avoid warning noise (one line per skill/file) on
-  // machines without OpenClaw.
-  log.debug(`openclaw: no workspace dir found (tried: ${workspace.tried})`);
+  // this at debug level, and once per run: callers ask per skill and file.
+  debugOnce(`openclaw: no workspace dir found (tried: ${workspace.tried})`);
   return null;
 }

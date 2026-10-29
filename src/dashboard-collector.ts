@@ -5,7 +5,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { log } from './utils/logger.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
-import { ensureDir } from './utils/fs.js';
+import { ensureDir, pathExists } from './utils/fs.js';
 import { repoKeys, repoLabel } from './utils/repo-attribution.js';
 import { isProcessAlive, resolveMonitorPid } from './pid-monitor.js';
 import { normalizeToolName } from './utils/tool-names.js';
@@ -24,10 +24,12 @@ import {
   stripInjectedPrompt,
   TRANSCRIPT_REJECT_MARKERS,
   COPILOT_TOOL_ID,
+  MUSE_TOOL_ID,
   getCopilotHome,
   getDataHome,
   emptyTokenUsage,
   addTokenUsage,
+  totalTokens,
   type DashboardEvent,
   type DashboardEventType,
   type DashboardSession,
@@ -38,6 +40,8 @@ import {
   type LocalConfig,
 } from './types.js';
 import { getUserHome } from './utils/home.js';
+import type { HeadState } from './utils/git.js';
+import type { SessionRun } from './launch-context.js';
 import { estimateClaudeRequest } from './model-pricing.js';
 
 // ─── Event collection data flow ─────────────────────────
@@ -800,6 +804,75 @@ export function resolveCopilotUsageTranscript(
   );
 }
 
+const MUSE_USAGE_EVENT = 'goal_usage_attribution';
+const MUSE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Muse Code's log of `sessionId`, `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
+ * (`~/.local/share` when unset; muse 1.4.6 honors XDG_DATA_HOME, #1138), found by its id
+ * alone: Muse's hooks send `transcript_path: null`. The variable is read live — the only
+ * reader is muse's own stop hook, which inherits muse's environment, and tokens are stamped
+ * onto the event there, so no later reader without the variable has to find the tree.
+ */
+async function findMuseSessionLog(sessionId: string): Promise<string | null> {
+  if (!MUSE_SESSION_ID_RE.test(sessionId)) return null;
+  const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(getUserHome(), '.local', 'share');
+  const root = path.join(dataHome, 'muse', 'sessions');
+  const subdirs = async (dir: string) => (await fs.promises.readdir(dir).catch(() => [] as string[]))
+    .filter((name) => /^\d+$/.test(name)).sort().reverse().map((name) => path.join(dir, name));
+  for (const year of await subdirs(root)) {
+    for (const month of await subdirs(year)) {
+      for (const day of await subdirs(month)) {
+        const file = path.join(day, sessionId, 'session.jsonl');
+        if (await pathExists(file)) return file;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The session's token totals from the `goal_usage_attribution` records of its
+ * main log, or null with none. Subagent logs (`subagent/<id>/`) are not read,
+ * as Claude's are not. Muse reports `input_tokens` inclusive of `cached_tokens`,
+ * as Codex does, so the cached part is moved to cacheRead.
+ */
+async function readMuseSessionTokens(sessionId: string): Promise<TokenUsage | null> {
+  const file = await findMuseSessionLog(sessionId);
+  if (!file) return null;
+  let tokens: TokenUsage | null = null;
+  const stream = fs.createReadStream(file, { encoding: 'utf-8' });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.includes(`"${MUSE_USAGE_EVENT}"`)) continue;
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const event = asRecord(asRecord(asRecord(entry)?.payload)?.event);
+      if (event?.kind !== MUSE_USAGE_EVENT) continue;
+      const quantity = asRecord(asRecord(event.record)?.quantity);
+      if (quantity?.unit !== 'tokens') continue;
+      const cacheRead = toNum(quantity.cached_tokens);
+      tokens = addTokenUsage(tokens ?? emptyTokenUsage(), {
+        input: Math.max(0, toNum(quantity.input_tokens) - cacheRead),
+        output: toNum(quantity.output_tokens),
+        cacheRead,
+        cacheCreation: 0,
+      });
+    }
+  } catch (e) {
+    log.debug(`dashboard: could not read the Muse Code session log ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+  return tokens && totalTokens(tokens) > 0 ? tokens : null;
+}
+
 /**
  * Read a CodeBuddy `index.json` transcript once. CodeBuddy's schema differs from
  * Claude Code:
@@ -1140,6 +1213,28 @@ export interface ParseHookEventOptions {
   modelAliases?: Record<string, string>;
 }
 
+function codexReplyText(prompt: string): string {
+  // JSON.parse skips the whitespace around the array, so the pattern needs no
+  // whitespace quantifiers inside the tags: those backtrack on long runs.
+  const match = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/.exec(prompt);
+  if (!match) return prompt;
+  try {
+    const replies: unknown = JSON.parse(match[1]);
+    if (!Array.isArray(replies) || replies.length === 0) return prompt;
+    const items: unknown[] = replies;
+    const answers: string[] = [];
+    for (const reply of items) {
+      if (!reply || typeof reply !== 'object' || !('answer' in reply) || typeof reply.answer !== 'string') return prompt;
+      answers.push(reply.answer);
+    }
+    // A reply with no answer text keeps the prompt, so the turn is still counted.
+    const text = answers.join('\n');
+    return text.trim() ? text : prompt;
+  } catch {
+    return prompt;
+  }
+}
+
 /**
  * Parse a hook STDIN JSON payload into a DashboardEvent.
  * Returns null if the payload is invalid or irrelevant.
@@ -1214,7 +1309,8 @@ export async function parseHookEvent(
   // is purely injected content produces no event at all, so it neither inflates the
   // prompt count nor shows up as a session prompt.
   if (eventType === 'prompt_submit' && typeof hookData.prompt === 'string') {
-    const human = stripInjectedPrompt(hookData.prompt);
+    const prompt = isCodexTool(tool) ? codexReplyText(hookData.prompt) : hookData.prompt;
+    const human = stripInjectedPrompt(prompt);
     if (!human) return null;
     // Decide "correction" here, over the full prompt, because only the hook knows
     // which team (and so which extra keywords) the prompt belongs to. The
@@ -1273,6 +1369,14 @@ export async function parseHookEvent(
       }));
       if (records.length) event.requestDaily = aggregateRequestDaily(records);
       await reconcileRequestLog(records);
+    }
+  }
+
+  if (eventType === 'stop' && tool.toLowerCase() === MUSE_TOOL_ID) {
+    const tokens = await readMuseSessionTokens(sessionId);
+    if (tokens) {
+      event.tokens = tokens;
+      event.tokenScope = 'session';
     }
   }
 
@@ -1964,6 +2068,34 @@ function setLatestTokenSnapshot(
 }
 
 /**
+ * The events of the member's own sessions: an event a session teamai launched recorded (`launchedBy`) never counts as
+ * the member's, in either mode. A step that continued a member's session leaves the member's earlier turns theirs, and
+ * ends what counts of that session: a Stop's snapshot covers the whole transcript, so a later one holds the step's turns.
+ */
+export function memberEvents(events: DashboardEvent[]): DashboardEvent[] {
+  const launchedFrom = new Map<string, number>();
+  for (const event of events) {
+    const at = Date.parse(event.timestamp);
+    if (event.launchedBy && Number.isFinite(at)) launchedFrom.set(event.sessionId, Math.min(at, launchedFrom.get(event.sessionId) ?? at));
+  }
+  return events.filter((event) => {
+    if (event.launchedBy) return false;
+    const from = launchedFrom.get(event.sessionId);
+    return from === undefined || Date.parse(event.timestamp) < from;
+  });
+}
+
+/**
+ * Each session's run: the mode and launcher its latest event that recorded a mode says. A session with no such event,
+ * such as one recorded before the mode was, has none, and counts as not recorded.
+ */
+export function sessionRuns(events: DashboardEvent[]): Map<string, SessionRun> {
+  const runs = new Map<string, SessionRun>();
+  for (const { sessionId, runMode, launchedBy } of events) if (runMode) runs.set(sessionId, { runMode, ...(launchedBy ? { launchedBy } : {}) });
+  return runs;
+}
+
+/**
  * Aggregate per-session metrics from raw events (no timeout filtering).
  *
  * - interrupt / toolReject: taken from the latest Stop event's snapshot.
@@ -2181,6 +2313,9 @@ export function aggregateSessionInterventions(
 
 // ─── JSONL compaction ───────────────────────────────────
 
+/** How long compaction keeps where a launched session started: Claude Code removes a transcript after 30 days by default. */
+const LAUNCHED_RESUMABLE_MS = 30 * 24 * 60 * 60 * 1000;
+
 /**
  * Compact events.jsonl by keeping only events for active sessions.
  * Active = not stopped and last activity within STALE_TIMEOUT, or its tool
@@ -2236,8 +2371,25 @@ export async function compactEvents(eventsPath?: string): Promise<void> {
         if (isProcessAlive(pid)) activeIds.add(sessionId);
       }
 
+      // A session teamai launched keeps its first launched event: a member's resume of it must still find where teamai
+      // started, or its Stop would bring the launched turns back to the member (memberEvents). One line per session,
+      // and none once its tool may no longer resume it, so those lines never refill the log. Until the session is stale
+      // it keeps every event, since its first one alone would list it as running again.
+      const launchedFrom = new Map<string, DashboardEvent>();
+      const lastAt = new Map<string, number>();
+      for (const e of chronological) {
+        if (e.launchedBy && !launchedFrom.has(e.sessionId)) launchedFrom.set(e.sessionId, e);
+        lastAt.set(e.sessionId, Date.parse(e.timestamp));
+      }
+      const now = Date.now();
+      const marks = new Set<DashboardEvent>();
+      for (const [sessionId, first] of launchedFrom) {
+        if (now - (lastAt.get(sessionId) ?? 0) <= DASHBOARD_STALE_TIMEOUT_MS) activeIds.add(sessionId);
+        else if (now - Date.parse(first.timestamp) <= LAUNCHED_RESUMABLE_MS) marks.add(first);
+      }
+
       // Keep only events for active sessions
-      const kept = events.filter(e => activeIds.has(e.sessionId));
+      const kept = events.filter(e => activeIds.has(e.sessionId) || marks.has(e));
       const compacted = kept.map(e => JSON.stringify(e)).join('\n') + '\n';
 
       // Atomic write: write to temp with the file's mode, then rename. The
@@ -2265,6 +2417,7 @@ export async function compactEvents(eventsPath?: string): Promise<void> {
 
 /** What a session last recorded: its scope and the repo it was in. */
 interface RecordedScope {
+  cwd?: string;
   /** The last event's data home key, with the `projectAnchor` of that same event. */
   scope?: { key: string; anchor: string | undefined };
   /** The last `projectAnchor` the session recorded (#809's attribution rule). */
@@ -2288,6 +2441,7 @@ function recordedScope(sessionId: string, cwd: string): Promise<RecordedScope> {
       const here = own.filter((e) => e.cwd === cwd);
       const scoped = here.find((e) => e.dataHomeKey) ?? own.find((e) => e.dataHomeKey);
       return {
+        cwd: scoped?.cwd ?? own.find((e) => e.cwd)?.cwd,
         scope: scoped?.dataHomeKey ? { key: scoped.dataHomeKey, anchor: scoped.projectAnchor } : undefined,
         projectAnchor: (here.find((e) => e.projectAnchor) ?? own.find((e) => e.projectAnchor))?.projectAnchor,
       };
@@ -2295,6 +2449,13 @@ function recordedScope(sessionId: string, cwd: string): Promise<RecordedScope> {
     recordedScopes.set(key, known);
   }
   return known;
+}
+
+/** Recover the latest missing directory when the launcher's process cwd is gone. */
+export async function recordedHookCwd(hookData: Record<string, unknown>, tool: string): Promise<string | undefined> {
+  const sessionId = deriveDispatchSessionId(hookData, tool);
+  const events = (await readEvents()).filter(event => event.sessionId === sessionId).reverse();
+  return (events.find(event => event.cwd && !fs.existsSync(event.cwd)) ?? events.find(event => event.cwd))?.cwd;
 }
 
 /**
@@ -2330,19 +2491,17 @@ export async function resolveHookConfig(hookData: Record<string, unknown>, tool:
 }
 
 /**
- * A checkout of the repo anchored at `anchor` to resolve its scope from: the
- * anchor itself, or for a bare repo (whose anchor is the git directory, which
- * detection cannot read) the first of its worktrees that still exists.
+ * Recover a live checkout for scope detection, including Git-directory identities.
  */
 async function checkoutOf(anchor: string): Promise<string | undefined> {
   if (!fs.existsSync(anchor)) return undefined;
   if (fs.existsSync(path.join(anchor, '.git'))) return anchor;
-  const { listWorktrees } = await import('./utils/git.js');
-  return (await listWorktrees(anchor)).find((dir) => dir !== anchor && fs.existsSync(dir));
+  const { checkoutForProjectAnchor } = await import('./utils/git.js');
+  return await checkoutForProjectAnchor(anchor) ?? undefined;
 }
 
 /**
- * The `projectAnchor` an event records (#809): the main checkout of the repo
+ * The `projectAnchor` an event records (#809): the stable identity of the repo
  * holding the event's `cwd`, the directory the hook resolved its scope for.
  * Undefined for an event that records no cwd, which keeps it free of paths
  * (Copilot), and outside git. For a cwd that no longer exists, which git refuses
@@ -2354,6 +2513,52 @@ export async function eventProjectAnchor(cwd: string | undefined, sessionId: str
   if (!fs.existsSync(cwd)) return (await recordedScope(sessionId, cwd)).projectAnchor;
   const { resolveAnchors } = await import('./utils/git.js');
   return (await resolveAnchors(cwd))?.projectAnchor;
+}
+
+/** How long a session start waits for `git status` before recording no git state. */
+const GIT_STATE_TIMEOUT_MS = 2_000;
+
+/**
+ * The hook payload field in which the session-start dispatcher hands its readers, the session capture and this event,
+ * the one git state it read: a state, or null when it found none.
+ */
+export const GIT_AT_START_PAYLOAD_KEY = 'teamai_git_at_start';
+
+/** The git state `payload` carries from its session start's one read: a state, null for none, undefined when it carries none. */
+export function gitStateIn(payload: Record<string, unknown>): HeadState | null | undefined {
+  if (!(GIT_AT_START_PAYLOAD_KEY in payload)) return undefined;
+  const value = payload[GIT_AT_START_PAYLOAD_KEY];
+  return value !== null && typeof value === 'object' && 'head' in value && typeof value.head === 'string' && 'dirty' in value && typeof value.dirty === 'boolean'
+    ? { head: value.head, dirty: value.dirty }
+    : null;
+}
+
+/**
+ * The commit `cwd` had checked out at a session start and whether tracked files had changes, or null when it has no
+ * commit, is not in git, or `git status` takes longer than its time cap. A failure is logged at debug level.
+ */
+export async function readGitStateAtStart(cwd: string): Promise<HeadState | null> {
+  try {
+    const { getHeadState } = await import('./utils/git.js');
+    const state = await getHeadState(cwd, AbortSignal.timeout(GIT_STATE_TIMEOUT_MS));
+    if (!state) log.debug(`dashboard: ${cwd} has no commit yet, so session_start records no git state`);
+    return state;
+  } catch (e) {
+    log.debug(`dashboard: could not read the git state of ${cwd} at session_start: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+/**
+ * Add to a `session_start` event the git state its `cwd` started on, so the session can be replayed on the code it ran
+ * against: `known`, the state the session-start dispatcher read once for the session capture too, else one read here.
+ * Every start records its own (resume and compaction fire SessionStart too). Other events, and events with no cwd
+ * (Copilot), are left as they are. Without a state the event is still written. Both event writers go through here.
+ */
+export async function addGitStateAtStart(event: DashboardEvent, known?: HeadState | null): Promise<void> {
+  if (event.type !== 'session_start' || !event.cwd) return;
+  const state = known === undefined ? await readGitStateAtStart(event.cwd) : known;
+  if (state) event.gitAtStart = state;
 }
 
 // ─── CLI entry point ────────────────────────────────────
@@ -2395,7 +2600,13 @@ export async function dashboardReport(toolArg?: string): Promise<void> {
   if (!event) return;
 
   event.dataHomeKey = await dataHomeKey(getDataHome(config));
-  event.projectAnchor = await eventProjectAnchor(event.cwd, event.sessionId);
+  const [projectAnchor] = await Promise.all([
+    eventProjectAnchor(event.cwd, event.sessionId),
+    addGitStateAtStart(event, gitStateIn(hookData)),
+  ]);
+  event.projectAnchor = projectAnchor;
+  const { sessionRun } = await import('./launch-context.js');
+  Object.assign(event, sessionRun(process.env));
   await appendEvent(event);
 
   // Trigger compaction check (non-blocking)

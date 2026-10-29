@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -8,6 +9,7 @@ import {
   hasTeamaiHooks,
   reconcileHooks,
   reconcileTeamHooksForConfig,
+  removeCopilotGlobalBuiltins,
 } from '../hooks.js';
 import { _resetShellCache } from '../builtin-hooks.js';
 import { RulesHandler } from '../resources/rules.js';
@@ -124,11 +126,11 @@ describe('GitHub Copilot adapter', () => {
     expect(detected?.absoluteSkillsPath).toBe(path.join(project, '.github', 'skills'));
   });
 
-  it('requires Copilot installation or explicit selection before writing project hooks', async () => {
+  it('requires Copilot installation or explicit selection before writing global hooks', async () => {
     await fse.remove(copilotHome);
     const config = localConfig('project');
     config.enabledAgents = undefined;
-    const hookPath = path.join(project, '.github', 'hooks', COPILOT_HOOK_FILE);
+    const hookPath = path.join(copilotHome, 'hooks', COPILOT_HOOK_FILE);
 
     await reconcileTeamHooksForConfig(teamConfig, config);
     expect(await fse.pathExists(hookPath)).toBe(false);
@@ -202,8 +204,8 @@ describe('GitHub Copilot adapter', () => {
 
   it.each([
     ['user', () => path.join(copilotHome, 'hooks', COPILOT_HOOK_FILE)],
-    ['project', () => path.join(project, '.github', 'hooks', COPILOT_HOOK_FILE)],
-  ] as const)('writes idempotent versioned Copilot hooks in %s scope without settings.json', async (scope, hookPath) => {
+    ['project', () => path.join(copilotHome, 'hooks', COPILOT_HOOK_FILE)],
+  ] as const)('writes idempotent global Copilot hooks from %s scope without settings.json', async (scope, hookPath) => {
     const settingsPath = path.join(copilotHome, COPILOT_SETTINGS_FILE);
     const settings = '{"theme":"dark"}\n';
     await fse.writeFile(settingsPath, settings);
@@ -232,14 +234,8 @@ describe('GitHub Copilot adapter', () => {
       command: expect.stringContaining('teamai hook-dispatch session-start --tool copilot'),
       timeoutSec: expect.any(Number),
     }));
-    expect(parsed.hooks.PostToolUse).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        matcher: 'skill',
-        command: expect.stringContaining('--matcher Skill'),
-      }),
-      expect.objectContaining({ matcher: 'TodoWrite' }),
-    ]));
-    expect(parsed.hooks.PostToolUse.some((entry) => entry.matcher === undefined)).toBe(true);
+    expect(parsed.hooks.PostToolUse.map((entry) => entry.matcher)).toEqual([undefined, 'TodoWrite']);
+    expect(JSON.stringify(parsed.hooks.PostToolUse)).not.toContain('--matcher Skill');
     expect(await fse.readFile(settingsPath, 'utf8')).toBe(settings);
   });
 
@@ -305,11 +301,11 @@ describe('GitHub Copilot adapter', () => {
     expect(await getHookStatus(hookPath, 'copilot')).toBe('installed');
     expect(await hasTeamaiHooks(hookPath, 'copilot')).toBe(true);
 
-    const skillHook = reconciled.hooks.PostToolUse.find((entry) => entry.command.includes('--matcher Skill')) as {
+    const todoHook = reconciled.hooks.PostToolUse.find((entry) => entry.command.includes('--matcher TodoWrite')) as {
       command: string;
       matcher?: string;
     };
-    delete skillHook.matcher;
+    delete todoHook.matcher;
     await fse.writeJson(hookPath, reconciled);
     expect(await getHookStatus(hookPath, 'copilot')).toBe('missing');
 
@@ -329,6 +325,78 @@ describe('GitHub Copilot adapter', () => {
 
     expect(await fse.pathExists(hookPath)).toBe(false);
     expect(await fse.pathExists(path.dirname(hookPath))).toBe(false);
+  });
+
+  describe('hook file with no entries', () => {
+    const projectHookPath = (): string => path.join(project, '.github', 'hooks', COPILOT_HOOK_FILE);
+    const teamHook: HookDef = {
+      source: 'team',
+      key: 'check-bash',
+      event: 'PostToolUse',
+      matcher: 'Bash',
+      command: 'echo check-bash',
+      description: '[teamai:hook:check-bash] check bash commands',
+    };
+    const reconcileProjectFile = (defs: HookDef[]): Promise<void> => reconcileHooks(projectHookPath(), 'copilot', defs, {
+      manifestPath: path.join(root, 'managed-hooks.json'),
+      teamOnly: true,
+    });
+
+    it('deletes an empty file an earlier pull left when the team has no Copilot hooks', async () => {
+      await fse.outputJson(projectHookPath(), { version: 1, hooks: {} });
+
+      await reconcileTeamHooksForConfig(teamConfig, localConfig('project'));
+
+      expect(await fse.pathExists(projectHookPath())).toBe(false);
+    });
+
+    it('does not create the file when there are no Copilot hooks to write', async () => {
+      await reconcileProjectFile([]);
+
+      expect(await fse.pathExists(path.dirname(projectHookPath()))).toBe(false);
+    });
+
+    it('deletes the file when the team hook removed was its last entry', async () => {
+      await reconcileProjectFile([teamHook]);
+      expect(await fse.pathExists(projectHookPath())).toBe(true);
+
+      await reconcileProjectFile([]);
+
+      expect(await fse.pathExists(projectHookPath())).toBe(false);
+    });
+
+    it('keeps the file and the member\'s entry when the team hook is removed', async () => {
+      const memberEntry = { type: 'command', bash: 'echo mine', powershell: 'echo mine', command: 'echo mine' };
+      await fse.outputJson(projectHookPath(), { version: 1, hooks: { SessionStart: [memberEntry] } });
+      await reconcileProjectFile([teamHook]);
+
+      await reconcileProjectFile([]);
+
+      expect(await fse.readJson(projectHookPath())).toEqual({ version: 1, hooks: { SessionStart: [memberEntry] } });
+    });
+
+    it('keeps an empty file the repository commits', async () => {
+      await fse.outputJson(projectHookPath(), { version: 1, hooks: {} });
+      const git = (...args: string[]): void => {
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: project, stdio: 'pipe' });
+      };
+      git('init', '-q');
+      git('add', '.github/hooks');
+      git('commit', '-q', '-m', 'hooks');
+
+      await reconcileProjectFile([]);
+
+      expect(await fse.readJson(projectHookPath())).toEqual({ version: 1, hooks: {} });
+    });
+
+    it('keeps another empty file in the user hooks directory when removing the built-ins', async () => {
+      const memberFile = path.join(copilotHome, 'hooks', 'mine.json');
+      await fse.outputJson(memberFile, { version: 1, hooks: {} });
+
+      await removeCopilotGlobalBuiltins();
+
+      expect(await fse.readJson(memberFile)).toEqual({ version: 1, hooks: {} });
+    });
   });
 
   it('never replaces a Copilot rule with empty content when its source is unreadable', async () => {
@@ -387,7 +455,9 @@ describe('GitHub Copilot adapter', () => {
       };
       const entry = parsed.hooks.SessionStart[0];
       const bashExe = path.join(fakeGitRoot, 'Programs', 'Git', 'bin', 'bash.exe').split(path.sep).join('/');
-      const dispatch = 'teamai hook-dispatch session-start --tool copilot';
+      const source = entry.bash.match(/--copilot-global ([^ "]+)/)?.[1];
+      expect(source).toBeDefined();
+      const dispatch = `teamai hook-dispatch session-start --tool copilot --copilot-global ${source}`;
       expect(entry.bash).toBe(`"${bashExe}" -lc "${dispatch} 2>/dev/null" || true`);
       expect(entry.powershell).toBe(`& "${bashExe}" -lc "${dispatch} 2>/dev/null"; exit 0`);
       expect(entry.command).toBe(entry.bash);

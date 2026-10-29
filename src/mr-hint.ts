@@ -5,6 +5,7 @@ import path from 'node:path';
 import { getTGitToken, tgitFetch } from './providers/tgit/rest-auth.js';
 import { log } from './utils/logger.js';
 import { getUserHome } from './utils/home.js';
+import type { LocalConfig } from './types.js';
 
 // ─── MR Hint data flow ──────────────────────────────────
 //
@@ -363,25 +364,44 @@ async function listGitHubMergedMRs(
  * Build the additionalContext hint message for AI.
  *
  * @param mrs  New merged MRs that have not been imported yet
- * @returns    Bilingual hint string
+ * @returns    Hint string. English only when language is `en`; otherwise the historical bilingual text.
  */
-export function buildHintMessage(mrs: MRSummary[]): string {
+export function buildHintMessage(mrs: MRSummary[], language?: 'en' | 'zh'): string {
+  // One command for every MR: `--from-mr` takes several URLs, publishes the
+  // accepted learnings once and updates each repository's teamwiki once (#1104).
+  const command = `  teamai import --from-mr ${mrs.map((mr) => mr.url).join(' ')}`;
+  if (language === 'en') {
+    const lines = [
+      `[teamai:mr-hint] Found ${mrs.length} recently merged MR(s) not yet imported into the team knowledge base.`,
+      '',
+      'After this task, tell the user they can turn these MRs into learnings with:',
+      '',
+    ];
+    for (const mr of mrs) {
+      lines.push(`- ${mr.title} (merged: ${mr.mergedAt.slice(0, 10)})`);
+    }
+    lines.push('');
+    lines.push(command);
+    return lines.join('\n');
+  }
   const lines: string[] = [
     `[teamai:mr-hint] 发现 ${mrs.length} 个近期已合入但尚未提炼的 MR。`,
     '',
-    '请在任务完成后告知用户，可运行以下命令将 MR 提炼为 learning 并更新 codebase.md：',
+    '请在任务完成后告知用户，可运行以下命令将这些 MR 提炼为 learning：',
     '',
   ];
 
   for (const mr of mrs) {
     const date = mr.mergedAt.slice(0, 10);
     lines.push(`- ${mr.title}（merged: ${date}）`);
-    lines.push(`  teamai import --from-mr ${mr.url}`);
   }
 
   lines.push('');
+  lines.push(command);
+
+  lines.push('');
   lines.push('[teamai:mr-hint] Found merged MR(s) not yet imported into team knowledge base.');
-  lines.push('Please remind the user to run `teamai import --from-mr <url>` when convenient.');
+  lines.push('Please remind the user to run `teamai import --from-mr <url...>` when convenient.');
 
   return lines.join('\n');
 }
@@ -396,19 +416,47 @@ export function buildHintMessage(mrs: MRSummary[]): string {
  * an additionalContext hint when unimported MRs are found.
  *
  * Behavior:
- * - Silently exits when TEAMAI_MR_HINT_DISABLED=1.
+ * - Silently exits when TEAMAI_MR_HINT_DISABLED=1, or when the scope's
+ *   `mrHint` switch resolves to off.
  * - Silently exits when CWD is not a git repo or remote is unrecognized.
  * - Silently exits when API/CLI calls fail (best-effort, non-blocking).
  * - Per-repo cache prevents re-hinting the same MR across sessions.
  */
 /**
+ * Whether the scope the caller resolved allows the hint.
+ *
+ * Resolved here, in the one path the SessionStart hook and the legacy
+ * `teamai mr-hint` entry point share, so the two cannot disagree about it.
+ * A null scope means teamai is not set up for this directory: there is no
+ * config to read a switch from, and the hint has always been on there.
+ */
+async function mrHintAllowed(localConfig?: LocalConfig | null): Promise<boolean> {
+  if (!localConfig) return true;
+  const { loadTeamConfig } = await import('./config.js');
+  const { isMrHintEnabled } = await import('./types.js');
+  let teamConfig: Awaited<ReturnType<typeof loadTeamConfig>> = null;
+  try {
+    teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+  } catch {
+    // An unreadable teamai.yaml is not an instruction to stop; a team with no
+    // opinion leaves the hint on, which is what isMrHintEnabled defaults to.
+  }
+  return isMrHintEnabled(localConfig, teamConfig ?? {});
+}
+
+/**
  * Core MR-hint computation: detect repo, query merged MRs, update cache, and
  * build the SessionStart hookSpecificOutput JSON. Returns null when there is
- * nothing to hint. Does NOT read STDIN — safe to call from the hook dispatcher
- * (which has already consumed STDIN) as well as from the standalone command.
+ * nothing to hint, or when the scope's switch turns it off. Does NOT read STDIN
+ * — safe to call from the hook dispatcher (which has already consumed STDIN) as
+ * well as from the standalone command.
  */
-export async function computeMrHintOutput(): Promise<string | null> {
+export async function computeMrHintOutput(
+  language?: 'en' | 'zh',
+  localConfig?: LocalConfig | null,
+): Promise<string | null> {
   if (process.env.TEAMAI_MR_HINT_DISABLED === '1') return null;
+  if (!(await mrHintAllowed(localConfig))) return null;
 
   // Detect git remote
   const rawCwd = process.env.TEAMAI_MR_HINT_CWD ?? process.cwd();
@@ -462,7 +510,7 @@ export async function computeMrHintOutput(): Promise<string | null> {
   saveCache(owner, repo, { hintedMrIds: updatedIds, updatedAt: new Date().toISOString() });
 
   // Build additionalContext hint
-  const hintText = buildHintMessage(newMrs);
+  const hintText = buildHintMessage(newMrs, language);
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
@@ -471,19 +519,46 @@ export async function computeMrHintOutput(): Promise<string | null> {
   });
 }
 
-export async function mrHint(): Promise<void> {
+export async function mrHint(tool?: string): Promise<void> {
   // Drain STDIN when piped (hook invocation) so the caller doesn't block.
-  // Session metadata is not yet used by the hint logic.
+  // The payload's cwd selects the scope whose teamai.yaml `language` applies.
+  let payload: Record<string, unknown> = {};
   if (!process.stdin.isTTY) {
     try {
-      for await (const _chunk of process.stdin) {
-        void _chunk;
+      const chunks: Buffer[] = [];
+      for await (const chunk of process.stdin) {
+        chunks.push(chunk as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf-8').trim();
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            payload = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // non-critical: an unparseable payload still drains
+        }
       }
     } catch {
       // non-critical
     }
   }
 
-  const output = await computeMrHintOutput();
+  // One scope resolution feeds both the language and the switch, so this entry
+  // point reads exactly the config the SessionStart hook reads.
+  let language: 'en' | 'zh' | undefined;
+  let hookConfig: LocalConfig | null = null;
+  try {
+    const { resolveHookConfig } = await import('./dashboard-collector.js');
+    const { loadTeamAgentLanguage } = await import('./config.js');
+    hookConfig = await resolveHookConfig(payload, tool ?? 'claude');
+    language = await loadTeamAgentLanguage(hookConfig);
+  } catch {
+    // An unreadable scope keeps the historical bilingual text. The hint stays
+    // on: mrHintAllowed treats a missing config as "no switch to read".
+  }
+
+  const output = await computeMrHintOutput(language, hookConfig);
   if (output) process.stdout.write(output + '\n');
 }

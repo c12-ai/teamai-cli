@@ -123,7 +123,8 @@ describe('a pull at an unchanged team revision after the rule formats change (#9
     await fse.remove(tmpDir);
   });
 
-  it('re-renders the unedited copy, records it, and overwrites the edited one', async () => {
+  // c12 fork: the team version wins, so the edited copy is re-rendered too, and named.
+  it('re-renders the unedited copy and the edited one, records both, and names the edit (c12 fork)', async () => {
     await pull({});
 
     const successes = vi.mocked(log.success).mock.calls.map(([message]) => String(message));
@@ -131,9 +132,10 @@ describe('a pull at an unchanged team revision after the rule formats change (#9
     expect(await fse.readFile(kiroCopy(), 'utf8')).toBe(KIRO);
     expect(await fse.readFile(qoderCopy(), 'utf8')).not.toContain('My own wording.');
     expect(delivered()[kiroCopy()]).toBe(sha256(KIRO));
-    // Overwritten and named, as a full sync names it.
+    expect(delivered()[qoderCopy()]).toBe(sha256(await fse.readFile(qoderCopy(), 'utf8')));
+    expect(successes).toContain('[user] Rewrote 1 rule(s) in their tool\'s own format: scoped');
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${qoderCopy()} with the team version`))).toHaveLength(1);
+    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${qoderCopy()}`))).toHaveLength(1);
   });
 });
 
@@ -382,25 +384,27 @@ describe('a pull at an unchanged team revision after JoyCode gets its own render
     await fse.remove(tmpDir);
   });
 
-  it('re-renders the unedited copy for JoyCode, and overwrites and names the edited one', async () => {
+  // c12 fork: the edited copy takes the JoyCode render as well, named once.
+  it('re-renders the unedited and the edited copy for JoyCode, and names the edit (c12 fork)', async () => {
     await pull({});
 
     const successes = vi.mocked(log.success).mock.calls.map(([message]) => String(message));
     expect(successes.some((message) => message.includes('Already synced at abc1234'))).toBe(true);
     expect(await fse.readFile(copy('scoped'), 'utf8')).toBe(JOYCODE);
     expect(delivered()[copy('scoped')]).toBe(sha256(JOYCODE));
-    expect(await fse.readFile(copy('edited'), 'utf8')).toBe(JOYCODE);
+    expect(await fse.readFile(copy('edited'), 'utf8')).not.toContain('My own wording.');
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${copy('edited')} with the team version`))).toHaveLength(1);
+    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${copy('edited')}`))).toHaveLength(1);
+    expect(warnings.some((message) => message.includes('JoyCode never matches'))).toBe(false);
     expect(warnings.some((message) => message.includes(copy('scoped')))).toBe(false);
   });
 
-  it('overwrites the edited copy on a full sync too', async () => {
+  it('replaces the edited copy on a full sync too (c12 fork)', async () => {
     await pull({ force: true });
 
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
-    expect(await fse.readFile(copy('edited'), 'utf8')).toBe(JOYCODE);
-    expect(warnings.filter((message) => message.includes(`Overwrote local edits in ${copy('edited')} with the team version`))).toHaveLength(1);
+    expect(await fse.readFile(copy('edited'), 'utf8')).not.toContain('My own wording.');
+    expect(warnings.some((message) => message.includes('JoyCode never matches'))).toBe(false);
   });
 });
 
@@ -509,6 +513,12 @@ describe('a rules sync that delivers no rule reclaims an older-format copy (#946
     const edited = path.join(homeDir, '.kiro', 'steering', 'other.md');
     await fse.outputFile(old, SCOPED);
     await fse.outputFile(edited, 'Other rule, my way.\n');
+    // A link of the member's is theirs even when its target holds the copy teamai wrote (#993).
+    await fse.outputFile(path.join(repoPath, 'rules', 'linked.md'), 'Linked rule.\n');
+    const linkTarget = path.join(tmpDir, 'mine', 'linked.md');
+    await fse.outputFile(linkTarget, 'Linked rule.\n');
+    const link = path.join(homeDir, '.kiro', 'steering', 'linked.md');
+    await fse.symlink(linkTarget, link);
     vi.stubEnv('HOME', homeDir);
     const { RulesHandler } = await import('../resources/rules.js');
     const localConfig = {
@@ -526,6 +536,8 @@ describe('a rules sync that delivers no rule reclaims an older-format copy (#946
 
     expect(await fse.pathExists(old)).toBe(false);
     expect(await fse.readFile(edited, 'utf8')).toBe('Other rule, my way.\n');
+    expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(linkTarget, 'utf8')).toBe('Linked rule.\n');
   });
 });
 

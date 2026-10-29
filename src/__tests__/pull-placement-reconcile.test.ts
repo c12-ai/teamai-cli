@@ -16,6 +16,9 @@ vi.mock('../config.js', () => ({
   detectProjectConfig: vi.fn().mockResolvedValue(null),
   loadStateForScope: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   saveStateForScope: vi.fn(),
+  // Pull re-resolves the role assignment once the team repo has moved (#1186);
+  // this suite's configs carry none, so it hands the config straight back.
+  refreshRoleAssignment: vi.fn(async () => {}),
 }));
 
 vi.mock('../utils/git.js', () => ({
@@ -48,6 +51,8 @@ vi.mock('../source.js', () => ({ pullSources: vi.fn().mockResolvedValue(undefine
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
   reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
+  deliveredHookFiles: vi.fn().mockResolvedValue([]),
+  unreadableHookFiles: vi.fn().mockResolvedValue([]),
 }));
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),

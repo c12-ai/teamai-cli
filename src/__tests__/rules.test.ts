@@ -13,7 +13,9 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadStateForScope: vi.fn(async () => ({})),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // The history proof of an unrecorded copy reads the team repo (#993).
+  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
   pullRepo: vi.fn(),
   listFilesAtRev: vi.fn(async () => []),
   pushRepoBranch: vi.fn().mockResolvedValue(true),
@@ -36,22 +38,10 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { RulesHandler, inlinedRulesText } from '../resources/rules.js';
+import { RulesHandler, inlinedRulesText, isLegacyLayoutCopy } from '../resources/rules.js';
 import { loadStateForScope } from '../config.js';
-import { listFilesRecursive } from '../utils/fs.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { openLedger, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
-
-/**
- * A ledger recording every file now under `dirs` as delivered by teamai: the
- * stale sweep removes only copies on that record (c12 fork).
- */
-async function ledgerDelivering(...dirs: string[]) {
-  const previous: DeliveredHashes = {};
-  for (const dir of dirs) {
-    for (const file of await listFilesRecursive(dir)) await recordDelivered(previous, path.join(dir, file));
-  }
-  return openLedger(previous);
-}
 import type { TeamaiConfig, LocalConfig, State } from '../types.js';
 
 describe('RulesHandler.scanLocalForPush — modified rule detection', () => {
@@ -609,6 +599,18 @@ scope: 'user',
     await fse.remove(tmpDir);
   });
 
+  /**
+   * Rules the team repo held at an earlier revision, when teamai delivered
+   * the copies a test lays down: with no record of them, the team repo's
+   * history is what proves them teamai's (#993).
+   */
+  async function earlierTeamRules(files: Record<string, string>): Promise<void> {
+    const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    for (const [rel, content] of Object.entries(files)) await fse.outputFile(path.join(teamRulesDir, rel), content);
+    commitTeamRepo(localConfig.repo.localPath, 'earlier');
+    for (const rel of Object.keys(files)) await fse.remove(path.join(teamRulesDir, rel));
+  }
+
   describe('when no team rule is selected for this directory (#802)', () => {
     it('reclaims unmodified delivered copies and keeps personal and edited rules', async () => {
       // The team repo still has these rules; none reaches this directory any more
@@ -659,7 +661,8 @@ scope: 'user',
       expect(await fse.readFile(personal, 'utf-8')).toBe('# Mine\n');
     });
 
-    it('drops a reclaimed copy from the delivered record and keeps the record of an edited one (#822)', async () => {
+    // c12 fork: a copy the team no longer delivers goes even when edited, record and all.
+    it('drops a reclaimed copy and an edited one, and their records (#822, c12 fork)', async () => {
       const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
       await fse.ensureDir(path.join(teamRulesDir, 'alpha'));
       await fse.writeFile(path.join(teamRulesDir, 'alpha/alpha-rule.md'), '# Alpha rule\n');
@@ -678,7 +681,8 @@ scope: 'user',
       await handler.pullAllRules(teamConfig, localConfig, [], [], ledger);
 
       expect(await fse.pathExists(reclaimed)).toBe(false);
-      expect(Object.keys(ledger.hashes)).toEqual([edited]);
+      expect(await fse.pathExists(edited)).toBe(false);
+      expect(Object.keys(ledger.hashes)).toEqual([]);
     });
 
     it('removes a namespace directory it empties', async () => {
@@ -715,6 +719,7 @@ scope: 'user',
 
   it('should remove local rule files that no longer exist in team repo', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'tencent_standard.md': 'old standard content', 'coding-style.md': 'stale content', 'hooks.md': 'stale content' });
 
     // Team repo only has tencent_standard.md
     await fse.writeFile(path.join(teamRulesDir, 'tencent_standard.md'), 'standard content');
@@ -725,7 +730,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'coding-style.md'), 'stale content');
     await fse.writeFile(path.join(localRulesDir, 'hooks.md'), 'stale content');
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     // tencent_standard.md should be updated
     expect(await fse.pathExists(path.join(localRulesDir, 'tencent_standard.md'))).toBe(true);
@@ -774,10 +779,14 @@ scope: 'user',
    */
   it("delivers a rule this machine placed onto the author's root copy, not beside it", async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    // An earlier pull delivered the team's first version beside the root copy: teamai's by the history (#993).
+    await fse.outputFile(path.join(teamRulesDir, 'fe-know/my-rule.md'), 'first team content');
+    commitTeamRepo(localConfig.repo.localPath, 'v1');
     await fse.outputFile(path.join(teamRulesDir, 'fe-know/my-rule.md'), 'team content');
+    commitTeamRepo(localConfig.repo.localPath, 'v2');
     const localRulesDir = path.join(homeDir, '.claude/rules');
     await fse.writeFile(path.join(localRulesDir, 'my-rule.md'), 'stale root copy');
-    await fse.outputFile(path.join(localRulesDir, 'fe-know/my-rule.md'), 'duplicate from an earlier pull');
+    await fse.outputFile(path.join(localRulesDir, 'fe-know/my-rule.md'), 'first team content');
     vi.mocked(loadStateForScope).mockResolvedValue({
       lastPush: null, lastPull: null, lastPullRev: null, pushedRules: [], pushedSkills: [],
       pushedEnvVars: [], pendingPushes: [], lastUpdateCheck: null, availableUpdate: null,
@@ -887,6 +896,7 @@ scope: 'user',
 
   it('still sweeps a root rule whose record points at a file that is gone', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'my-rule.md': 'orphaned' });
     await fse.writeFile(path.join(teamRulesDir, 'other.md'), 'other');
     const localRulesDir = path.join(homeDir, '.claude/rules');
     await fse.writeFile(path.join(localRulesDir, 'my-rule.md'), 'orphaned');
@@ -896,13 +906,14 @@ scope: 'user',
       placedRules: { 'my-rule': 'rules/fe-know/my-rule.md' },
     } as State);
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localRulesDir, 'my-rule.md'))).toBe(false);
   });
 
   it('should remove stale files in subdirectories', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'python/tencent_standard.md': 'old', 'python/coding-style.md': 'stale', 'python/security.md': 'stale' });
 
     // Team repo has python/tencent_standard.md only
     await fse.ensureDir(path.join(teamRulesDir, 'python'));
@@ -915,7 +926,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'python/coding-style.md'), 'stale');
     await fse.writeFile(path.join(localRulesDir, 'python/security.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localRulesDir, 'python/tencent_standard.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'python/coding-style.md'))).toBe(false);
@@ -924,6 +935,7 @@ scope: 'user',
 
   it('should remove empty subdirectories after cleaning stale files', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'common/agents.md': 'old agents', 'python/old-rule.md': 'stale' });
 
     // Team repo has only common/agents.md
     await fse.ensureDir(path.join(teamRulesDir, 'common'));
@@ -936,7 +948,7 @@ scope: 'user',
     await fse.ensureDir(path.join(localRulesDir, 'python'));
     await fse.writeFile(path.join(localRulesDir, 'python/old-rule.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localRulesDir, 'common/agents.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'python/old-rule.md'))).toBe(false);
@@ -955,6 +967,7 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.claude-internal', 'CLAUDE.md'), '');
 
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'keep.md': 'old', 'stale.md': 'stale' });
     await fse.writeFile(path.join(teamRulesDir, 'keep.md'), 'keep this');
 
     // Both tool dirs have stale files
@@ -963,8 +976,7 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.claude-internal/rules', 'keep.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.claude-internal/rules', 'stale.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [],
-      await ledgerDelivering(path.join(homeDir, '.claude/rules'), path.join(homeDir, '.claude-internal/rules')));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     // Both tool dirs should have stale.md removed
     expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'stale.md'))).toBe(false);
@@ -991,6 +1003,7 @@ scope: 'user',
 
   it('should not remove built-in rules (teamai-recall) during stale cleanup', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await earlierTeamRules({ 'team-rule.md': 'old', 'old-user-rule.md': 'stale' });
     await fse.writeFile(path.join(teamRulesDir, 'team-rule.md'), 'team content');
 
     const localRulesDir = path.join(homeDir, '.claude/rules');
@@ -998,7 +1011,7 @@ scope: 'user',
     await fse.writeFile(path.join(localRulesDir, 'teamai-recall.md'), 'recall rule content');
     await fse.writeFile(path.join(localRulesDir, 'old-user-rule.md'), 'stale');
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(localRulesDir));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localRulesDir, 'team-rule.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'teamai-recall.md'))).toBe(true);
@@ -1024,6 +1037,53 @@ scope: 'user',
     await fse.writeFile(context, 'RESERVED-RULE, edited by the member');
     await handler.pullAllRules(teamConfig, localConfig);
     expect(await fse.readFile(context, 'utf8')).toBe('RESERVED-RULE, edited by the member');
+  });
+
+  it('keeps a member\'s link named teamai-context in a rules directory, even when its target holds the delivered copy (#993)', async () => {
+    const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
+    await fse.writeFile(path.join(teamRulesDir, 'teamai-context.md'), 'RESERVED-RULE');
+    const context = path.join(homeDir, '.claude/rules', 'teamai-context.md');
+    const target = path.join(tmpDir, 'mine.md');
+    await fse.writeFile(target, 'RESERVED-RULE');
+    await fse.symlink(target, context);
+
+    await handler.pullAllRules(teamConfig, localConfig);
+
+    expect((await fse.lstat(context)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(target, 'utf8')).toBe('RESERVED-RULE');
+  });
+
+  it('never writes through a member\'s link at a rule path when installed without a delivery record (#993)', async () => {
+    await fse.writeFile(path.join(localConfig.repo.localPath, 'rules', 'team-rule.md'), 'team content');
+    const link = path.join(homeDir, '.claude/rules', 'team-rule.md');
+    const target = path.join(tmpDir, 'mine.md');
+    await fse.writeFile(target, 'mine');
+    await fse.symlink(target, link);
+
+    await handler.pullAllRules(teamConfig, localConfig);
+
+    expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(target, 'utf8')).toBe('mine');
+  });
+
+  it('never counts a member\'s link as a copy an older layout wrote, on record or with a built-in rule\'s name (#993)', async () => {
+    const target = path.join(tmpDir, 'mine.md');
+    await fse.writeFile(target, 'mine');
+    const link = path.join(homeDir, '.cursor', 'rules', 'teamai-recall.md');
+    await fse.ensureDir(path.dirname(link));
+    await fse.symlink(target, link);
+
+    expect(await isLegacyLayoutCopy(link, 'rules/teamai-recall.md', undefined, localConfig.repo.localPath)).toBe(false);
+    expect(await isLegacyLayoutCopy(link, 'rules/team-rule.md', { [link]: 'recorded' }, localConfig.repo.localPath)).toBe(false);
+  });
+});
+
+describe('OpenCode rules activation does not ask locate for mcp', () => {
+  it('rules.ts does not call locate with resource mcp', async () => {
+    const source = await fse.readFile(new URL('../resources/rules.ts', import.meta.url), 'utf8');
+    const resources = [...source.matchAll(/\blocate\s*\(\s*[^,]+,\s*(['"])([^'"]+)\1/g)].map((match) => match[2]);
+    expect(resources).toContain('rules');
+    expect(resources).not.toContain('mcp');
   });
 });
 
@@ -1168,6 +1228,19 @@ describe('RulesHandler.pullAllRules — OpenCode instructions activation', () =>
     expect(doc.instructions ?? []).not.toContain(`${ocRules()}/*.md`);
   });
 
+  it('follows $XDG_CONFIG_HOME: the rules and their glob go to the opencode dir there (#1221)', async () => {
+    const xdgOpencode = path.join(tmpDir, 'xdg', 'opencode');
+    await fse.ensureDir(xdgOpencode);
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(tmpDir, 'xdg'));
+    await fse.writeFile(path.join(localConfig.repo.localPath, 'rules', 'team-rule.md'), 'team content');
+
+    await handler.pullAllRules(teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(xdgOpencode, 'rules', 'team-rule.md'))).toBe(true);
+    expect((await fse.readJson(path.join(xdgOpencode, 'opencode.json'))).instructions).toEqual([`${path.join(xdgOpencode, 'rules')}/*.md`]);
+    expect(await fse.pathExists(ocRules())).toBe(false);
+  });
+
   it('does not create opencode.json when OpenCode is not installed', async () => {
     // Remove the install marker.
     await fse.remove(path.join(homeDir, '.config', 'opencode'));
@@ -1227,6 +1300,31 @@ describe('RulesHandler.pullAllRules — OpenCode instructions activation', () =>
       await handler.pullAllRules(teamConfig, projectConfig, []);
 
       expect((await fse.readJson(dotConfig())).instructions).toBeUndefined();
+    });
+
+    it('names the project opencode.json as retired.configFile under the default MCP path', async () => {
+      const target = await handler.opencodeInstructionsTarget(teamConfig, projectConfig, []);
+      expect(target?.retired?.configFile).toBe(path.join(projectRoot, 'opencode.json'));
+    });
+
+    it('leaves retired null when the project MCP place is absent', async () => {
+      const target = await handler.opencodeInstructionsTarget({
+        ...teamConfig,
+        toolPaths: {
+          opencode: {
+            skills: '.opencode/skills',
+            rules: '.opencode/rules',
+            agents: '.opencode/agents',
+            mcp: '.config/opencode/opencode.json',
+            userScope: {
+              skills: '.config/opencode/skills',
+              rules: '.config/opencode/rules',
+              agents: '.config/opencode/agents',
+            },
+          },
+        },
+      }, projectConfig, []);
+      expect(target?.retired).toBeNull();
     });
   });
 });
@@ -1492,6 +1590,8 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'legacy.md'), 'Legacy rule body.');
     // Simulate the pre-.mdc layout.
     await fse.writeFile(path.join(homeDir, '.cursor/rules/legacy.md'), 'Legacy rule body.');
+    // The copy is the team rule verbatim: the team history proves it teamai's (#993).
+    commitTeamRepo(repoPath);
 
     await handler.pullAllRules(teamConfig, localConfig);
 
@@ -1505,6 +1605,7 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
     // Re-create the legacy copy to prove `remove` sweeps both extensions.
     await fse.writeFile(path.join(homeDir, '.cursor/rules/both.md'), 'bye');
 
+    commitTeamRepo(repoPath);
     await handler.removeItem('both', teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/both.mdc'))).toBe(false);
@@ -1513,7 +1614,11 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
 
   it('sweeps a legacy .md whose rule the team has since deleted', async () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'team.md'), 'Team rule.');
-    // `dropped` is no longer in the team repo, but its pre-.mdc copy lingers.
+    // `dropped` is no longer in the team repo, but its pre-.mdc copy lingers:
+    // the team history still has it (#993).
+    await fse.writeFile(path.join(repoPath, 'rules', 'dropped.md'), 'gone upstream');
+    commitTeamRepo(repoPath, 'dropped');
+    await fse.remove(path.join(repoPath, 'rules', 'dropped.md'));
     await fse.writeFile(path.join(homeDir, '.cursor/rules/dropped.md'), 'gone upstream');
 
     await handler.pullAllRules(teamConfig, localConfig);
@@ -1536,14 +1641,18 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
   });
 
   it('stale cleanup removes an orphaned cursor .mdc not in team repo', async () => {
-    // Team has one rule; cursor dir has an extra orphan .mdc.
+    // Team has one rule; cursor dir has an extra orphan .mdc, delivered when
+    // the team repo still had that rule (#993: its history proves it teamai's).
+    await fse.writeFile(path.join(repoPath, 'rules', 'orphan.md'), 'orphan');
+    commitTeamRepo(repoPath, 'earlier');
+    await fse.remove(path.join(repoPath, 'rules', 'orphan.md'));
     await fse.writeFile(path.join(repoPath, 'rules', 'keep.md'), 'keep me');
     await fse.writeFile(
       path.join(homeDir, '.cursor/rules/orphan.mdc'),
-      '---\nalwaysApply: true\n---\n\norphan',
+      '---\nalwaysApply: true\n---\n\norphan\n',
     );
 
-    await handler.pullAllRules(teamConfig, localConfig, undefined, [], await ledgerDelivering(path.join(homeDir, '.cursor/rules')));
+    await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/orphan.mdc'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/keep.mdc'))).toBe(true);
@@ -1554,8 +1663,23 @@ describe('RulesHandler — .mdc handling (Cursor, JoyCode)', () => {
     await handler.pullAllRules(teamConfig, localConfig);
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/gone.mdc'))).toBe(true);
 
+    commitTeamRepo(repoPath);
     await handler.removeItem('gone', teamConfig, localConfig);
     expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/gone.mdc'))).toBe(false);
+  });
+
+  it('removeItem deletes a copy holding what pull writes today, with no record or team history', async () => {
+    // A team checkout without history: today's render is the only proof.
+    await fse.writeFile(path.join(repoPath, 'rules', 'fresh.md'), 'bye');
+    await handler.pullAllRules(teamConfig, localConfig);
+    await fse.writeFile(path.join(homeDir, '.cursor/rules/fresh.md'), 'bye');
+    await fse.writeFile(path.join(homeDir, '.claude/rules/fresh.md'), 'my own notes');
+
+    await handler.removeItem('fresh', teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/fresh.mdc'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/fresh.md'))).toBe(false);
+    expect(await fse.readFile(path.join(homeDir, '.claude/rules/fresh.md'), 'utf-8')).toBe('my own notes');
   });
 });
 
@@ -1686,7 +1810,8 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     expect(Object.keys(ledger.hashes).filter((file) => file.endsWith('former.md'))).toEqual([]);
   });
 
-  it('re-renders a verbatim copy an older teamai delivered, and overwrites one the member edited (#822)', async () => {
+  // c12 fork: the edited copy takes the team version too, and is named as replaced.
+  it('re-renders a verbatim copy an older teamai delivered, and the one the member edited (#822, c12 fork)', async () => {
     const kiroCopy = path.join(homeDir, '.kiro/steering/scoped.md');
     const qoderCopy = path.join(homeDir, '.qoder/rules/scoped.md');
     await fse.writeFile(kiroCopy, SCOPED);
@@ -1701,8 +1826,8 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     await handler.pullAllRules(teamConfig, localConfig, undefined, [], ledger);
 
     expect(await fse.readFile(kiroCopy, 'utf-8')).toBe(KIRO);
-    expect(await fse.readFile(qoderCopy, 'utf-8')).not.toBe(edited);
-    expect(ledger.replaced.map((replaced) => replaced.dest)).toEqual([qoderCopy]);
+    expect(await fse.readFile(qoderCopy, 'utf-8')).not.toContain('My own wording.');
+    expect(ledger.replaced.map((entry) => [entry.dest, entry.replaces])).toEqual([[qoderCopy, 'edited']]);
   });
 });
 

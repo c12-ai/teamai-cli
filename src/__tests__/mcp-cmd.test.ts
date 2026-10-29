@@ -14,9 +14,13 @@ vi.mock('../mcp-reconcile.js', async (importOriginal) => {
   return {
     desiredMcpForTarget: actual.desiredMcpForTarget,
     mcpTargetExcluded: actual.mcpTargetExcluded,
+    mcpManifestKey: actual.mcpManifestKey,
+    describeMcpLocation: actual.describeMcpLocation,
+    readMcpManifest: actual.readMcpManifest,
     reconcileMcpForConfig: vi.fn(),
     releaseCleanMcpGitExcludes: vi.fn(),
     resolveMcpTargets: vi.fn().mockResolvedValue([]),
+    shadowedMcpRecords: vi.fn().mockResolvedValue(new Map()),
     buildDesiredMcpContext: vi.fn().mockResolvedValue({
       sharing: { autoApply: true, allowedCommands: [], allowedHosts: [] },
       excluded: new Set(),
@@ -31,6 +35,7 @@ vi.mock('../mcp-git-exclude.js', async (importOriginal) => ({
 }));
 vi.mock('../utils/fs.js', () => ({
   readJson: vi.fn().mockResolvedValue(null),
+  expandHome: (p: string) => p,
   // No teamai env.sh on this machine (member-env.ts, via the env advisories).
   readFileSafe: vi.fn().mockResolvedValue(null),
 }));
@@ -295,5 +300,43 @@ describe('mcpRemove', () => {
     expect(releaseCleanMcpGitExcludes).not.toHaveBeenCalled();
     expect(output.join('\n')).toContain('MCP remove (dry run):');
     expect(output.join('\n')).toContain('removed');
+  });
+});
+
+describe('MCP commands with unreadable tool configs', () => {
+  it.each([
+    { command: 'inject', run: mcpInject, success: 'MCP servers updated. Restart your AI tool session to load them.', unchanged: 'Already up to date.' },
+    { command: 'remove', run: mcpRemove, success: 'teamai-managed MCP servers removed.', unchanged: 'Nothing to remove.' },
+  ])('$command fails for both an unchanged and a partially written result, including dry runs', async ({ command, run, success, unchanged }) => {
+    const { log } = await import('../utils/logger.js');
+    mockedAutoDetectInit.mockResolvedValue({
+      localConfig: { repo: { localPath: '/repo' }, scope: 'user', additionalRoles: [] },
+      teamConfig: { toolPaths: {} },
+    });
+    for (const dryRun of [false, true]) {
+      for (const wrote of [false, true]) {
+        process.exitCode = undefined;
+        vi.mocked(log.success).mockClear();
+        vi.mocked(log.info).mockClear();
+        vi.mocked(log.error).mockClear();
+        vi.mocked(reconcileMcpForConfig).mockResolvedValueOnce({
+          changes: [{ tool: 'cursor', server: 'team-mcp', action: command === 'inject' ? 'updated' : 'removed' }],
+          wrote, unparsed: true,
+        });
+        const output: string[] = [];
+        const spy = vi.spyOn(console, 'log').mockImplementation((line?: unknown) => { output.push(String(line)); });
+        try {
+          await run({ dryRun });
+          expect(process.exitCode).toBe(1);
+          expect(log.error).toHaveBeenCalledWith(expect.stringContaining(`teamai mcp ${command}`));
+          expect(log.success).not.toHaveBeenCalledWith(success);
+          expect(log.info).not.toHaveBeenCalledWith(unchanged);
+          expect(output.join('\n')).toContain('cursor/team-mcp');
+        } finally {
+          spy.mockRestore();
+          process.exitCode = undefined;
+        }
+      }
+    }
   });
 });

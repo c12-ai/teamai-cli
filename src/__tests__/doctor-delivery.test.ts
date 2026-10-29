@@ -15,12 +15,25 @@ vi.mock('../utils/logger.js', () => ({
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
   setStderrOnly: vi.fn(),
+  isSilent: () => false,
+  setSilent: vi.fn(),
 }));
 
+vi.mock('../resources/desired.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../resources/desired.js')>();
+  return { ...actual, resolveDesiredSkills: vi.fn(actual.resolveDesiredSkills) };
+});
+
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
+import { resolveDesiredSkills } from '../resources/desired.js';
 import { log } from '../utils/logger.js';
-import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
+import { buildChecks, doctor, resolveDoctorContext, type Check, type DoctorReport } from '../doctor.js';
+import { checkoutKey } from '../pull.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { saveToolHomes, toolHomesPath } from '../tool-home.js';
+import { packagedSkillRoots } from '../skill-content.js';
 
 /**
  * The delivery check: what `pull` said it synced, against what an agent can
@@ -104,6 +117,23 @@ describe('doctor — skills delivered on disk', () => {
 
     expect(await check.check()).toBe(true);
     expect(check.source).toBe('local');
+  });
+
+  it('fails when a file blocks a tool skills directory instead of silently skipping its delivery', async () => {
+    teamConfig.toolPaths = { hermes: { skills: '.hermes/skills' } };
+    localConfig.enabledAgents = ['hermes'];
+    await fse.ensureDir(path.join(homeDir, '.hermes'));
+    const blocked = path.join(homeDir, '.hermes', 'skills');
+    await fse.writeFile(blocked, 'member file');
+    const ctx = await resolveDoctorContext();
+    if (!ctx) throw new Error('expected a resolved doctor context');
+    const checks = await buildChecks(ctx);
+    const check = checks.find((c) => c.name === 'hermes skills directory is usable');
+    expect(check).toBeDefined();
+    expect(await check!.check()).toBe(false);
+    expect(check!.fix).toContain(blocked);
+    expect(check!.fix).toContain('Move the file aside');
+    expect(await fse.readFile(blocked, 'utf8')).toBe('member file');
   });
 
   it('fails and names the skill the tool never received', async () => {
@@ -318,10 +348,10 @@ describe('doctor — skills delivered on disk', () => {
       await deliver(CLAUDE_SKILLS, 'alpha');
       const beta = path.join(homeDir, ...CLAUDE_SKILLS, 'beta');
       await fse.ensureDir(beta);
-      await fse.writeFile(
-        path.join(beta, 'SKILL.md'),
-        '---\nname: beta\ndescription: d\nallowed-tools: [Read]\nversion: 2\n---\n',
-      );
+      const skillMd = '---\nname: beta\ndescription: d\nallowed-tools: [Read]\nversion: 2\n---\n';
+      // As pull delivered it: the team's SKILL.md (a copy that is not one is the member's, #993).
+      await fse.writeFile(path.join(repoPath, 'skills', 'beta', 'SKILL.md'), skillMd);
+      await fse.writeFile(path.join(beta, 'SKILL.md'), skillMd);
 
       expect(await (await deliveryCheck()).check()).toBe(true);
     });
@@ -426,33 +456,63 @@ describe('doctor — skills delivered on disk', () => {
       localConfig.projects = ['alpha'];
       await writeTeamDoc('beta', 'billing.md');
       await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'billing.md'), '# my notes\n');
+      // The history proves which local files a pull may prune (#993).
+      commitTeamRepo(repoPath);
 
-      expect(await (await docsCheck())!.check()).toBe(true);
+      // No check at all is as good as a passing one: nothing is reported (#993).
+      expect(await (await docsCheck())?.check() ?? true).toBe(true);
 
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'retired.md'), '# gone upstream\n');
+      // A copy of a doc the team has since removed is stale; a file of the member's would not be (#993).
+      await writeTeamDoc('beta', 'retired.md');
+      commitTeamRepo(repoPath, 'retired');
+      await fse.remove(path.join(repoPath, 'docs', 'beta', 'retired.md'));
+      commitTeamRepo(repoPath, 'remove retired');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'retired.md'), '# doc\n');
       const check = await docsCheck();
       expect(await check!.check()).toBe(false);
       expect(check!.fix).toContain('beta/retired.md');
       expect(check!.fix).not.toContain('billing.md');
     });
 
+    it('does not report as stale a directory of the member\'s that pull keeps where the team deleted a doc file (#993)', async () => {
+      await writeTeamDoc('guide');
+      commitTeamRepo(repoPath, 'add guide');
+      await fse.remove(path.join(repoPath, 'docs', 'guide'));
+      await writeTeamDoc('other.md');
+      commitTeamRepo(repoPath, 'remove guide');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'other.md'), '# doc\n');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'guide', 'personal.md'), 'mine');
+      const check = await docsCheck();
+      expect(check?.fix ?? '').not.toContain('guide/personal.md');
+    });
+
     it('reports missing and stale docs together without changing local files', async () => {
+      // docs/old/retired.md was a team doc, so the local copy is stale once the team removed it (#993).
+      await writeTeamDoc('old', 'retired.md');
+      commitTeamRepo(repoPath, 'retired');
+      await fse.remove(path.join(repoPath, 'docs', 'old'));
       await writeTeamDoc('guide.md');
+      commitTeamRepo(repoPath, 'remove retired');
       const stale = path.join(homeDir, 'team-docs', 'old', 'retired.md');
-      await fse.outputFile(stale, 'stale');
+      await fse.outputFile(stale, '# doc\n');
       const check = await docsCheck();
       expect(await check!.check()).toBe(false);
       expect(check!.fix).toContain('Missing from');
       expect(check!.fix).toContain('guide.md');
       expect(check!.fix).toContain('Stale docs');
       expect(check!.fix).toContain('old/retired.md');
-      expect(await fse.readFile(stale, 'utf8')).toBe('stale');
+      expect(await fse.readFile(stale, 'utf8')).toBe('# doc\n');
     });
 
     it.each(['missing', 'empty', 'hidden-only'])('detects stale docs when the team bundle is %s', async (state) => {
+      // docs/old.md was a team doc, so the local copy is stale once the team removed it (#993).
+      await writeTeamDoc('old.md');
+      commitTeamRepo(repoPath, 'old');
+      await fse.remove(path.join(repoPath, 'docs'));
       if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));
       if (state === 'hidden-only') await writeTeamDoc('.keep');
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'old.md'), 'stale');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'old.md'), '# doc\n');
+      commitTeamRepo(repoPath, 'remove old');
       const check = await docsCheck();
       expect(await check!.check()).toBe(false);
       expect(check!.fix).toContain('Stale docs');
@@ -485,15 +545,18 @@ describe('doctor — skills delivered on disk', () => {
       expect(await docsCheck()).toBeUndefined();
     });
 
-    it('reports a stale directory link without traversing its target', async () => {
+    // Changed in #993 from reporting it as stale: pull keeps a member's link at a path the team never had.
+    it('does not call a member\'s directory link at a path the team never had stale, nor traverse its target (#993)', async () => {
       const outside = path.join(tempDir, 'outside');
       await fse.outputFile(path.join(outside, 'keep.md'), 'outside');
       await fse.ensureDir(path.join(homeDir, 'team-docs'));
       await fse.symlink(outside, path.join(homeDir, 'team-docs', 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+      // The history shows the team never had docs/linked (#993).
+      commitTeamRepo(repoPath);
       const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('linked');
-      expect(check!.fix).not.toContain('keep.md');
+      expect(await check?.check() ?? true).toBe(true);
+      expect(check?.fix ?? '').not.toContain('linked');
+      expect(check?.fix ?? '').not.toContain('keep.md');
       expect(await fse.readFile(path.join(outside, 'keep.md'), 'utf8')).toBe('outside');
     });
 
@@ -543,5 +606,224 @@ describe('doctor — skills delivered on disk', () => {
     await (await deliveryCheck()).check();
 
     expect(await fse.readdir(path.join(homeDir, ...CLAUDE_SKILLS))).toEqual(['alpha']);
+  });
+});
+
+describe('doctor — where a tool takes skills', () => {
+  let tempDir: string;
+  let homeDir: string;
+  let localConfig: LocalConfig;
+  let teamConfig: TeamaiConfig;
+
+  async function checks(): Promise<Check[]> {
+    const ctx = await resolveDoctorContext();
+    if (!ctx) throw new Error('expected a resolved doctor context');
+    return buildChecks(ctx);
+  }
+
+  async function failing(): Promise<Check[]> {
+    const out: Check[] = [];
+    for (const check of await checks()) if (!await check.check()) out.push(check);
+    return out;
+  }
+
+  async function report(): Promise<DoctorReport> {
+    const printed: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((line: unknown) => { printed.push(String(line)); });
+    try {
+      await doctor({ json: true });
+    } finally {
+      spy.mockRestore();
+    }
+    const json = printed.find((line) => line.trimStart().startsWith('{'));
+    if (json === undefined) throw new Error('doctor printed no JSON');
+    return JSON.parse(json) as DoctorReport;
+  }
+
+  beforeEach(async () => {
+    tempDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-dirs-doctor-'));
+    homeDir = path.join(tempDir, 'home');
+    const repoPath = path.join(tempDir, 'team-repo');
+    vi.stubEnv('HOME', homeDir);
+    await fse.outputFile(path.join(repoPath, 'skills', 'alpha', 'SKILL.md'), '---\nname: alpha\ndescription: d\n---\n');
+    localConfig = { repo: { localPath: repoPath, remote: 'owner/repo' }, username: 'tester', scope: 'user', additionalRoles: [] };
+    teamConfig = {
+      team: 'test', description: '', repo: 'owner/repo', provider: 'git', reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: false } },
+      toolPaths: { opencode: { skills: '.config/opencode/skills' } },
+    };
+    vi.mocked(loadLocalConfig).mockResolvedValue(localConfig);
+    vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    await fse.remove(tempDir);
+  });
+
+  it('fails when the last pull wrote a tool\'s skills elsewhere than it takes them now', async () => {
+    const xdg = path.join(tempDir, 'xdg');
+    await fse.ensureDir(path.join(xdg, 'opencode'));
+    vi.stubEnv('XDG_CONFIG_HOME', xdg);
+    const state = await loadStateForScope(localConfig);
+    const wrote = path.join(homeDir, '.config', 'opencode', 'skills');
+    await saveStateForScope({ ...state, lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'abc1234', targets: ['opencode'], skillDirs: { opencode: [wrote] } } } }, localConfig);
+
+    const [check, ...rest] = (await failing()).filter((c) => c.name.startsWith('opencode skills'));
+
+    expect(rest).toEqual([]);
+    expect(check?.fix).toBe(`opencode takes skills from ${path.join(xdg, 'opencode', 'skills')}, but the last pull wrote them to ${wrote}. Run \`teamai pull\` to sync them there.`);
+  });
+
+  it('names the member\'s file that holds a skill back where a tool takes skills now', async () => {
+    const xdg = path.join(tempDir, 'xdg');
+    const mine = path.join(xdg, 'opencode', 'skills', 'alpha');
+    await fse.outputFile(path.join(mine, 'SKILL.md'), '---\nname: alpha\ndescription: mine\n---\nMine.\n');
+    vi.stubEnv('XDG_CONFIG_HOME', xdg);
+    const state = await loadStateForScope(localConfig);
+    const wrote = path.join(homeDir, '.config', 'opencode', 'skills');
+    await saveStateForScope({ ...state, lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'abc1234', targets: ['opencode'], skillDirs: { opencode: [wrote, path.join(xdg, 'opencode', 'skills')] } } } }, localConfig);
+
+    const check = (await failing()).find((c) => c.name === 'opencode skills are where the last pull wrote them');
+
+    expect(check?.fix).toContain(`Kept ${mine}:`);
+    expect(check?.fix).not.toContain('Run `teamai pull` to sync them there.');
+  });
+
+  it('tells a Codex member to pull after its home moved, though the shared skills directory is still written', async () => {
+    const moved = path.join(homeDir, '.codex-alt');
+    await fse.ensureDir(path.join(homeDir, '.codex')); await fse.ensureDir(moved);
+    teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+    localConfig.toolRoots = { codex: moved };
+    const wrote = path.join(homeDir, '.codex', 'skills');
+    const state = await loadStateForScope(localConfig);
+    await saveStateForScope({ ...state, lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'abc1234', targets: ['codex'], skillDirs: { codex: [wrote, path.join(homeDir, '.agents', 'skills')] } } } }, localConfig);
+
+    const check = (await failing()).find((c) => c.name === 'codex skills are where the last pull wrote them');
+
+    expect(check?.fix).toBe(`codex takes skills from ${path.join(moved, 'skills')}, but the last pull wrote them to ${wrote}. Run \`teamai pull\` to sync them there.`);
+  });
+
+  describe('when the last pull kept the old copies of a move it could not finish', () => {
+    let xdg: string; let wrote: string; let now: string;
+    const moveFix = async (): Promise<string | undefined> => (await failing()).find((c) => c.name === 'opencode skills are where the last pull wrote them')?.fix;
+    beforeEach(async () => {
+      xdg = path.join(tempDir, 'xdg'); wrote = path.join(homeDir, '.config', 'opencode', 'skills'); now = path.join(xdg, 'opencode', 'skills');
+      await fse.outputFile(path.join(now, 'teamai', 'SKILL.md'), await fse.readFile(path.join(packagedSkillRoots().deployRoot, 'teamai', 'SKILL.md')));
+      vi.stubEnv('XDG_CONFIG_HOME', xdg);
+      const state = await loadStateForScope(localConfig);
+      await saveStateForScope({ ...state, lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'abc1234', targets: ['opencode'], skillDirs: { opencode: [wrote, now] } } } }, localConfig);
+    });
+
+    it('names the member\'s built-in skill file that holds the move back', async () => {
+      const stub = path.join(now, 'teamai', 'SKILL.md');
+      await fse.writeFile(stub, 'Instructions belonging to the member\n');
+
+      const fix = await moveFix();
+
+      expect(fix).toContain(`Kept ${stub}:`);
+      expect(fix).not.toContain('Run `teamai pull`');
+    });
+
+    it('says a workspace holds a skill back', async () => {
+      const { resolveDesiredSkills: actual } = await vi.importActual<typeof import('../resources/desired.js')>('../resources/desired.js');
+      vi.mocked(resolveDesiredSkills).mockImplementation(async (...args) => {
+        const desired = await actual(...args);
+        return desired.kind === 'resolved' ? { ...desired, items: [], held: ['alpha'] } : desired;
+      });
+
+      try {
+        expect(await moveFix()).toBe(`opencode takes skills from ${now}, but the last pull could not deliver every skill there, so it kept teamai's copies in ${wrote}. `
+          + 'This workspace holds back alpha: its members deliver different copies. Make the copies equal in the team repo, or rename one.');
+      } finally {
+        vi.mocked(resolveDesiredSkills).mockImplementation(actual);
+      }
+    });
+
+    it('says the built-in skill could not be deployed', async () => {
+      await fse.remove(path.join(now, 'teamai'));
+
+      expect(await moveFix()).toBe(`opencode takes skills from ${now}, but the last pull could not deliver every skill there, so it kept teamai's copies in ${wrote}. `
+        + 'The built-in teamai skill is not there: `teamai pull` says why it could not deploy it.');
+    });
+  });
+
+  it('fails when the shell moves a tool\'s home away from the one recorded, and passes when they agree', async () => {
+    const recorded = path.join(tempDir, 'recorded', 'opencode');
+    await saveToolHomes({ opencode: recorded });
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(tempDir, 'other'));
+
+    const mismatch = (await failing()).find((c) => c.name === 'opencode home matches XDG_CONFIG_HOME');
+
+    expect(mismatch?.fix).toBe(`XDG_CONFIG_HOME puts the opencode home at ${path.join(tempDir, 'other', 'opencode')}; this machine syncs opencode to ${recorded}. Re-run \`teamai init\` to record it.`);
+
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(tempDir, 'recorded'));
+
+    expect((await failing()).map((c) => c.name)).not.toContain('opencode home matches XDG_CONFIG_HOME');
+  });
+
+  it('fails when the home recorded for a tool is gone, whatever the shell says', async () => {
+    const recorded = path.join(tempDir, 'recorded', 'opencode');
+    await saveToolHomes({ opencode: recorded });
+
+    const gone = (await failing()).find((c) => c.name === 'opencode home exists');
+
+    expect(gone?.fix).toBe(`The opencode home recorded on this machine, ${recorded}, does not exist, so teamai skips opencode. `
+      + `Re-run \`teamai init\` from a shell that sets the home opencode uses, or remove "opencode" from ${toolHomesPath()}.`);
+
+    await fse.ensureDir(recorded);
+
+    expect((await failing()).map((c) => c.name)).not.toContain('opencode home exists');
+  });
+
+  it('fails when the tool-homes record is not one, since teamai then ignores it', async () => {
+    await fse.outputFile(toolHomesPath(), JSON.stringify({ opencode: 'relative/opencode' }));
+
+    const check = (await failing()).find((c) => c.name === 'tool homes record is readable');
+
+    expect(check?.fix).toBe(`${toolHomesPath()} is not a tool-homes record (opencode: must be an absolute directory): `
+      + 'pull syncs nothing until it is, and other commands ignore every home in it. Fix it, or delete it and re-run `teamai init`.');
+  });
+
+  it('fails when a tool does not read the directory teamai writes its skills to', async () => {
+    teamConfig.toolPaths = { opencode: { skills: '.opencode/skills' } };
+    await fse.ensureDir(path.join(homeDir, '.opencode'));
+
+    const check = (await failing()).find((c) => c.name === 'opencode reads the skills teamai writes');
+
+    expect(check?.fix).toContain(`opencode does not read ${path.join(homeDir, '.opencode', 'skills')}`);
+  });
+
+  it('notes nothing left in OpenCode\'s default home once its skills follow the moved one (#1221)', async () => {
+    const xdg = path.join(tempDir, 'xdg');
+    await fse.ensureDir(path.join(xdg, 'opencode'));
+    vi.stubEnv('XDG_CONFIG_HOME', xdg);
+
+    const { notes } = await report();
+
+    expect(notes?.some((note) => note.includes('still writes some of its other files'))).toBe(false);
+  });
+
+  it('notes nothing left in Pi\'s default home once its skills follow the moved one (#1221)', async () => {
+    const pi = path.join(tempDir, 'pi-agent');
+    await fse.ensureDir(pi);
+    vi.stubEnv('PI_CODING_AGENT_DIR', pi);
+    teamConfig.toolPaths = { pi: { skills: '.pi/agent/skills' } };
+
+    const { notes } = await report();
+
+    expect(notes?.filter((note) => note.startsWith('pi '))).toEqual([]);
+  });
+
+  it('notes a project directory a tool reads only from a session started at the project root', async () => {
+    const project = path.join(tempDir, 'project');
+    await fse.ensureDir(path.join(project, '.pi'));
+    Object.assign(localConfig, { scope: 'project', projectRoot: project });
+    teamConfig.toolPaths = { pi: { skills: '.pi/skills' } };
+
+    const { notes } = await report();
+
+    expect(notes).toContain(`pi reads project skills only from a session started in ${project}.`);
   });
 });

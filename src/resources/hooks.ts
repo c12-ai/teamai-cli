@@ -6,6 +6,7 @@ import type { ResourceItem, TeamaiConfig, LocalConfig, HookDef } from '../types.
 import { TEAMAI_CUSTOM_HOOK_PREFIX, areTeamHooksDisabled, getHooksSharing } from '../types.js';
 import { pathExists } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { pushRepoResourceItem, scanRepoResourceForPush } from './repo-resource.js';
 import {
   entryFilePath, missingTopLevelKeyReason, readEntryFileText, reportEntryResolution, resolveEntriesFor, unknownEntryKeys,
   type EntryReader, type EntryResolution,
@@ -82,6 +83,17 @@ async function readHooksFile(absolutePath: string, relativePath: string): Promis
   }
 }
 
+/** The hooks one hooks file's text declares, or null when it does not parse: for reading a past revision. */
+export function parseTeamHooks(content: string): TeamHook[] | null {
+  try {
+    const raw: unknown = YAML.parse(content);
+    if (missingTopLevelKeyReason(raw, HooksYamlSchema)) return null;
+    return HooksYamlSchema.parse(raw ?? {}).hooks;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * How `hooks/hooks.yaml` and `hooks/<ns>/hooks.yaml` are read for delivery.
  * The `builtin:` overrides are team-wide and read from the root file alone.
@@ -131,9 +143,38 @@ export async function resolveTeamHookEntries(
   localConfig: LocalConfig,
 ): Promise<{ resolution: EntryResolution<TeamHook>; builtin: BuiltinOverrideRead }> {
   const resolution = await resolveEntriesFor(hooksEntryReader, localConfig);
+  return { resolution, builtin: await readBuiltinOverride(localConfig) };
+}
+
+/** The root hooks file's `builtin:` block alone (see BuiltinOverrideRead). */
+export async function readBuiltinOverride(localConfig: LocalConfig): Promise<BuiltinOverrideRead> {
   const root = await readHooksFile(teamHooksYamlPath(localConfig.repo.localPath), entryFilePath('hooks', null));
-  if (root === null) return { resolution, builtin: { known: true, override: undefined } };
-  return { resolution, builtin: root.ok ? { known: true, override: root.yaml.builtin } : { known: false } };
+  if (root === null) return { known: true, override: undefined };
+  return root.ok ? { known: true, override: root.yaml.builtin } : { known: false };
+}
+
+const RawBuiltinDisabledSchema = z.object({ builtin: z.object({ disabled: z.array(z.unknown()) }) });
+
+/**
+ * Whether the root hooks file's `builtin.disabled` array lists `key`, read from
+ * the raw YAML so an invalid hook or field elsewhere in the file does not hide
+ * it. `unreadable` only when the file cannot be read or its YAML does not parse.
+ */
+export async function readBuiltinDisabledListing(
+  localConfig: LocalConfig,
+  key: string,
+): Promise<'listed' | 'not-listed' | 'unreadable'> {
+  const file = await readEntryFileText(teamHooksYamlPath(localConfig.repo.localPath), entryFilePath('hooks', null));
+  if (!file.ok) return 'unreadable';
+  if (file.text === null) return 'not-listed';
+  let raw: unknown;
+  try {
+    raw = YAML.parse(file.text);
+  } catch {
+    return 'unreadable';
+  }
+  const parsed = RawBuiltinDisabledSchema.safeParse(raw);
+  return parsed.success && parsed.data.builtin.disabled.includes(key) ? 'listed' : 'not-listed';
 }
 
 // ─── Security gate (§6) ─────────────────────────────────────
@@ -160,7 +201,10 @@ export async function resolveTeamHooks(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
   opts: { auto?: boolean; silent?: boolean; preview?: boolean } = {},
-): Promise<{ ok: true; defs: HookDef[]; builtin: BuiltinOverride | undefined } | { ok: false; builtin: BuiltinOverrideRead }> {
+): Promise<
+  | { ok: true; defs: HookDef[]; builtin: BuiltinOverride | undefined; held?: readonly string[] }
+  | { ok: false; builtin: BuiltinOverrideRead }
+> {
   // Which hooks this member receives: root plus active namespace files, before
   // the security gates so the transparency print below lists only hooks this
   // member will actually run. A resolution that fails keeps what is installed.
@@ -171,6 +215,8 @@ export async function resolveTeamHooks(
   const builtin = builtinRead.known ? builtinRead.override : undefined;
   const sharing = getHooksSharing(teamConfig);
   let defs = resolution.entries.map((entry) => teamHookToDef(entry.entry));
+  // The ids a workspace holds back (#913): each tool keeps what it has installed for them.
+  const held = resolution.held ? { held: resolution.held } : {};
 
   if (areTeamHooksDisabled()) {
     if (defs.length > 0) log.warn(`Team hooks disabled (TEAMAI_HOOKS_DISABLED) — skipping ${defs.length} team hook(s)`);
@@ -188,7 +234,7 @@ export async function resolveTeamHooks(
 
   if (opts.auto && sharing.autoApply === false && defs.length > 0) {
     log.info(`${defs.length} team hook(s) pending — run 'teamai hooks inject' to apply (sharing.hooks.autoApply=false)`);
-    return { ok: true, defs: [], builtin };
+    return { ok: true, defs: [], builtin, ...held };
   }
 
   if (defs.length > 0 && !opts.silent) {
@@ -200,7 +246,7 @@ export async function resolveTeamHooks(
     for (const d of defs) log.info(`  [${d.key}] ${d.command}`);
   }
 
-  return { ok: true, defs, builtin };
+  return { ok: true, defs, builtin, ...held };
 }
 
 // ─── Handler ────────────────────────────────────────────────
@@ -213,9 +259,8 @@ export async function resolveTeamHooks(
 export class HooksHandler extends ResourceHandler {
   readonly type = 'hooks' as const;
 
-  /** Never reverse-push from local settings (avoids confusion with built-in A hooks). */
-  async scanLocalForPush(_teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<ResourceItem[]> {
-    return [];
+  async scanLocalForPush(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
+    return scanRepoResourceForPush('hooks', 'hooks', teamConfig, localConfig);
   }
 
   async scanTeamForPull(_teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
@@ -224,8 +269,8 @@ export class HooksHandler extends ResourceHandler {
     return [{ name: 'hooks.yaml', type: 'hooks', sourcePath: yamlPath, relativePath: 'hooks/hooks.yaml' }];
   }
 
-  async pushItem(_item: ResourceItem, _teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<void> {
-    // No-op — hooks.yaml is edited directly in the repo; push.ts handles git commit.
+  async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    await pushRepoResourceItem(item, localConfig);
   }
 
   async pullItem(_item: ResourceItem, _teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<void> {

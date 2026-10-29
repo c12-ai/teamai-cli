@@ -235,6 +235,68 @@ describe.skipIf(process.platform === 'win32')('project-only mode (C12 fork)', ()
     expect(gitHookInstalled()).toBe(false);
   }, 180_000);
 
+  it('lists every delivered file in the delivered block by default, .mcp.json included, as deliveries come and go', async () => {
+    // A team repo of its own (this test changes it), reached through the same
+    // URL, that says nothing about sharing.gitExclude: on by default here.
+    const seed = path.join(sandbox, `seed-exclude-${path.basename(project)}`);
+    const excludeRemote = path.join(sandbox, `team-exclude-${path.basename(project)}.git`);
+    git(['clone', '-q', remote, seed], sandbox);
+    git(['clone', '-q', '--bare', seed, excludeRemote], sandbox);
+    for (const url of [`${TEAM_URL}.git`, TEAM_URL]) git(['config', '--global', '--unset-all', `url.${remote}.insteadOf`, url], sandbox, { HOME: home, USERPROFILE: home });
+    git(['config', '--global', `url.${excludeRemote}.insteadOf`, `${TEAM_URL}.git`], sandbox, { HOME: home, USERPROFILE: home });
+    git(['config', '--global', '--add', `url.${excludeRemote}.insteadOf`, TEAM_URL], sandbox, { HOME: home, USERPROFILE: home });
+    const pushTeam = (message: string): void => {
+      git(['add', '-A'], seed);
+      git(['commit', '-q', '-m', message], seed);
+      git(['push', '-q', excludeRemote, 'HEAD:main'], seed);
+    };
+    const block = (): string[] => {
+      const text = read(project, '.git/info/exclude');
+      const start = text.indexOf('# [teamai:delivered:start]');
+      const end = text.indexOf('# [teamai:delivered:end]');
+      if (start === -1 || end === -1) return [];
+      return text.slice(start, end).split('\n').slice(1).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+    };
+    const untracked = (): string[] => git(['status', '--porcelain', '--untracked-files=all'], project).split('\n').filter((line) => line.startsWith('??'));
+
+    const init = await runCLI(INIT, true);
+    expect(init.code, init.output).toBe(0);
+    const first = await runCLI(['pull'], true);
+    expect(first.code, first.output).toBe(0);
+
+    // Claude's servers stay in the project's .mcp.json (upstream moves them to
+    // ~/.claude.json, which a project-only HOME hides from the member's tools).
+    expect(JSON.parse(read(project, '.mcp.json')).mcpServers['team-mcp']).toBeDefined();
+    expect(fs.existsSync(path.join(home, '.claude.json')) && read(home, '.claude.json').includes('team-mcp')).toBe(false);
+    expect(block()).toEqual(expect.arrayContaining(['/.mcp.json', '/.claude/settings.local.json', '/.claude/rules/team-rule.md']));
+    // A file the project tracks is never listed: an exclude line would not apply to it.
+    expect(block().some((line) => line.includes('project-rule') || line.startsWith('/.agents/'))).toBe(false);
+    expect(untracked(), first.output).toEqual([]);
+
+    // A skill with extra files the team adds later, delivered by an ordinary pull (the session-start one).
+    writeFile(seed, 'skills/late/SKILL.md', '---\nname: late\ndescription: late fixture\n---\nLate.\n');
+    writeFile(seed, 'skills/late/SOURCE.md', 'Where it came from.\n');
+    writeFile(seed, 'skills/late/agents/openai.yaml', 'name: late\n');
+    pushTeam('late skill');
+    const second = await runCLI(['pull'], true);
+    expect(second.code, second.output).toBe(0);
+    expect(fs.existsSync(path.join(project, '.claude/skills/late/agents/openai.yaml'))).toBe(true);
+    expect(block()).toEqual(expect.arrayContaining([
+      '/.claude/skills/late/SKILL.md', '/.claude/skills/late/SOURCE.md', '/.claude/skills/late/agents/openai.yaml',
+    ]));
+    expect(untracked(), second.output).toEqual([]);
+
+    // The team removes it as `teamai remove` does (a tombstone): its copies go, and so do their lines.
+    fs.rmSync(path.join(seed, 'skills/late'), { recursive: true });
+    writeFile(seed, 'skills/.removed', 'late\n');
+    pushTeam('drop late skill');
+    const third = await runCLI(['pull'], true);
+    expect(third.code, third.output).toBe(0);
+    expect(fs.existsSync(path.join(project, '.claude/skills/late')), third.output).toBe(false);
+    expect(block().some((line) => line.includes('/skills/late/'))).toBe(false);
+    expect(untracked(), third.output).toEqual([]);
+  }, 240_000);
+
   it('without the variable: upstream behaviour (hooks in HOME, git hook in the project)', async () => {
     const init = await runCLI(INIT, false);
     expect(init.code, init.output).toBe(0);

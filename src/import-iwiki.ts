@@ -121,7 +121,7 @@ export async function importFromIWiki(opts: {
   token?: string;
   all?: boolean;
   outputDir?: string;
-  repoPath?: string;
+  repoPath: string;
   dryRun?: boolean;
   maxPages?: number;
 }): Promise<void> {
@@ -145,7 +145,7 @@ export async function importFromIWiki(opts: {
     // 单页模式：用占位符，后续直接下载该页
     pages = [{ docid: id, title: id }];
   } else {
-    const fetchSpinner = spinner(`Fetching iWiki Space (${id}) page tree...`);
+    const fetchSpinner = await spinner(`Fetching iWiki Space (${id}) page tree...`);
     try {
       pages = await client.fetchAllPages(id, { maxPages: opts.maxPages ?? 200 });
       fetchSpinner.succeed(`Page tree fetched: ${pages.length} pages`);
@@ -161,7 +161,7 @@ export async function importFromIWiki(opts: {
   }
 
   // 5. 并发下载文档内容
-  const downloadSpin = spinner(`Downloading iWiki documents (${pages.length} pages)...`);
+  const downloadSpin = await spinner(`Downloading iWiki documents (${pages.length} pages)...`);
   let documents: IWikiDocument[];
   try {
     documents = await downloadDocuments(client, pages);
@@ -191,11 +191,17 @@ export async function importFromIWiki(opts: {
   const session = await interactiveReview(classified, { all: opts.all });
 
   // 9. 推送
-  const repoPath = opts.repoPath ?? `${process.env['HOME']}/.teamai/team-repo`;
+  const repoPath = opts.repoPath;
   await pushAccepted(session, repoPath, {
     dryRun: opts.dryRun,
     outputDir: opts.outputDir,
   });
+
+  // A preview or an --output import leaves the team repo untouched.
+  if (opts.dryRun || opts.outputDir) {
+    log.success('iWiki import complete');
+    return;
+  }
 
   // 10. 与 teamwiki 代码知识建立 MAPS_TO 关系（在 push 之前，确保结果被推送）
   const teamwikiRoot = path.join(repoPath, 'teamwiki');
@@ -213,10 +219,8 @@ export async function importFromIWiki(opts: {
   }
 
   // 11. 自动推送所有产物到团队仓库
-  if (!opts.dryRun) {
-    const { autoPushTeamRepo } = await import('./utils/git.js');
-    await autoPushTeamRepo(repoPath, `[teamai] Import from iWiki: ${documents.map(d => d.title).slice(0, 3).join(', ')}`);
-  }
+  const { autoPushTeamRepo } = await import('./utils/git.js');
+  await autoPushTeamRepo(repoPath, `[teamai] Import from iWiki: ${documents.map(d => d.title).slice(0, 3).join(', ')}`);
 
   log.success('iWiki import complete');
 }

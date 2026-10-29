@@ -4,10 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ensureDir } from '../../utils/fs.js';
+import { getUserHome, legacyUserHome } from '../../utils/home.js';
 import { log, spinner } from '../../utils/logger.js';
 import { isInteractive } from '../../utils/prompt.js';
 import { getTeamaiHomeDir } from '../../types.js';
+import { z } from 'zod';
+import type { PullRequestRef } from '../types.js';
 import { tgitFetch, tgitGitCloneUrl } from './rest-auth.js';
+import { TGIT_HOST } from './repo-url.js';
 
 /** Path where gf CLI is installed */
 function gfInstallDir(): string {
@@ -39,7 +43,7 @@ function shellQuote(s: string): string {
  */
 export function gfExec(
   args: string[],
-  options?: { inheritStdio?: boolean; cwd?: string },
+  options?: { inheritStdio?: boolean; cwd?: string; timeoutMs?: number },
 ): { stdout: string; stderr: string; status: number } {
   const gfPath = getGfPath();
   // Shell-quote every token (including the binary path) so values such as repo
@@ -54,6 +58,7 @@ export function gfExec(
       stdio: 'inherit',
       env: { ...process.env },
       cwd: options.cwd,
+      ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
     });
     return { stdout: '', stderr: '', status: result.status ?? 1 };
   }
@@ -63,6 +68,7 @@ export function gfExec(
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
+    ...(options?.timeoutMs ? { timeout: options.timeoutMs } : {}),
   });
 
   return {
@@ -186,7 +192,7 @@ export async function ensureGfInstalled(): Promise<void> {
   const tmpId = `${process.pid}-${randomBytes(6).toString('hex')}`;
   const tarballPath = path.join(dir, `gf-download.${tmpId}.tar.gz`);
   const headerPath = path.join(dir, `gf-download.${tmpId}.headers`);
-  const spin = spinner('Installing gf CLI (工蜂命令行工具)...').start();
+  const spin = (await spinner('Installing gf CLI (工蜂命令行工具)...')).start();
 
   try {
     await ensureDir(dir);
@@ -355,19 +361,36 @@ export function ensureAuthenticated(): string {
  * Returns null if no credential is found.
  */
 export function gfGetOAuthToken(): string | null {
+  // `gf` wrote this file when `~` still resolved to `os.homedir()`, so a user
+  // whose HOME points elsewhere keeps working after the upgrade: read the
+  // current location first, then the legacy one.
+  let candidates: string[];
   try {
-    const netrcPath = path.join(os.homedir(), '.netrc');
-    if (!fs.existsSync(netrcPath)) return null;
-
-    const content = fs.readFileSync(netrcPath, 'utf-8');
-    // Match: machine git.woa.com ... password <TOKEN>
-    const match = content.match(
-      /machine\s+git\.woa\.com\s+.*?password\s+(\S+)/,
-    );
-    return match?.[1] ?? null;
+    candidates = [path.join(getUserHome(), '.netrc')];
+    const legacy = legacyUserHome();
+    if (legacy) candidates.push(path.join(legacy, '.netrc'));
   } catch {
     return null;
   }
+
+  for (const netrcPath of candidates) {
+    try {
+      // `existsSync` first, as this reader has always done: it keeps the
+      // "no ~/.netrc" case a cheap no-op rather than a thrown ENOENT. A file
+      // that exists but cannot be read still falls through to the next
+      // candidate via the `catch`.
+      if (!fs.existsSync(netrcPath)) continue;
+      const content = fs.readFileSync(netrcPath, 'utf-8');
+      // Match: machine git.woa.com ... password <TOKEN>
+      const match = content.match(
+        /machine\s+git\.woa\.com\s+.*?password\s+(\S+)/,
+      );
+      if (match?.[1]) return match[1];
+    } catch {
+      // Missing or unreadable here — try the next location.
+    }
+  }
+  return null;
 }
 
 /**
@@ -483,6 +506,10 @@ export interface GfMrCreateOptions {
   reviewers?: string[];
   /** Working directory for gf CLI (should be the team repo path) */
   cwd?: string;
+  /** Hard timeout (ms) for the `gf mr create` subprocess; kills it at the OS
+   * level once exceeded. spawnSync blocks the event loop, so withTimeout cannot
+   * interrupt it — this bounds a stalled MR creation. */
+  spawnTimeoutMs?: number;
 }
 
 /**
@@ -506,7 +533,7 @@ export function gfMrCreate(opts: GfMrCreateOptions): string {
     args.push('-r', opts.reviewers.join(','));
   }
 
-  const result = gfExec(args, { cwd: opts.cwd });
+  const result = gfExec(args, { cwd: opts.cwd, ...(opts.spawnTimeoutMs ? { timeoutMs: opts.spawnTimeoutMs } : {}) });
   if (result.status !== 0) {
     const errMsg = result.stderr || result.stdout;
     throw new Error(`gf mr create failed: ${errMsg}`);
@@ -527,4 +554,41 @@ export function gfMrCreate(opts: GfMrCreateOptions): string {
 
   // Could not extract MR URL — treat as failure
   throw new Error(`gf mr create succeeded but returned unexpected output: ${output}`);
+}
+
+// ─── Open merge request lookup ───────────────────────────
+
+const LOOKUP_PAGE = 100;
+
+const TGitOpenMrSchema = z.object({
+  web_url: z.string(),
+  state: z.string(),
+  source_branch: z.string(),
+  target_branch: z.string(),
+  source_project_id: z.number(),
+  target_project_id: z.number(),
+});
+
+/**
+ * The open merge request from `source` into `target` in project `repo`, asked of the git.woa.com REST API with the
+ * credential `tgitFetch` resolves; a reopened request is open too. A request from a fork with the same branch name is
+ * not it. Never prompts, and throws, rather than answering none, when TGit cannot be asked or answers in time, answers
+ * what this cannot read, fills a whole page without it, or names a request on another host.
+ */
+export async function tgitFindOpenMr({ repo, source, target, timeoutMs }: PullRequestRef): Promise<string | undefined> {
+  const query = new URLSearchParams({ state: 'opened', source_branch: source, target_branch: target, per_page: String(LOOKUP_PAGE) });
+  const response = await tgitFetch(`/projects/${encodeURIComponent(repo)}/merge_requests?${query}`, {
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) throw new Error(`TGit answered the open merge request lookup with HTTP ${response.status}. Check TGIT_TOKEN or the gf login and their access to the project.`);
+  const requests = z.array(TGitOpenMrSchema).safeParse(await response.json().catch(() => undefined));
+  if (!requests.success) throw new Error('TGit answered the open merge request lookup with data TeamAI cannot read.');
+  const found = requests.data.find((mr) => (mr.state === 'opened' || mr.state === 'reopened') && mr.source_branch === source
+    && mr.target_branch === target && mr.source_project_id === mr.target_project_id);
+  if (!found) {
+    if (requests.data.length >= LOOKUP_PAGE) throw new Error('TGit listed more open merge requests than one page, so TeamAI cannot tell whether this branch has one.');
+    return undefined;
+  }
+  if (!found.web_url.startsWith(`https://${TGIT_HOST}/`)) throw new Error('TGit answered the open merge request lookup with a URL on another host.');
+  return found.web_url;
 }

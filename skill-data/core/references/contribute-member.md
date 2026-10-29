@@ -93,13 +93,26 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    ```
 
    To publish into a specific role namespace: `teamai push --skill <path> --role <id>`.
+   `--skill <path>` selects that exact local copy after resolving `~` and
+   symlinks; a same-named copy in another tool is never a substitute.
    `--role <ns>` / `--project <id>` place every new resource, not only skills: a
    new rule and a new agent land in that namespace too (a project resolves each
    from its own axis — `knowledge` for rules, `agents` for agents). Without one,
-   a new resource whose namespace cannot be resolved stays at the shared root and
-   reaches the whole team. An edit of a skill, rule or agent you received from a
-   namespace goes back to that namespace, even when it replaces a shared item of
-   the same name; the shared one is left as it is. Use `--branch <name>` when a new push must target a
+   the role and the active projects decide; with neither, a new rule or agent
+   stays at the shared root and reaches the whole team. When an active project
+   cannot be resolved (not in `manifest/projects.yaml`, or that file is
+   missing), push stops with exit 2 until you fix it or pass `--role` /
+   `--project`, or explicitly choose the shared root with `--shared`. This flag
+   places new resources at the shared root even when namespaces exist and
+   cannot combine with `--role` or `--project`. Shared-root skills retain the
+   existing tag-subscription delivery rules. An edit of a skill, rule or agent you received from a namespace
+   goes back to that namespace, even when it replaces a shared item of the same
+   name; the shared one is left as it is. A delivered skill copy is pushed only
+   when its recorded version matches exactly one current team skill, using that
+   path's history since its latest creation after deletion. `--role`, `--project`
+   and `--skill` do not establish an origin. If no unique origin is proven, push
+   skips the edit with a warning; copy it under a new name to send it as a new
+   skill. Use `--branch <name>` when a new push must target a
    specific branch; an existing open PR keeps its recorded branch. TeamAI refuses
    to reset a team-repo clone with user changes, so commit or stash unrelated
    modified, staged, untracked, or conflicted files before retrying.
@@ -110,6 +123,12 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    pushing it would revert a teammate's update. To publish an edit of it, bring
    the current version in first (`git fetch origin && git merge origin/<default>`,
    or copy the team's current file over it), redo the edit on top, and push again.
+   Any other team file under `.teamai/` that the default branch changed since
+   your branch left it is left out of the push when you did not edit it. A file
+   you edited too stops the push with exit 2; merge the default branch and push
+   again. Skills are checked as whole directories, including reference files
+   and deletions: a skill edit stops when it would replace any changed upstream
+   file with a stale local copy, even if you edited a different file.
 
 ## After contributing
 
@@ -119,7 +138,7 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
 Before listing rules, `push` refreshes copies whose bodies still match a recorded
 sync revision. The header teamai generates for a tool's own rules format
 (Cursor `.mdc`, JoyCode's own `.mdc`, Copilot `applyTo`, Kiro `inclusion`, Qoder
-`trigger`, CodeBuddy and WorkBuddy `alwaysApply`, Oh My Pi `alwaysApply`/`globs`) does not count as a local edit: unedited old copies update in that
+`trigger`, Trae `globs`/`alwaysApply`, CodeBuddy and WorkBuddy `alwaysApply`, Oh My Pi `alwaysApply`/`globs`) does not count as a local edit: unedited old copies update in that
 format, including under `COPILOT_HOME` in user scope. Genuine local body edits remain push candidates.
 Rule pre-sync leaves tools excluded by `enabledAgents` or `disabledAgents` untouched.
 When only team `paths` change, `applyTo` refreshes if the local file still matches
@@ -136,7 +155,7 @@ team repo, then run `teamai pull`. Doctor also reports team-owned OpenCode globs
 or inline blocks left after the last rule is removed.
 
 A new file in the rules directory of a tool with a rules format of its own
-(Cursor, JoyCode, Copilot, Kiro, Qoder, CodeBuddy, WorkBuddy, Oh My Pi) is the
+(Cursor, JoyCode, Copilot, Kiro, Qoder, Trae, CodeBuddy, WorkBuddy, Oh My Pi) is the
 member's own rule in that tool's format: push never offers it, and pull leaves
 it. To author a new team rule, write it as a plain `.md` in `.claude/rules/`
 (scope it with `paths:` frontmatter, which teamai renders into each tool's

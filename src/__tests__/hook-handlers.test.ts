@@ -7,6 +7,7 @@ import path from 'node:path';
 // Mock the underlying modules so handlers don't do real I/O
 
 const mockPull = vi.fn().mockResolvedValue(undefined);
+const mockSettleLateUsageReport = vi.fn().mockResolvedValue(undefined);
 const mockDashboardReport = vi.fn().mockResolvedValue(undefined);
 const mockParseHookEvent = vi.fn().mockResolvedValue({ type: 'session_start', timestamp: '2026-01-01', sessionId: 'test', tool: 'claude' });
 const mockAppendEvent = vi.fn().mockResolvedValue(undefined);
@@ -30,8 +31,14 @@ const mockStashPackageHint = vi.fn().mockResolvedValue(undefined);
 const mockClaimPackageHint = vi.fn().mockResolvedValue(null);
 const mockTakePendingPackageHint = vi.fn().mockResolvedValue(null);
 
+const mockTeamDelivery = vi.fn().mockResolvedValue({ complete: false, key: undefined, gap: 'no_record' });
+// The checkout already has a delivery record: a session start or tool use prepares nothing.
+const mockDeliveringCheckoutRecord = vi.fn().mockResolvedValue({ rev: 'abc', targets: [] });
 vi.mock('../pull.js', () => ({
   pull: mockPull,
+  deliveringCheckoutRecord: mockDeliveringCheckoutRecord,
+  settleLateUsageReport: mockSettleLateUsageReport,
+  teamDelivery: mockTeamDelivery,
 }));
 
 vi.mock('../dashboard-collector.js', () => ({
@@ -41,22 +48,26 @@ vi.mock('../dashboard-collector.js', () => ({
   dashboardReport: mockDashboardReport,
   dataHomeKey: vi.fn().mockResolvedValue('key'),
   eventProjectAnchor: vi.fn().mockResolvedValue(undefined),
+  addGitStateAtStart: vi.fn().mockResolvedValue(undefined),
+  gitStateIn: vi.fn().mockReturnValue(undefined),
   // The payload's cwd: what hookScopeDir answers for a cwd that exists (#810).
   hookScopeDir: async (stdin: Record<string, unknown>) =>
     (await vi.importActual<typeof import('../utils/hook-cwd.js')>('../utils/hook-cwd.js')).resolveHookCwd(stdin),
 }));
 
-// Use the REAL resolveSkillUse (pure Skill/Read+SKILL.md logic, no I/O) so the
-// webhook + track tests exercise the actual skill-name resolution shared by both
-// callers, rather than a stub that could drift from production behavior.
+// The REAL skill-name extraction and validation, so the webhook and skill-use
+// tests exercise the resolution production runs; every named skill counts as
+// installed, since these payloads name paths that do not exist here.
 vi.mock('../usage-tracker.js', async () => {
   const actual = await vi.importActual<typeof import('../usage-tracker.js')>('../usage-tracker.js');
   return {
     trackFromStdin: mockTrackFromParsed,
     trackSlashCommand: mockTrackSlashFromParsed,
-    resolveSkillUse: actual.resolveSkillUse,
     extractSkillName: actual.extractSkillName,
     isValidSkillName: actual.isValidSkillName,
+    skillRoots: vi.fn().mockResolvedValue([]),
+    skillExistsOnDisk: vi.fn().mockResolvedValue(true),
+    isInstalledSkillFile: vi.fn().mockResolvedValue(true),
     appendUsageEvent: vi.fn().mockResolvedValue(undefined),
     updateKnownSkills: vi.fn().mockResolvedValue(undefined),
   };
@@ -72,10 +83,11 @@ vi.mock('../webhook.js', () => ({
   loadWebhookConfig: mockLoadWebhookConfig,
 }));
 
-vi.mock('../contribute-check.js', () => ({
+vi.mock('../contribute-check.js', async () => ({
   contributeCheck: vi.fn().mockResolvedValue(undefined),
   contributeCheckForSession: mockContributeCheckForSession,
   takePendingHint: mockTakePendingHint,
+  sanitizeSessionId: (await vi.importActual<typeof import('../contribute-check.js')>('../contribute-check.js')).sanitizeSessionId,
 }));
 
 vi.mock('../votes-judge.js', () => ({
@@ -85,6 +97,9 @@ vi.mock('../votes-judge.js', () => ({
 vi.mock('../update.js', () => ({
   doUpdate: mockDoUpdate,
   checkForUpdate: vi.fn().mockResolvedValue({ available: false, current: '1.0.0' }),
+  acquireLock: vi.fn().mockResolvedValue(true),
+  releaseLock: vi.fn().mockResolvedValue(undefined),
+  withFileLock: vi.fn(async (_lockPath: string, _wait: unknown, body: () => Promise<unknown>) => ({ held: true, value: await body() })),
 }));
 
 const mockAutoDetectInit = vi.fn().mockResolvedValue({
@@ -103,6 +118,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   // project config, so the gate asks the user config: the same mocked one.
   requireInit: mockAutoDetectInit,
   findUnreadableProjectConfig: mockFindUnreadableProjectConfig,
+  loadLocalConfigForScope: vi.fn().mockResolvedValue(null),
   resolveConfigForDir: vi.fn().mockResolvedValue({
     repo: { localPath: '/tmp/team-repo', remote: '' }, username: 'test', scope: 'user', additionalRoles: [],
   }),
@@ -138,14 +154,20 @@ vi.mock('../transcript-parser.js', () => ({
 // behavior is covered end to end in recall-attribution.test.ts.
 const mockCreditAdoptedDocs = vi.hoisted(() => vi.fn());
 vi.mock('../recall-adoption.js', () => ({
+  recalledDocsForSession: vi.fn(async () => []),
   creditAdoptedDocs: mockCreditAdoptedDocs,
   recalledKeyOf: vi.fn(async () => () => undefined),
+  // The judge backfills a missing `File:` path from the recall log; these tests
+  // supply every path via the transcript, so the lookup is never consulted.
+  recalledPathOf: vi.fn(async () => () => undefined),
   recordToolCall: vi.fn(async () => undefined),
 }));
 
 const voteMocks = vi.hoisted(() => ({
   hasPendingVoteDeltas: vi.fn().mockResolvedValue(false),
   creditedDocIdsForSession: vi.fn().mockResolvedValue(new Set<string>()),
+  stageVotesMerge: vi.fn().mockResolvedValue(null),
+  confirmVotesSynced: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('../votes.js', () => ({
   incrementUpvoted: mockIncrementUpvoted,
@@ -153,19 +175,32 @@ vi.mock('../votes.js', () => ({
   hasPendingVoteDeltas: (...args: unknown[]) => voteMocks.hasPendingVoteDeltas(...args),
   creditedDocIdsForSession: (...args: unknown[]) => voteMocks.creditedDocIdsForSession(...args),
   pruneUpvoteLedger: vi.fn().mockResolvedValue(undefined),
+  stageVotesMerge: (...args: unknown[]) => voteMocks.stageVotesMerge(...args),
+  confirmVotesSynced: (...args: unknown[]) => voteMocks.confirmVotesSynced(...args),
+  readUserVotesFromContent: vi.fn(() => ({ version: 2, votes: {}, deltas: {} })),
 }));
 
 const reportsBranchMocks = vi.hoisted(() => ({
-  updateReports: vi.fn().mockResolvedValue(true),
+  updateReports: vi.fn().mockResolvedValue({ status: 'published' }),
+  readReportsOriginFile: vi.fn().mockResolvedValue(null),
 }));
 vi.mock('../utils/reports-branch.js', () => ({
   updateReports: (...args: unknown[]) => reportsBranchMocks.updateReports(...args),
+  readReportsOriginFile: (...args: unknown[]) => reportsBranchMocks.readReportsOriginFile(...args),
 }));
 
 const mockSeedProjectAgentRoot = vi.fn().mockResolvedValue(undefined);
+const mockCreateProjectToolRoots = vi.fn().mockResolvedValue(undefined);
 vi.mock('../project-agent-root.js', () => ({
   seedProjectAgentRoot: mockSeedProjectAgentRoot,
+  createProjectToolRoots: mockCreateProjectToolRoots,
 }));
+
+// No scope scores finished sessions unless a test says so; a detached process is never started for real.
+const mockSessionScoringScopes = vi.fn().mockResolvedValue([]);
+vi.mock('../score-sessions.js', () => ({ sessionScoringScopes: mockSessionScoringScopes }));
+const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn(() => ({ on: vi.fn().mockReturnThis(), unref: vi.fn() })) }));
+vi.mock('node:child_process', async (importOriginal) => ({ ...(await importOriginal<typeof import('node:child_process')>()), spawn: mockSpawn }));
 
 import { buildAdoptedSummary, buildHandlerRegistry, filterHandlersForConfig } from '../hook-handlers.js';
 import { createDispatcher } from '../hook-dispatch.js';
@@ -198,6 +233,26 @@ describe('hook-handlers registry', () => {
     expect(events).toContain('post-tool-use');
     expect(events).toContain('prompt-submit');
     expect(events).toContain('session-end');
+  });
+
+  it('post-tool-use runs every non-output handler detached, leaving the inline pass empty (#1216)', () => {
+    // dashboard-report and recall-attribution always return null — pure side
+    // effects, the exact criterion `background` documents — and the same
+    // dashboard handler already runs detached for stop and session-end. On
+    // Windows each foreground handler second is host-visible: a dispatch pays
+    // one node start-up per pass, and under disk contention dashboard-report
+    // alone measured 3.8 s inside the host's 10 s budget (#1216). Detached,
+    // the inline pass for a plain tool call has no handlers at all, and the
+    // host-visible cost collapses to bundle load + spawn.
+    const handlers = buildHandlerRegistry().filter((r) => r.event === 'post-tool-use' && r.matcher === '*');
+    for (const name of ['dashboard-report', 'recall-attribution', 'local-agent-sync']) {
+      const reg = handlers.find((r) => (r.handler as { name: string }).name === name);
+      expect(reg, name).toBeDefined();
+      expect(reg!.background, `${name} must run detached`).toBe(true);
+    }
+    // What remains inline for a plain tool call: nothing.
+    const inline = handlers.filter((r) => !r.background);
+    expect(inline).toEqual([]);
   });
 
   it('session-end records the final dashboard snapshot and dispatches the webhook in the background, and syncs votes in the foreground', () => {
@@ -233,6 +288,41 @@ describe('hook-handlers registry', () => {
       .map((r) => r.handler.name);
     expect(sessionStartHandlers).toContain('pull');
     expect(sessionStartHandlers).toContain('dashboard-report');
+  });
+
+  it.skipIf(process.platform === 'win32')('session-start adds the tool version to the capture its start wrote, and sweeps captures of sessions that are gone, in the background (#1178)', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'capture-version-')));
+    const captureId = '0b6f2a52-5d7e-4c7e-9a43-6a3c1d0e2f11';
+    const dir = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 's-capture');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${captureId}.json`), JSON.stringify({
+      captureId, platform: 'claude-code', sessionId: 's-capture', capturedAt: '2026-10-23T10:00:00.000Z',
+      agent: { v: 1, tool: { name: 'claude' }, teamai: '0.0.0', driver: 'session' },
+    }));
+    const gone = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 's-gone');
+    fs.mkdirSync(gone, { recursive: true });
+    fs.writeFileSync(path.join(gone, `${captureId}.json`), JSON.stringify({
+      captureId, platform: 'claude-code', sessionId: 's-gone', capturedAt: '2026-10-01T10:00:00.000Z', sessionFile: path.join(root, 's-gone.jsonl'),
+      agent: { v: 1, tool: { name: 'claude' }, teamai: '0.0.0', driver: 'session' },
+    }));
+    const { clearVersionCache } = await import('../agent-version.js');
+    fs.mkdirSync(path.join(root, 'bin'));
+    fs.writeFileSync(path.join(root, 'bin', 'claude'), '#!/bin/sh\necho "2.1.308 (Claude Code)"\n', { mode: 0o755 });
+    vi.stubEnv('PATH', `${path.join(root, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`);
+    clearVersionCache();
+    const config: LocalConfig = { repo: { kind: 'git', localPath: root, remote: '' }, username: 'test', scope: 'user', additionalRoles: [], dataHome: path.join(root, 'data') };
+    const registration = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'session-capture');
+
+    try {
+      expect(registration).toMatchObject({ background: true, requiresConfig: true });
+      await registration?.handler.execute({ session_id: 's-capture', teamai_capture: captureId }, 'claude', config);
+      expect(JSON.parse(fs.readFileSync(path.join(dir, `${captureId}.json`), 'utf8')).agent.tool).toEqual({ name: 'claude', version: '2.1.308' });
+      expect(fs.existsSync(path.join(root, 'data', 'sessions', 'captures', 'claude-code', 's-gone'))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      clearVersionCache();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('caps the self-mode post-merge lock wait at five seconds', async () => {
@@ -405,6 +495,84 @@ describe('hook-handlers registry', () => {
     );
   });
 
+  it('session-start pull returns only after a report the pull stopped waiting for settles (#1322)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'session-start' && r.handler.name === 'pull',
+    )!.handler;
+    let settle!: () => void;
+    mockSettleLateUsageReport.mockReturnValueOnce(new Promise<void>((resolve) => { settle = resolve; }));
+    let returned = false;
+
+    const done = handler.execute({ cwd: '/tmp/some-project' }, 'claude', null).then(() => { returned = true; });
+    await vi.waitFor(() => expect(mockSettleLateUsageReport).toHaveBeenCalledOnce());
+    expect(returned).toBe(false);
+    settle();
+    await done;
+
+    expect(returned).toBe(true);
+  });
+
+  function sessionStartPull() {
+    const registered = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'pull');
+    if (!registered) throw new Error('no session-start pull handler');
+    return registered.handler;
+  }
+
+  it('session-start pull starts score-sessions detached once the late usage report settles, when a scope scores sessions (#1179)', async () => {
+    const handler = sessionStartPull();
+    const cwd = fs.realpathSync.native(os.tmpdir());
+    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+
+    await handler.execute({ cwd }, 'claude', scope);
+
+    expect(mockSessionScoringScopes).toHaveBeenCalledWith(cwd);
+    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd, detached: true, stdio: 'ignore' }));
+    expect(mockSettleLateUsageReport.mock.invocationCallOrder.at(-1)).toBeLessThan(mockSpawn.mock.invocationCallOrder.at(-1) ?? 0);
+  });
+
+  it('session-start pull scores the sessions of the directory it runs in when the payload names none (#1179)', async () => {
+    const handler = sessionStartPull();
+    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+    mockSpawn.mockClear();
+
+    await handler.execute({}, 'claude', scope);
+
+    expect(mockSessionScoringScopes).toHaveBeenLastCalledWith(process.cwd());
+    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd: process.cwd() }));
+  });
+
+  it('session-start pull starts no score-sessions when no scope scores sessions (#1179)', async () => {
+    const handler = sessionStartPull();
+    mockSpawn.mockClear();
+
+    await handler.execute({ cwd: fs.realpathSync.native(os.tmpdir()) }, 'claude', scope);
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('session-start pull marks the session\'s captures when it delivers a new revision (#1178)', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'capture-pull-')));
+    const captureId = '0b6f2a52-5d7e-4c7e-9a43-6a3c1d0e2f12';
+    const dir = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 's-pull');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${captureId}.json`), JSON.stringify({
+      captureId, platform: 'claude-code', sessionId: 's-pull', capturedAt: '2026-10-23T10:00:00.000Z',
+      agent: { v: 1, tool: { name: 'claude' }, teamai: '0.0.0', driver: 'session' },
+    }));
+    const record = (rev: string) => ({ complete: true, key: 'k', commit: rev.repeat(40), record: { rev, targets: ['claude'] } });
+    mockTeamDelivery.mockResolvedValueOnce(record('a')).mockResolvedValueOnce(record('b'));
+    const config: LocalConfig = { repo: { kind: 'git', localPath: root, remote: '' }, username: 'test', scope: 'user', additionalRoles: [], dataHome: path.join(root, 'data') };
+    const handler = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'pull')?.handler;
+
+    try {
+      await handler?.execute({ session_id: 's-pull', cwd: root }, 'claude', config);
+      expect(JSON.parse(fs.readFileSync(path.join(dir, `${captureId}.json`), 'utf8')).teamChanged).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('session-start pull seeds from workspace_roots when cwd is absent', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
@@ -540,7 +708,7 @@ describe('hook-handlers registry', () => {
     expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] hello');
   });
 
-  it.each(['codebuddy', 'codex', 'codex-internal', 'tcodex'])('contribute-check handler asks to stash (not stdout) for %s', async (tool) => {
+  it.each(['codebuddy', 'codex', 'codex-internal', 'tcodex', 'muse'])('contribute-check handler asks to stash (not stdout) for %s', async (tool) => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
@@ -769,7 +937,7 @@ describe('hook-handlers registry', () => {
     expect(result).toBeNull();
   });
 
-  it.each(['codebuddy', 'codex'])('pending-hint handler injects stashed hint for %s on prompt-submit', async (tool) => {
+  it.each(['codebuddy', 'codex', 'muse'])('pending-hint handler injects stashed hint for %s on prompt-submit', async (tool) => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
@@ -828,12 +996,11 @@ describe('hook-handlers registry', () => {
     expect(wildcardHandlers).toContain('dashboard-report');
   });
 
-  it('post-tool-use Skill matcher has track', () => {
+  it('post-tool-use tracks skill use on the wildcard pass, detached, with no Skill matcher (#1221)', () => {
     const registry = buildHandlerRegistry();
-    const skillHandlers = registry
-      .filter((r) => r.event === 'post-tool-use' && r.matcher === 'Skill')
-      .map((r) => r.handler.name);
-    expect(skillHandlers).toContain('track');
+    expect(registry.filter((r) => r.event === 'post-tool-use' && r.matcher === 'Skill')).toEqual([]);
+    const skillUse = registry.find((r) => r.event === 'post-tool-use' && r.handler.name === 'skill-use');
+    expect(skillUse).toMatchObject({ matcher: '*', background: true, requiresConfig: true });
   });
 
   // Perf regression: post-tool-use fires on every tool call, so its local-agent
@@ -850,16 +1017,20 @@ describe('hook-handlers registry', () => {
     expect(localAgent!.background).toBe(true);
   });
 
-  // post-tool-use dashboard-report stays foreground: it is a fast local file
-  // append with no network I/O, so detaching it would add spawn overhead for
-  // no benefit.
-  it('post-tool-use wildcard dashboard-report stays foreground', () => {
+  // post-tool-use dashboard-report runs detached (#1216): the old "fast local
+  // append, detaching adds spawn overhead" premise is platform-dependent — on
+  // Windows (Defender, disk contention) the same append measured 3.8 s inside
+  // the host's 10 s hook budget, and hooks were killed outright. The spawn
+  // already exists (local-agent-sync below is background), so moving this into
+  // the detached child adds no process and removes its runtime from the
+  // host-visible path.
+  it('post-tool-use wildcard dashboard-report runs detached (#1216)', () => {
     const registry = buildHandlerRegistry();
     const dashboard = registry.find(
       (r) => r.event === 'post-tool-use' && r.matcher === '*' && r.handler.name === 'dashboard-report',
     );
     expect(dashboard).toBeDefined();
-    expect(dashboard!.background).not.toBe(true);
+    expect(dashboard!.background).toBe(true);
   });
 
   // prompt-submit local-agent-sync must NOT be backgrounded: when the org
@@ -905,12 +1076,12 @@ describe('hook-handlers registry', () => {
     }
   });
 
-  it('prompt-submit has track-slash and dashboard-report', () => {
+  it('prompt-submit has skill-mention and dashboard-report', () => {
     const registry = buildHandlerRegistry();
     const handlers = registry
       .filter((r) => r.event === 'prompt-submit' && r.matcher === '*')
       .map((r) => r.handler.name);
-    expect(handlers).toContain('track-slash');
+    expect(handlers).toContain('skill-mention');
     expect(handlers).toContain('dashboard-report');
   });
 
@@ -1341,13 +1512,27 @@ describe('hook-handlers registry', () => {
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
+    const syncedDeltas = { 'doc-a': { recalled_delta: 0, upvoted_delta: 1 } };
     voteMocks.hasPendingVoteDeltas.mockResolvedValueOnce(true);
-    mockSyncVotesToTeam.mockResolvedValueOnce(true);
+    voteMocks.stageVotesMerge.mockResolvedValueOnce({ syncedDeltas });
+    voteMocks.confirmVotesSynced.mockClear();
     reportsBranchMocks.updateReports.mockClear();
+    reportsBranchMocks.readReportsOriginFile.mockResolvedValueOnce(null);
     reportsBranchMocks.updateReports.mockImplementationOnce(
-      async (_cfg: unknown, write: (wt: string) => Promise<unknown>) => {
-        await write('/wt');
-        return true;
+      async (
+        _cfg: unknown,
+        write: (wt: string, ctx: { onDelivered: (fn: () => Promise<void>) => void }) => Promise<unknown>,
+      ) => {
+        const delivered: (() => Promise<void>)[] = [];
+        const change = await write('/wt', { onDelivered: (fn) => { delivered.push(fn); } });
+        // The staged write is what the branch publishes, and the deltas are
+        // cleared only after delivery (#1027): the confirm hook runs here.
+        expect(change).toEqual({
+          files: ['votes/test.yaml'],
+          message: '[teamai] Update votes for test',
+        });
+        for (const fn of delivered) await fn();
+        return { status: 'published' };
       },
     );
 
@@ -1357,7 +1542,40 @@ describe('hook-handlers registry', () => {
     );
 
     expect(reportsBranchMocks.updateReports).toHaveBeenCalledOnce();
-    expect(mockSyncVotesToTeam).toHaveBeenCalledWith('/wt', 'test', expect.any(String));
+    // The merge base is origin's snapshot, not the worktree copy (#1027).
+    expect(voteMocks.stageVotesMerge).toHaveBeenCalledWith('/wt', 'test', expect.any(String), null);
+    expect(voteMocks.confirmVotesSynced).toHaveBeenCalledWith(expect.any(String), syncedDeltas);
+  });
+
+  it('votes-sync keeps the deltas pending when the reports push is not delivered (#1027)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    voteMocks.hasPendingVoteDeltas.mockResolvedValueOnce(true);
+    voteMocks.stageVotesMerge.mockResolvedValueOnce({ syncedDeltas: {} });
+    voteMocks.confirmVotesSynced.mockClear();
+    reportsBranchMocks.readReportsOriginFile.mockResolvedValueOnce(null);
+    reportsBranchMocks.updateReports.mockImplementationOnce(
+      async (
+        _cfg: unknown,
+        write: (wt: string, ctx: { onDelivered: (fn: () => Promise<void>) => void }) => Promise<unknown>,
+      ) => {
+        await write('/wt', { onDelivered: () => {} });
+        // Push failed after its retries: delivery never confirmed.
+        return { status: 'failed', reason: 'push did not land' };
+      },
+    );
+
+    await handler.execute(
+      { session_id: 'sid-push-failed', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude', scope,
+    );
+
+    expect(voteMocks.stageVotesMerge).toHaveBeenCalledOnce();
+    // Not delivered → the deltas are NOT cleared; the next Stop retries them.
+    expect(voteMocks.confirmVotesSynced).not.toHaveBeenCalled();
   });
 
   // ── votes-sync adopted-summary is skipped for stdout-less tools ──
@@ -1452,15 +1670,93 @@ describe('post-tool-use dispatch — local-agent runs detached, never blocks hos
     expect(mockReportAndSyncFromHook).toHaveBeenCalledOnce();
   });
 
-  it('foreground pass still runs the fast local dashboard-report handler', async () => {
+  it('the background pass runs dashboard-report; a plain tool call leaves the foreground pass empty (#1216)', async () => {
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
     await dispatcher.dispatch('post-tool-use', '*', stdin, 'claude', 'foreground');
-    // dashboard-report parses the event and appends locally — it must stay inline.
+    // dashboard-report and recall-attribution moved to the detached pass: the
+    // inline pass for a plain tool call runs no handlers at all, so the host
+    // waits only for bundle load + spawn.
+    expect(mockParseHookEvent).not.toHaveBeenCalled();
+    await dispatcher.dispatch('post-tool-use', '*', stdin, 'claude', 'background');
     expect(mockParseHookEvent).toHaveBeenCalled();
   });
 });
 
-describe('session-start secrets hint (#875)', () => {
+describe('a checkout no pull delivered into (#1424)', () => {
+  let root: string;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'new-checkout-')));
+    mockDeliveringCheckoutRecord.mockResolvedValue(undefined);
+    // A linked worktree: its `.git` file names a git dir holding `commondir`.
+    fs.mkdirSync(path.join(root, 'project'));
+    fs.mkdirSync(path.join(root, 'repo.git', 'worktrees', 'project'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'repo.git', 'worktrees', 'project', 'commondir'), '../..\n');
+    fs.writeFileSync(path.join(root, 'project', '.git'), `gitdir: ${path.join(root, 'repo.git', 'worktrees', 'project')}\n`);
+  });
+  afterEach(() => {
+    mockDeliveringCheckoutRecord.mockResolvedValue({ rev: 'abc', targets: [] });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const projectConfig = (kind: 'git' | 'http'): LocalConfig => ({
+    repo: { kind, localPath: path.join(root, 'team'), remote: '' }, username: 'test', scope: 'project',
+    additionalRoles: [], dataHome: path.join(root, 'data'), projectRoot: path.join(root, 'project'),
+  });
+  const toolUse = (config: LocalConfig) => createDispatcher({ handlers: buildHandlerRegistry(), localConfig: config })
+    .dispatch('post-tool-use', '*', { tool_name: 'EnterWorktree', cwd: path.join(root, 'project') }, 'claude', 'background');
+
+  it('prepares it from the team clone as last fetched', async () => {
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, prepareCheckout: 'once', inline: true, localOnly: true });
+  });
+
+  it('prepares nothing in a main checkout, where init runs', async () => {
+    fs.rmSync(path.join(root, 'project', '.git'));
+    fs.mkdirSync(path.join(root, 'project', '.git'));
+
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('prepares nothing in a submodule or a --separate-git-dir checkout, whose git dir holds no commondir', async () => {
+    fs.rmSync(path.join(root, 'repo.git', 'worktrees', 'project', 'commondir'));
+
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('prepares nothing for an HTTP team, whose checkouts keep no delivery record', async () => {
+    await toolUse(projectConfig('http'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('git\'s hook for a new worktree hands the pull it starts after git returns the checkout to prepare', async () => {
+    const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: projectConfig('git') });
+
+    await dispatcher.dispatch('post-checkout', '*', {
+      cwd: path.join(root, 'project'), hook_event_name: 'post-checkout', git_args: ['0'.repeat(40), 'a'.repeat(40), '1'],
+    }, 'git');
+
+    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'pull', '--silent'], expect.objectContaining({
+      env: expect.objectContaining({ TEAMAI_GIT_HOOK: 'post-checkout', TEAMAI_PREPARE_CHECKOUT: 'once' }),
+    }));
+  });
+
+  it('a session start still pulls when the tool roots cannot be created', async () => {
+    mockCreateProjectToolRoots.mockRejectedValueOnce(new Error('EACCES'));
+    const handler = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'pull')?.handler;
+
+    await handler?.execute({ session_id: 's-roots', cwd: path.join(root, 'project') }, 'claude', projectConfig('git'));
+
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, prepareCheckout: 'once' });
+  });
+});
+
+describe('session-start team env hint (#875, #1018)', () => {
   let teamRepo: string;
 
   beforeEach(() => {
@@ -1504,7 +1800,38 @@ describe('session-start secrets hint (#875)', () => {
     expect(lines.filter((line) => line !== secretLines[0])).toEqual(['MR context', 'Package context']);
   });
 
-  it('adds nothing when the scope declares no secrets', async () => {
+  it('names the scope\'s env variables and env exec when it delivers variables but no secrets (#1018)', async () => {
+    fs.mkdirSync(path.join(teamRepo, 'env'));
+    fs.writeFileSync(path.join(teamRepo, 'env', 'env.yaml'), 'variables:\n  - key: API_URL\n    value: https://api.example\n');
+
+    const lines = await sessionContext();
+
+    const envLines = lines.filter((line) => line.includes('API_URL'));
+    expect(envLines).toHaveLength(1);
+    expect(envLines[0]).toContain('teamai env exec --');
+    expect(envLines[0]).not.toContain('teamai env set KEY');
+  });
+
+  it('includes inherited user variables in the hint through the shared env resolution', async () => {
+    const userRepo = path.join(teamRepo, 'user-team');
+    fs.mkdirSync(path.join(userRepo, 'env'), { recursive: true });
+    fs.writeFileSync(path.join(userRepo, 'teamai.yaml'), 'team: acme\nrepo: https://example.test/acme/team.git\n');
+    fs.writeFileSync(path.join(userRepo, 'env', 'env.yaml'), 'variables:\n  - key: USER_ONLY\n    value: inherited\n');
+    const { loadLocalConfigForScope } = await import('../config.js');
+    vi.mocked(loadLocalConfigForScope).mockResolvedValueOnce({
+      ...scope, scope: 'user', repo: { localPath: userRepo, remote: '' },
+    });
+    const projectConfig: LocalConfig = {
+      ...scope, scope: 'project', inheritUserScope: true, projectRoot: teamRepo, repo: { localPath: teamRepo, remote: '' },
+    };
+    const dispatcher = createDispatcher({ handlers: filterHandlersForConfig(buildHandlerRegistry(), projectConfig), localConfig: projectConfig });
+    const result = await dispatcher.dispatch('session-start', '*', { session_id: 'sid-inherited', cwd: teamRepo }, 'claude', 'foreground');
+
+    expect(result.errors).toEqual([]);
+    expect(result.output).toContain('Team env variables in this scope: USER_ONLY.');
+  });
+
+  it('adds nothing when the scope delivers no env', async () => {
     expect(await sessionContext()).toEqual(['MR context', 'Package context']);
   });
 
@@ -1516,10 +1843,10 @@ describe('session-start secrets hint (#875)', () => {
   });
 
   it('is a foreground team handler, so a directory without teamai never gets the line', () => {
-    const registration = buildHandlerRegistry().find((r) => r.handler.name === 'secrets-hint');
+    const registration = buildHandlerRegistry().find((r) => r.handler.name === 'team-env-hint');
     expect(registration).toMatchObject({ event: 'session-start', matcher: '*', requiresConfig: true });
     expect(registration?.background).not.toBe(true);
-    expect(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name)).not.toContain('secrets-hint');
+    expect(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name)).not.toContain('team-env-hint');
   });
 });
 
@@ -1567,6 +1894,9 @@ describe('webhook-dispatch handler (#701, #702)', () => {
   const handler = () => buildHandlerRegistry().find(
     (r) => r.handler.name === 'webhook-dispatch',
   )!.handler;
+  const skillUse = () => buildHandlerRegistry().find(
+    (r) => r.handler.name === 'skill-use',
+  )!.handler;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1576,14 +1906,13 @@ describe('webhook-dispatch handler (#701, #702)', () => {
     });
   });
 
-  it('maps PostToolUse/Skill to skill-use and forwards only the skill name (#701, #702)', async () => {
-    await handler().execute(
+  it('sends skill-use for a Skill call and forwards only the skill name (#701, #702)', async () => {
+    await skillUse().execute(
       {
         hook_event_name: 'PostToolUse',
         tool_name: 'Skill',
         tool_input: { skill: 'demo', args: 'api_key=SYNTHETIC_SECRET_NOT_REAL' },
         tool_response: 'SYNTHETIC_PRIVATE_OUTPUT',
-        session_id: 'sid',
       },
       'claude', scope,
     );
@@ -1625,16 +1954,15 @@ describe('webhook-dispatch handler (#701, #702)', () => {
 
   // Codex review finding 9: Cursor represents skill use as a `Read` of a
   // SKILL.md file (tool_name: 'Read'), NOT a `Skill` tool — and it dispatches
-  // via the camelCase `postToolUse` event. The webhook must reach the same
-  // parity trackHandler has (shared resolveSkillUse), forwarding {skillName}.
-  it('maps a Cursor camelCase postToolUse Read of SKILL.md to skill-use (#702, #9)', async () => {
-    await handler().execute(
+  // via the camelCase `postToolUse` event. The webhook comes from the handler
+  // that records the use, so the two cannot disagree.
+  it('sends skill-use for a Cursor camelCase postToolUse Read of SKILL.md (#702, #9)', async () => {
+    await skillUse().execute(
       {
         hook_event_name: 'postToolUse',
         tool_name: 'Read',
         tool_input: { path: '/root/.cursor/skills/tdd/SKILL.md' },
         tool_response: 'SYNTHETIC_PRIVATE_OUTPUT',
-        session_id: 'sid',
       },
       'cursor', scope,
     );
@@ -1645,25 +1973,16 @@ describe('webhook-dispatch handler (#701, #702)', () => {
     expect(JSON.stringify(payload)).not.toContain('SYNTHETIC_PRIVATE_OUTPUT');
   });
 
-  // Finding 9 guard: a NORMAL (non-SKILL.md) Read must NOT produce a skill-use
-  // webhook — data must be empty so a plain file read never leaks or fires.
-  it('does NOT emit skill-use data for a normal (non-SKILL.md) Read (#9 guard)', async () => {
-    await handler().execute(
-      {
-        hook_event_name: 'PostToolUse',
-        tool_name: 'Read',
-        tool_input: { path: '/root/project/src/secrets.ts' },
-        tool_response: 'const API_KEY = "SYNTHETIC_SECRET_NOT_REAL";',
-        session_id: 'sid',
-      },
-      'cursor', scope,
-    );
-    expect(mockSendWebhook).toHaveBeenCalledOnce();
-    const [event, payload] = mockSendWebhook.mock.calls[0];
-    expect(event).toBe('skill-use');
-    expect(payload.data).toEqual({});
-    expect(JSON.stringify(payload)).not.toContain('SYNTHETIC_SECRET_NOT_REAL');
-    expect(JSON.stringify(payload)).not.toContain('secrets.ts');
+  it('sends no webhook for a normal (non-SKILL.md) Read (#9 guard)', async () => {
+    const payload = {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Read',
+      tool_input: { path: '/root/project/src/secrets.ts' },
+      tool_response: 'const API_KEY = "SYNTHETIC_SECRET_NOT_REAL";',
+    };
+    await skillUse().execute(payload, 'cursor', scope);
+    await handler().execute(payload, 'cursor', scope);
+    expect(mockSendWebhook).not.toHaveBeenCalled();
   });
 
   // Codex review finding 2: Copilot fires SessionEnd (not Stop); the handler
@@ -1683,35 +2002,29 @@ describe('webhook-dispatch handler (#701, #702)', () => {
   });
 
   // Codex review finding 3: an extracted skillName that fails isValidSkillName
-  // (e.g. a path-like `command` arg) must be dropped, not forwarded. Uses the
-  // real resolveSkillUse, which validates with isValidSkillName.
-  it('drops an invalid skillName instead of forwarding it (#701)', async () => {
-    await handler().execute(
+  // (e.g. a path-like `command` arg) is no skill use, so nothing is sent.
+  it('sends nothing for an invalid skillName (#701)', async () => {
+    await skillUse().execute(
       {
         hook_event_name: 'PostToolUse',
         tool_name: 'Skill',
         tool_input: { command: '/etc/passwd; rm -rf /' },
-        session_id: 'sid',
       },
       'claude', scope,
     );
 
-    expect(mockSendWebhook).toHaveBeenCalledOnce();
-    const [, payload] = mockSendWebhook.mock.calls[0];
-    expect(payload.data).toEqual({});
-    expect(JSON.stringify(payload)).not.toContain('passwd');
+    expect(mockSendWebhook).not.toHaveBeenCalled();
   });
 });
 
 // Codex review finding 12: the tests above call handler.execute() directly,
-// bypassing dispatcher routing. These drive the REAL dispatcher for the
-// post-tool-use `Skill` matcher — the matcher Cursor's SKILL.md Read is wired to
-// (git f0ab4eb switched Cursor tracking from Read to the Skill matcher;
-// BUILTIN_HOOK_SPECS has no Read matcher) — to prove a Read payload routes
-// through it to webhookHandler. webhookHandler is background: true, so it runs in
-// the 'background' dispatch pass. (Cursor's own runtime is external and not
-// testable in this repo; this covers the CLI-side routing that is.)
-describe('post-tool-use Skill-matcher dispatch routes Cursor SKILL.md Read to the webhook (#702, #9, #12)', () => {
+// bypassing dispatcher routing. These drive the REAL dispatcher on the
+// wildcard post-tool-use pass, the one every tool installs (#1221), to prove a
+// Read payload routes through it to the skill-use webhook. skill-use is
+// background: true, so it runs in the 'background' dispatch pass. (Cursor's own
+// runtime is external and not testable in this repo; this covers the CLI-side
+// routing that is.)
+describe('post-tool-use wildcard dispatch routes Cursor SKILL.md Read to the webhook (#702, #9, #12)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockLoadWebhookConfig.mockResolvedValue({
@@ -1720,25 +2033,22 @@ describe('post-tool-use Skill-matcher dispatch routes Cursor SKILL.md Read to th
     });
   });
 
-  it('registers webhook-dispatch under the post-tool-use Skill matcher', () => {
-    const reg = buildHandlerRegistry().find(
-      (r) => r.event === 'post-tool-use' && r.matcher === 'Skill' && r.handler.name === 'webhook-dispatch',
-    );
-    expect(reg).toBeDefined();
-    expect(reg!.background).toBe(true);
+  it('registers no webhook-dispatch on post-tool-use: skill-use sends it', () => {
+    expect(buildHandlerRegistry().filter(
+      (r) => r.event === 'post-tool-use' && r.handler.name === 'webhook-dispatch',
+    )).toEqual([]);
   });
 
-  it('a Cursor Read of SKILL.md dispatched via the Skill matcher produces a skill-use webhook with {skillName}', async () => {
+  it('a Cursor Read of SKILL.md on the wildcard pass produces a skill-use webhook with {skillName}', async () => {
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
     await dispatcher.dispatch(
       'post-tool-use',
-      'Skill',
+      '*',
       {
         hook_event_name: 'PostToolUse',
         tool_name: 'Read',
         tool_input: { path: '/root/.cursor/skills/tdd/SKILL.md' },
         tool_response: 'SYNTHETIC_PRIVATE_OUTPUT',
-        session_id: 'sid',
       },
       'cursor',
       'background',
@@ -1751,36 +2061,71 @@ describe('post-tool-use Skill-matcher dispatch routes Cursor SKILL.md Read to th
     expect(JSON.stringify(payload)).not.toContain('SYNTHETIC_PRIVATE_OUTPUT');
   });
 
-  it('a normal Read (non-SKILL.md) dispatched via the Skill matcher produces empty skill-use data', async () => {
+  it('a normal Read (non-SKILL.md) on the wildcard pass sends no webhook', async () => {
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
     await dispatcher.dispatch(
       'post-tool-use',
-      'Skill',
+      '*',
       {
         hook_event_name: 'PostToolUse',
         tool_name: 'Read',
         tool_input: { path: '/root/project/src/secrets.ts' },
         tool_response: 'const API_KEY = "SYNTHETIC_SECRET_NOT_REAL";',
-        session_id: 'sid',
       },
       'cursor',
       'background',
     );
 
-    expect(mockSendWebhook).toHaveBeenCalledOnce();
-    const [, payload] = mockSendWebhook.mock.calls[0];
-    expect(payload.data).toEqual({});
-    expect(JSON.stringify(payload)).not.toContain('SYNTHETIC_SECRET_NOT_REAL');
-    expect(JSON.stringify(payload)).not.toContain('secrets.ts');
+    expect(mockSendWebhook).not.toHaveBeenCalled();
   });
 });
 
-describe('track-slash handler: dotted and colon skill names', () => {
+// PostToolUse payloads as Muse Code 1.4.6 sends them, tool_response trimmed.
+describe('skill-use handler: Muse Code', () => {
+  const musePayload = (toolName: string, toolInput: Record<string, unknown>) => ({
+    hook_event_name: 'PostToolUse',
+    tool_name: toolName,
+    tool_input: toolInput,
+    tool_use_id: 'call_14',
+    tool_response: '<read-skill-result name="live-skill" status="ok"></read-skill-result>',
+    session_id: '01a131d0-7b02-7e90-bd5a-74e6934af652',
+    turn_id: '2d808450-3250-42fc-93e5-27b5a7b725ea',
+    cwd: '/work/project',
+    transcript_path: null,
+    model: 'muse-spark-1.3',
+    permission_mode: 'bypassPermissions',
+    model_provider: 'meta',
+  });
+  const track = () => buildHandlerRegistry()
+    .find((r) => r.event === 'post-tool-use' && r.matcher === '*' && r.handler.name === 'skill-use')!.handler;
+
+  it('records a read_skill call as a use of that skill', async () => {
+    const { appendUsageEvent, updateKnownSkills } = await import('../usage-tracker.js');
+    vi.mocked(appendUsageEvent).mockClear();
+
+    await track().execute(musePayload('read_skill', { name: 'live-skill' }), 'muse', scope);
+
+    expect(appendUsageEvent).toHaveBeenCalledOnce();
+    expect(vi.mocked(appendUsageEvent).mock.calls[0][0]).toMatchObject({ skill: 'live-skill', tool: 'muse' });
+    expect(updateKnownSkills).toHaveBeenCalledWith('live-skill');
+  });
+
+  it('records nothing for a shell call', async () => {
+    const { appendUsageEvent } = await import('../usage-tracker.js');
+    vi.mocked(appendUsageEvent).mockClear();
+
+    await track().execute(musePayload('bash', { command: 'echo hi', workdir: '/work/project' }), 'muse', scope);
+
+    expect(appendUsageEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('skill-mention handler: dotted and colon skill names', () => {
   it('tracks a skill name that contains a dot', async () => {
     const { appendUsageEvent, updateKnownSkills } = await import('../usage-tracker.js');
     const registry = buildHandlerRegistry();
     const handler = registry.find(
-      (r) => r.event === 'prompt-submit' && r.handler.name === 'track-slash',
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'skill-mention',
     )!.handler;
 
     vi.mocked(appendUsageEvent).mockClear();
@@ -1801,7 +2146,7 @@ describe('track-slash handler: dotted and colon skill names', () => {
     const { appendUsageEvent, updateKnownSkills } = await import('../usage-tracker.js');
     const registry = buildHandlerRegistry();
     const handler = registry.find(
-      (r) => r.event === 'prompt-submit' && r.handler.name === 'track-slash',
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'skill-mention',
     )!.handler;
 
     vi.mocked(appendUsageEvent).mockClear();
@@ -1817,6 +2162,28 @@ describe('track-slash handler: dotted and colon skill names', () => {
     expect(vi.mocked(appendUsageEvent).mock.calls[0][0].skill).toBe('ns:deploy');
     expect(updateKnownSkills).toHaveBeenCalledWith('ns:deploy');
   });
+
+  it.each([
+    '/Volumes/External/project/.claude/skills/tdd/SKILL.md',
+    '/Users/alice/project',
+    '/tmp/project',
+    '/tdd/notes',
+    '/tdd\\notes',
+    '//server/share',
+    '/tdd+invalid',
+  ])('does not record a path or a partial skill name: %s', async (prompt) => {
+    const { appendUsageEvent, updateKnownSkills } = await import('../usage-tracker.js');
+    const handler = buildHandlerRegistry().find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'skill-mention',
+    )!.handler;
+    vi.mocked(appendUsageEvent).mockClear();
+    vi.mocked(updateKnownSkills).mockClear();
+
+    await handler.execute({ prompt, hook_event_name: 'UserPromptSubmit' }, 'claude', scope);
+
+    expect(appendUsageEvent).not.toHaveBeenCalled();
+    expect(updateKnownSkills).not.toHaveBeenCalled();
+  });
 });
 
 describe('buildAdoptedSummary', () => {
@@ -1828,5 +2195,51 @@ describe('buildAdoptedSummary', () => {
     expect(msg).toContain('auth-retry, k8s-oom');
     // User-facing CLI output must be English.
     expect(msg).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+});
+
+describe('mr-hint agent language (#1014)', () => {
+  it('passes language en from teamai.yaml into the hint', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\nlanguage: en\n');
+      const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
+      mockMrHintOutput.mockClear();
+      await handler.execute({}, 'claude', {
+        ...scope,
+        repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
+      });
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        'en',
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes no English override when language is omitted', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\n');
+      const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
+      mockMrHintOutput.mockClear();
+      await handler.execute({}, 'claude', {
+        ...scope,
+        repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
+      });
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        undefined,
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

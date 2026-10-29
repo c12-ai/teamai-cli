@@ -379,7 +379,7 @@ describe('source', () => {
     it('allows a nested identity change when the old and new destinations are disjoint', async () => {
       const repo = 'https://source.test/platform/repo.git';
       teamConfig.sources = [{ name: 'platform', repo }];
-      teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+      teamConfig.toolPaths = { claude: {}, codex: { skills: '.codex/skills' } };
       const YAML = (await import('yaml')).default;
       await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
       await fse.ensureDir(path.join(homeDir, '.codex/skills'));
@@ -727,7 +727,7 @@ describe('source', () => {
     it('does not claim a public skill when no configured tool is installed', async () => {
       const repo = 'https://source.test/platform/repo.git';
       teamConfig.sources = [{ name: 'platform', repo }];
-      teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+      teamConfig.toolPaths = { claude: {}, codex: { skills: '.codex/skills' } };
       const YAML = (await import('yaml')).default;
       await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
       await fse.outputFile(path.join(fixtureSourceRepoDir(), 'skills/shared-skill/SKILL.md'), '# Source');
@@ -895,7 +895,7 @@ describe('source', () => {
       const previousUrl = 'https://source.test/original/repo.git';
       const repo = changedRepository ? 'https://source.test/replacement/repo.git' : previousUrl;
       teamConfig.sources = [{ name: 'platform', repo }];
-      teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+      teamConfig.toolPaths = { claude: {}, codex: { skills: '.codex/skills' } };
       const YAML = (await import('yaml')).default;
       await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
       await fse.ensureDir(path.join(homeDir, '.codex/skills'));
@@ -924,7 +924,11 @@ describe('source', () => {
       expect(await fse.readFile(newPath, 'utf8')).toBe('# Replacement content');
       if (hasOtherOwner) {
         expect(await fse.readFile(path.join(homeDir, oldPath, 'SKILL.md'), 'utf8')).toBe('# Original content');
-        const otherTeam = { ...teamConfig, sources: [{ name: 'platform', repo: previousUrl }], toolPaths: { claude: { skills: '.claude/skills' } } };
+        const otherTeam = {
+          ...teamConfig,
+          sources: [{ name: 'platform', repo: previousUrl }],
+          toolPaths: { claude: { skills: '.claude/skills' }, codex: {} },
+        };
         await fse.outputFile(path.join(otherConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(otherTeam));
         const otherRepo = path.join(homeDir, '.teamai', 'source-repos', previousId, 'repo');
         await fse.outputFile(path.join(otherRepo, 'skills/shared-skill/SKILL.md'), '# Original refreshed');
@@ -936,7 +940,9 @@ describe('source', () => {
         // Released claims must no longer prevent another producer using the old destination.
         const incomingUrl = 'https://source.test/independent/repo.git';
         await fse.outputFile(path.join(otherConfig.repo.localPath, 'teamai.yaml'), YAML.stringify({
-          ...teamConfig, sources: [{ name: 'independent', repo: incomingUrl }], toolPaths: { claude: { skills: '.claude/skills' } },
+          ...teamConfig,
+          sources: [{ name: 'independent', repo: incomingUrl }],
+          toolPaths: { claude: { skills: '.claude/skills' }, codex: {} },
         }));
         const incomingRepo = path.join(homeDir, '.teamai', 'source-repos', createHash('sha256').update(incomingUrl).digest('hex'), 'repo');
         await fse.outputFile(path.join(incomingRepo, 'skills/shared-skill/SKILL.md'), '# Independent source');
@@ -998,9 +1004,9 @@ describe('source', () => {
       expect(deployed).toBe(false);
     });
 
-    it('removes a source skill from its recorded path when a shared Codex skill appears later', async () => {
+    it('keeps the member\'s shared Codex skill that appears later, delivering to the recorded path (#993)', async () => {
       teamConfig.sources = [{ name: 'platform', repo: 'git@git.woa.com:platform/repo.git' }];
-      teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+      teamConfig.toolPaths = { claude: {}, codex: { skills: '.codex/skills' } };
       const YAML = (await import('yaml')).default;
       await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
 
@@ -1024,12 +1030,13 @@ describe('source', () => {
 
       await pullSources(localConfig, { force: true });
 
+      // The shared copy is no version of the source skill: the member's.
       const updatedManifest = await fse.readJson(getSourceManifestPath('platform', localConfig)) as SourceInstallManifest;
       expect(updatedManifest.installedPaths?.['old-skill']).toEqual([
-        '.agents/skills/old-skill',
+        '.codex/skills/old-skill',
       ]);
-
-      expect(await fse.pathExists(path.join(homeDir, '.codex/skills/old-skill'))).toBe(false);
+      expect(await fse.readFile(path.join(homeDir, '.codex/skills/old-skill/SKILL.md'), 'utf8')).toBe('# Updated source');
+      expect(await fse.readFile(path.join(homeDir, '.agents/skills/old-skill/SKILL.md'), 'utf8')).toBe('# User copy');
       await fse.ensureDir(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill'));
       await fse.writeFile(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill', 'SKILL.md'), '# New');
       await fse.writeFile(path.join(fixtureSourceRepoDir(), 'teamai.yaml'), YAML.stringify({
@@ -1039,7 +1046,7 @@ describe('source', () => {
       await pullSources(localConfig, { force: true });
 
       expect(await fse.pathExists(path.join(homeDir, '.codex', 'skills', 'old-skill'))).toBe(false);
-      expect(await fse.pathExists(path.join(homeDir, '.agents', 'skills', 'old-skill'))).toBe(false);
+      expect(await fse.readFile(path.join(homeDir, '.agents/skills/old-skill/SKILL.md'), 'utf8')).toBe('# User copy');
     });
   });
 });

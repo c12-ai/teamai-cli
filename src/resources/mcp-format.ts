@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { McpServerDef, McpTransport } from '../types.js';
 import { sameEnvName } from './env-key.js';
+import { mcpFormatOf } from '../tools.js';
 
 // ─── Per-tool rendering ──────────────────────────────────────
 //
@@ -15,25 +16,13 @@ import { sameEnvName } from './env-key.js';
 //  Keeping the differences here — rather than in the reconcile engine — is the
 //  same split agents uses between agent-format.ts and its handler.
 
-export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi';
+export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi' | 'muse';
 
-const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'qoder-cn', 'kiro', 'zcode', 'omp']);
-const CURSOR_TOOLS = new Set(['cursor']);
-const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
-const BUDDY_TOOLS = new Set(['codebuddy', 'workbuddy']);
-const OPENCODE_TOOLS = new Set(['opencode']);
-const COPILOT_TOOLS = new Set(['copilot']);
 const COPILOT_ALL_TOOLS = '*';
 
+/** The format of the tool's declared MCP channel, or null when none is known. */
 export function detectMcpFormat(tool: string): McpFormat | null {
-  if (tool === 'pi') return 'pi';
-  if (CLAUDE_TOOLS.has(tool)) return 'claude';
-  if (CURSOR_TOOLS.has(tool)) return 'cursor';
-  if (CODEX_TOOLS.has(tool)) return 'codex';
-  if (BUDDY_TOOLS.has(tool)) return 'buddy';
-  if (OPENCODE_TOOLS.has(tool)) return 'opencode';
-  if (COPILOT_TOOLS.has(tool)) return 'copilot';
-  return null;
+  return mcpFormatOf(tool);
 }
 
 /**
@@ -43,6 +32,7 @@ export function detectMcpFormat(tool: string): McpFormat | null {
  */
 export const MCP_SERVER_KEY: Record<Exclude<McpFormat, 'codex'>, string> = {
   pi: 'mcpServers',
+  muse: 'mcpServers',
   claude: 'mcpServers',
   cursor: 'mcpServers',
   buddy: 'mcpServers',
@@ -59,6 +49,9 @@ export function sameServerKey(a: McpFormat, b: McpFormat): boolean {
 /** Transports each format can actually express. */
 const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   pi: new Set<McpTransport>(['stdio', 'http']),
+  // Muse Code fails startup validation on a single `type: sse` server and then
+  // loads no MCP server at all.
+  muse: new Set<McpTransport>(['stdio', 'http']),
   claude: new Set<McpTransport>(['stdio', 'http', 'sse']),
   cursor: new Set<McpTransport>(['stdio', 'http', 'sse']),
   buddy: new Set<McpTransport>(['stdio', 'http', 'sse']),
@@ -302,7 +295,7 @@ export function renderJsonEntry(format: Exclude<McpFormat, 'codex'>, def: McpSer
     // Omit exposure to keep Pi's native codemode default.
     return entry;
   }
-  if (format === 'claude') return renderClaude(def);
+  if (format === 'claude' || format === 'muse') return renderClaude(def);
   if (format === 'cursor') return renderCursor(def);
   if (format === 'opencode') return renderOpencode(def);
   if (format === 'copilot') return renderCopilot(def);
@@ -355,4 +348,21 @@ export function renderCodexBlock(def: McpServerDef): string {
 /** Stable content hash of a rendered entry; drives idempotent rewrites. */
 export function entryHash(rendered: unknown): string {
   return crypto.createHash('sha1').update(JSON.stringify(rendered)).digest('hex').slice(0, 16);
+}
+
+/** Muse saves inferred stdio types and object keys differently; array order remains meaningful. */
+export function museEntryHash(rendered: unknown): string {
+  let value = rendered;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const entry = value as Record<string, unknown>;
+    if (entry.type === undefined && typeof entry.command === 'string' && entry.url === undefined) {
+      value = { type: 'stdio', ...entry };
+    }
+  }
+  const canonical = JSON.stringify(value, (_key, item: unknown) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    const object = item as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(object).sort().map(key => [key, object[key]]));
+  });
+  return crypto.createHash('sha1').update(canonical).digest('hex').slice(0, 16);
 }

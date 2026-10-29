@@ -6,6 +6,7 @@
  * Asserted through `pull`, on the files in tool dirs and the state it saves.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -52,6 +53,8 @@ vi.mock('../source.js', () => ({ pullSources: vi.fn().mockResolvedValue(undefine
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
   reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
+  deliveredHookFiles: vi.fn().mockResolvedValue([]),
+  unreadableHookFiles: vi.fn().mockResolvedValue([]),
 }));
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
@@ -260,7 +263,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
     expect((await homeRecord())?.agentModels?.['implementer']?.['claude']).toEqual({ step: 'team', model: 'fable', source: 'models/aliases.yaml', alias: 'strong' });
   });
 
-  it('overwrites a copy the member changed with the team version, and records it', async () => {
+  // c12 fork: the team version wins, so an edited copy takes the new model too.
+  it('overwrites a copy the member changed with the team version and its new model (c12 fork)', async () => {
     await writeAliases(STRONG);
     await writeAgent(IMPLEMENTER);
     await pullOnce();
@@ -276,7 +280,7 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
     expect(logged('warn', /Overwrote local edits in .*implementer\.md with the team version/)).toBe(true);
     expect(await codexModel()).toMatchObject({ model: 'gpt-6-luna' });
     const recorded = (await homeRecord())?.agentModels?.['implementer'];
-    expect(recorded?.['claude']).toEqual({ step: 'team', model: 'fable', source: 'models/aliases.yaml', alias: 'strong' });
+    expect(recorded?.['claude']).toMatchObject({ model: 'fable' });
     expect(recorded?.['codex']).toEqual({ step: 'team', model: 'gpt-6-luna', source: 'models/aliases.yaml', alias: 'strong' });
   });
 
@@ -308,19 +312,19 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       expect((await homeRecord())?.agentModels?.['implementer']?.['codex']).toEqual({ step: 'local', source: path.join(homeDir, '.teamai/models/aliases.yaml'), alias: 'strong' });
     });
 
-    it('overwrites an edited copy when only the local override changed the deployed version', async () => {
+    // c12 fork: nothing is kept; the edited copy takes the override's model.
+    it('overwrites an edited copy when the override changes its model (c12 fork)', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
       await fse.writeFile(claudeFile(), `${await fse.readFile(claudeFile(), 'utf-8')}\nMy own note.\n`);
-      // Codex's change is what makes the ordinary pull redeploy the agent;
-      // an edited copy alone is left to the full sync.
       await writeLocal('aliases:\n  strong:\n    claude: sonnet\n    codex: gpt-6-luna\n');
 
       await pull({ silent: true });
 
-      expect(logged('warn', /Overwrote local edits in .*implementer\.md with the team version/)).toBe(true);
+      expect(await claudeModel()).toMatchObject({ model: 'sonnet' });
       expect(await fse.readFile(claudeFile(), 'utf-8')).not.toContain('My own note.');
+      expect(logged('warn', /Overwrote local edits in .*implementer\.md/)).toBe(true);
     });
 
     it('applies in a project checkout too', async () => {
@@ -328,7 +332,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await writeAgent(IMPLEMENTER);
       await writeLocal('aliases:\n  strong:\n    claude: sonnet\n');
       const projectRoot = path.join(tmpDir, 'project');
-      await fse.ensureDir(path.join(projectRoot, '.git'));
+      await fse.ensureDir(projectRoot);
+      execFileSync('git', ['init', '-q', projectRoot]);
       await fse.ensureDir(path.join(projectRoot, '.claude'));
       vi.mocked(detectProjectConfig).mockResolvedValue({ ...localConfig, scope: 'project', projectRoot });
 
@@ -622,7 +627,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       const projectRoot = path.join(tmpDir, 'project');
-      await fse.ensureDir(path.join(projectRoot, '.git'));
+      await fse.ensureDir(projectRoot);
+      execFileSync('git', ['init', '-q', projectRoot]);
       await fse.ensureDir(path.join(projectRoot, '.claude'));
       const projectConfig: LocalConfig = { ...localConfig, scope: 'project', projectRoot };
       vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
@@ -656,7 +662,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       const projectRoot = path.join(tmpDir, 'project');
-      await fse.ensureDir(path.join(projectRoot, '.git'));
+      await fse.ensureDir(projectRoot);
+      execFileSync('git', ['init', '-q', projectRoot]);
       await fse.ensureDir(path.join(projectRoot, '.claude'));
       vi.mocked(detectProjectConfig).mockResolvedValue({ ...localConfig, scope: 'project', projectRoot, inheritUserScope: true });
       await pullOnce();
@@ -667,7 +674,7 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await pull({ silent: true }, outcome);
 
       expect(logged('success', /\[user\] Already synced/)).toBe(false);
-      expect(logged('success', /\[project\] Already synced at abc1234/)).toBe(true);
+      expect(logged('success', /\[workspace\] Already synced at abc1234/)).toBe(true);
       expect(heldLines().some((line) => line.includes('Held implementer.yaml'))).toBe(true);
       expect(outcome.completed).toBe(false);
     });
@@ -728,7 +735,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
   describe('what the fast path says it did', () => {
     const writeLocal = (text: string): Promise<void> => fse.outputFile(path.join(homeDir, '.teamai/models/aliases.yaml'), text);
 
-    it('overwrites a copy the member changed on the fast path, and names it', async () => {
+    // c12 fork: the fast path replaces the edited copy as the full sync would.
+    it('overwrites a copy the member changed on the fast path when its model changes (c12 fork)', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -736,18 +744,15 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await fse.writeFile(claudeFile(), edited);
       await writeLocal('aliases:\n  strong:\n    claude: sonnet\n');
 
+      vi.clearAllMocks();
       await pull({ silent: true });
       expect(alreadySynced()).toBe(true);
       expect(logged('warn', /Overwrote local edits in .*implementer\.md with the team version/)).toBe(true);
       expect(await fse.readFile(claudeFile(), 'utf-8')).not.toContain('My own note.');
-
-      // Once overwritten, a later pull has nothing left to warn about.
-      vi.clearAllMocks();
-      await pull({ silent: true });
-      expect(logged('warn', /Overwrote local edits/)).toBe(false);
+      expect(await claudeModel()).toMatchObject({ model: 'sonnet' });
     });
 
-    it('delivers an agent that had no copy by a full sync, not as an updated model', async () => {
+    it('says it delivered an agent that had no copy, not that it updated its model', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -760,13 +765,13 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
 
       await pull({ silent: true });
 
-      // The deleted copies are in the delivery record, so the fast path steps aside for a full sync.
-      expect(alreadySynced()).toBe(false);
+      expect(alreadySynced()).toBe(true);
       expect(await claudeModel()).toMatchObject({ model: 'opus' });
       expect(logged('success', /Updated the model/)).toBe(false);
+      expect(logged('success', /Delivered 1 agent\(s\) missing from a tool: implementer/)).toBe(true);
     });
 
-    it('delivers a recorded agent whose copy was deleted since the last pull by a full sync', async () => {
+    it('delivers a recorded agent whose copy was deleted since the last pull', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -774,9 +779,9 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
 
       await pull({ silent: true });
 
-      expect(alreadySynced()).toBe(false);
-      expect(logged('info', /1 delivered file\(s\) missing; syncing/)).toBe(true);
+      expect(alreadySynced()).toBe(true);
       expect(await codexModel()).toMatchObject({ model: 'gpt-6-sol' });
+      expect(logged('success', /Delivered 1 agent\(s\) missing from a tool: implementer/)).toBe(true);
     });
   });
 
@@ -884,7 +889,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
     await pullOnce();
 
     const projectRoot = path.join(tmpDir, 'project');
-    await fse.ensureDir(path.join(projectRoot, '.git'));
+    await fse.ensureDir(projectRoot);
+    execFileSync('git', ['init', '-q', projectRoot]);
     await fse.ensureDir(path.join(projectRoot, '.claude'));
     const projectConfig: LocalConfig = { ...localConfig, scope: 'project', projectRoot };
     vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);

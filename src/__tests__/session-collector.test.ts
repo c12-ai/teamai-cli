@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import fse from 'fs-extra';
 import {
   collectSession,
   isValuable,
@@ -66,6 +67,28 @@ describe('collectSession', () => {
     expect(s.firstPrompt).toContain('<REDACTED:gh_tok>');
     expect(s.firstPrompt).not.toContain('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
   });
+
+  it('reports the git state of the earliest start that recorded one, whatever the event order', () => {
+    const events = [
+      ...sampleEvents(),
+      ev({ type: 'session_start', timestamp: '2026-03-10T10:00:00.000Z', sessionId: SID, gitAtStart: { head: 'b'.repeat(40), dirty: true } }),
+      ev({ type: 'session_start', timestamp: '2026-03-10T09:30:00.000Z', sessionId: SID, gitAtStart: { head: 'a'.repeat(40), dirty: false } }),
+    ];
+    expect(collectSession(SID, events)!.gitAtStart).toEqual({ head: 'a'.repeat(40), dirty: false });
+  });
+
+  it('reports no git state when no start recorded one', () => {
+    expect(collectSession(SID, sampleEvents())).not.toHaveProperty('gitAtStart');
+  });
+
+  it('keeps the git state out of the monthly log', () => {
+    const plain = collectSession(SID, sampleEvents())!;
+    const withGit = collectSession(SID, [
+      ...sampleEvents(),
+      ev({ type: 'session_start', timestamp: '2026-03-10T09:00:01.000Z', sessionId: SID, gitAtStart: { head: 'a'.repeat(40), dirty: true } }),
+    ])!;
+    expect(renderSessionMarkdown(withGit, { includePrompt: true })).toBe(renderSessionMarkdown(plain, { includePrompt: true }));
+  });
 });
 
 describe('isValuable', () => {
@@ -106,6 +129,7 @@ describe('appendMonthlyLog / pruneMonthlyLogs', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-sesslog-'));
   });
   afterEach(() => {
+    vi.restoreAllMocks();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -142,6 +166,87 @@ describe('appendMonthlyLog / pruneMonthlyLogs', () => {
     expect(await appendMonthlyLog(dir, b)).not.toBeNull(); // not dropped as a dup
     const content = fs.readFileSync(path.join(dir, '2026-03.md'), 'utf-8');
     expect(content.match(/<!-- teamai:session /g)!.length).toBe(2);
+  });
+
+  it('keeps both sessions when one writer pauses after reading the monthly log', async () => {
+    const file = path.join(dir, '2026-03.md');
+    fs.writeFileSync(file, '# Session log — 2026-03\n\n');
+    const readFile = fs.promises.readFile;
+    let release!: () => void;
+    let readStarted!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { readStarted = resolve; });
+    let first = true;
+    vi.spyOn(fs.promises, 'readFile').mockImplementation(async (...args) => {
+      const content = await readFile(...args);
+      if (args[0] === file && first) {
+        first = false;
+        readStarted();
+        await paused;
+      }
+      return content;
+    });
+    const a = collectSession(SID, sampleEvents())!;
+    const b = { ...a, sessionId: 'other-session' };
+    const firstWrite = appendMonthlyLog(dir, a);
+    await started;
+    const secondWrite = appendMonthlyLog(dir, b);
+    // Without serialization, the second writer commits while the first still
+    // holds its stale snapshot. With serialization, it waits for the first.
+    await Promise.race([secondWrite, new Promise((resolve) => setTimeout(resolve, 100))]);
+    release();
+    await Promise.all([firstWrite, secondWrite]);
+    const content = fs.readFileSync(file, 'utf8');
+    expect(content).toContain(`<!-- teamai:session ${SID} -->`);
+    expect(content).toContain('<!-- teamai:session other-session -->');
+    expect(content.match(/# Session log/g)).toHaveLength(1);
+  });
+
+  it('deduplicates concurrent saves of the same session', async () => {
+    const s = collectSession(SID, sampleEvents())!;
+    const written = await Promise.all(Array.from({ length: 6 }, () => appendMonthlyLog(dir, s)));
+    expect(written.filter((file) => file !== null)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, '2026-03.md'), 'utf8').match(/<!-- teamai:session /g)).toHaveLength(1);
+    expect(fs.readdirSync(dir)).toEqual(['2026-03.md']);
+  });
+
+  it('preserves an existing log when reading it fails and allows a retry', async () => {
+    const file = path.join(dir, '2026-03.md');
+    const original = '# Session log — 2026-03\n\nexisting session\n';
+    fs.writeFileSync(file, original);
+    const failure = Object.assign(new Error('read failed'), { code: 'EIO' });
+    const read = vi.spyOn(fs.promises, 'readFile').mockRejectedValue(failure);
+    const s = collectSession(SID, sampleEvents())!;
+    await expect(appendMonthlyLog(dir, s)).rejects.toMatchObject({ code: 'EIO' });
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.readdirSync(dir)).toEqual(['2026-03.md']);
+    read.mockRestore();
+    expect(await appendMonthlyLog(dir, s)).toBe(file);
+  });
+
+  it('preserves the original log and releases the lock when replacement fails', async () => {
+    const file = path.join(dir, '2026-03.md');
+    const original = '# existing session\n';
+    fs.writeFileSync(file, original);
+    const rename = vi.spyOn(fse, 'rename').mockRejectedValue(Object.assign(new Error('rename failed'), { code: 'EIO' }));
+    const s = collectSession(SID, sampleEvents())!;
+    await expect(appendMonthlyLog(dir, s)).rejects.toMatchObject({ code: 'EIO' });
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.readdirSync(dir)).toEqual(['2026-03.md']);
+    rename.mockRestore();
+    expect(await appendMonthlyLog(dir, s)).toBe(file);
+  });
+
+  it('reports lock contention without changing another holder or the log', async () => {
+    const file = path.join(dir, '2026-03.md');
+    const lock = `${file}.lock`;
+    const owner = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'other-holder' });
+    fs.writeFileSync(file, '# existing session\n');
+    fs.writeFileSync(lock, owner);
+    vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(5_000);
+    await expect(appendMonthlyLog(dir, collectSession(SID, sampleEvents())!)).rejects.toThrow('Retry teamai session save later');
+    expect(fs.readFileSync(file, 'utf8')).toBe('# existing session\n');
+    expect(fs.readFileSync(lock, 'utf8')).toBe(owner);
   });
 
   it('prunes months older than the retention window but keeps recent ones', async () => {

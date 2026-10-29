@@ -7,7 +7,7 @@
  * remote for its head with `git ls-remote`; it must leave the cache, the lock
  * and the team repo alone, and say whether the cache is current.
  */
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -136,14 +136,18 @@ describe('import --from-repo --dry-run (#900 C3)', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  /** A cache from an earlier import, synced at `sha`. */
+  /** A cache from an earlier import, synced at `sha`, and the baseline that import published. */
   function seedCache(sha: string): void {
     fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
     git(['clone', '-q', remote, cacheDir], sandbox);
     fs.writeFileSync(path.join(cacheDir, 'LAST_SYNC'), `${sha}\n2026-01-01T00:00:00.000Z\n`);
+    const evidence = path.join(teamRepo, 'teamwiki', 'evidence', 'code', 'git__acme__widget');
+    fs.mkdirSync(evidence, { recursive: true });
+    fs.writeFileSync(path.join(evidence, 'source-manifest.json'), JSON.stringify({ project: 'git__acme__widget', headSha: sha, files: [] }));
   }
 
   it('does not clone a repo that has no cache yet', async () => {
@@ -222,7 +226,8 @@ describe('import --from-repo --dry-run (#900 C3)', () => {
     expect(result.output).toContain('preview refresh failed, previewing a full clone instead');
     expect(result.output).toContain(`Would import acme/widget at ${main.slice(0, 8)}`);
     expect(result.output).not.toContain('so an incremental run would skip it');
-    await expect(shallowFetch(cacheDir, { provider: 'git' })).rejects.toThrow();
+    vi.stubEnv('TEAMAI_CACHE_DIR', cacheRoot);
+    await expect(shallowFetch(cacheDir, { provider: 'git' })).rejects.toThrow(/git (fetch|reset) failed/);
   });
 
   it('full-clone preview follows remote HEAD even when the cache is on master', async () => {
@@ -262,12 +267,20 @@ describe('import --from-repo --dry-run (#900 C3)', () => {
   });
 
   it('reports the actual --output destination without creating it', async () => {
-    const output = path.join(sandbox, 'custom', 'summary.md');
-    const before = tree(path.dirname(output));
+    const output = path.join(sandbox, 'custom');
     const result = await dryRun(['import', '--from-repo', URL, '--output', output]);
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain(path.join(path.resolve(output, '..', 'teamwiki'), 'evidence', 'code', 'git__acme__widget'));
-    expect(tree(path.dirname(output))).toEqual(before);
+    expect(result.output).toContain(path.join(output, 'teamwiki', 'evidence', 'code', 'git__acme__widget'));
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('does not promise an incremental skip for a teamwiki that was not imported at the cached commit', async () => {
+    seedCache(head);
+    const output = path.join(sandbox, 'other-output');
+    const result = await dryRun(['import', '--from-repo', URL, '--incremental', '--output', output]);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain(`cache is current at ${head.slice(0, 8)}`);
+    expect(result.output).not.toContain('so an incremental run would skip it');
   });
 
   it('selects a remote repo before lower-priority unsafe sources', async () => {

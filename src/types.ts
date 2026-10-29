@@ -1,10 +1,16 @@
 import { z } from 'zod';
+import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { getUserHome, expandHome } from './utils/home.js';
 import { log } from './utils/logger.js';
+import { realHost, toolHome } from './tool-home.js';
+import { channelsOf } from './tools.js';
+import type { WorkspaceChildren } from './workspace-children.js';
+import type { HeadState } from './utils/git.js';
+import type { RunMode } from './launch-context.js';
+import { AllowSchema } from './workflow/requirements.js';
 
-const DEFAULT_COPILOT_HOME = '.copilot';
 const COPILOT_USER_MCP_CONFIG = 'mcp-config.json';
 const COPILOT_PROJECT_MCP_CONFIG = '.github/mcp.json';
 
@@ -61,6 +67,28 @@ export const ToolPathsSchema = z.object({
 export const ScopeEnum = z.enum(['user', 'project']);
 export type Scope = z.infer<typeof ScopeEnum>;
 
+/**
+ * The install scope a member names in `--scope` and in config.yaml (#1099).
+ * `workspace` is the current name of the scope rooted at a directory; `project`
+ * is its older name and stays accepted. Both parse to the internal `project`,
+ * so code compares against one value; the serializer writes `workspace`.
+ */
+export const InstallScopeSchema = z
+  .enum(['user', 'workspace', 'project'])
+  .transform((scope): Scope => (scope === 'workspace' ? 'project' : scope));
+
+/** The value of a `--scope` option. Every command that takes one reads it here. */
+export function parseInstallScope(value: string): Scope {
+  const parsed = InstallScopeSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`Invalid scope "${value}". Use "workspace" or "user".`);
+  return parsed.data;
+}
+
+/** The name a member sees and config.yaml stores for an install scope. */
+export function installScopeName(scope: Scope): 'user' | 'workspace' {
+  return scope === 'project' ? 'workspace' : scope;
+}
+
 // ─── Team config (teamai.yaml) ───────────────────────────
 
 export const SharingConfigSchema = z.object({
@@ -88,6 +116,14 @@ export const SharingConfigSchema = z.object({
     enabled: z.boolean().default(false),
   }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
+  // isGitExcludeEnabled() for the resolved view.
+  gitExclude: z.object({
+    /** Keep what teamai delivers into a project out of git, through teamai's
+     *  `delivered` block in the clone's `.git/info/exclude` (#915). `init`
+     *  writes true into a new team's teamai.yaml; absent means off. */
+    enabled: z.boolean().default(false),
+  }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // isContributeHintEnabled() for the resolved view.
   contributeHint: z.object({
     /** Team default: whether the Stop hook nudges members towards the
@@ -95,6 +131,15 @@ export const SharingConfigSchema = z.object({
      *  knowledge sharing through their own review flow can turn the nudge off
      *  without disabling the rest of the Stop hook (update check, votes sync,
      *  dashboard reporting). */
+    enabled: z.boolean().default(true),
+  }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid; use
+  // isMrHintEnabled() for the resolved view.
+  mrHint: z.object({
+    /** Team default: whether the SessionStart hook tells members about MRs the
+     *  team merged recently. Kept separate from `contributeHint` (#988): a team
+     *  that routes knowledge sharing through its own review flow can drop the
+     *  MR summary while keeping the Stop hook's nudge, or the other way round. */
     enabled: z.boolean().default(true),
   }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid, AND so
@@ -105,6 +150,15 @@ export const SharingConfigSchema = z.object({
      *  attribution trailer. false = strip it (clean history). Users can override
      *  per-machine via `coAuthorEnabled` in local config. */
     enabled: z.boolean().default(true),
+  }).optional(),
+  // Optional: absent = no opinion, and teamai leaves every tool's own
+  // auto-compact setting alone. See resolveAutoCompactTokens().
+  autoCompact: z.object({
+    /** Context size, in tokens, at which members' AI tools compact the
+     *  conversation. Each tool expresses it its own way (window, limit or
+     *  ratio); see autocompact-reconcile.ts. Members can override per machine
+     *  via `autoCompactTokens` in local config. */
+    tokens: z.number().int().positive(),
   }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // getMcpSharing() for the defaulted view.
@@ -187,6 +241,46 @@ export function getRecallSharing(config: { sharing?: { recall?: { enabled?: bool
   return { enabled: config.sharing?.recall?.enabled ?? false };
 }
 
+/**
+ * Resolve whether pull keeps what it delivers into a project out of git
+ * (#915): the member's `gitExcludeEnabled` in the partition config > the
+ * team's `sharing.gitExclude.enabled` > default (false; on in project-only
+ * mode, c12 fork). A checkout still on
+ * the un-migrated layout reads its own config from `<projectRoot>/.teamai/`,
+ * and its worktrees each have one: that member value is not read, so no single
+ * checkout decides for the exclude file they share.
+ */
+export function isGitExcludeEnabled(
+  localConfig: { gitExcludeEnabled?: boolean; scope?: string; projectRoot?: string; dataHome?: string },
+  teamConfig: { sharing?: { gitExclude?: { enabled?: boolean } } },
+): boolean {
+  const member = isUnmigratedDataHome(localConfig) ? undefined : localConfig.gitExcludeEnabled;
+  // Project-only mode (c12 fork) promises that what teamai delivers stays
+  // untracked, so there the default is on.
+  return member ?? teamConfig.sharing?.gitExclude?.enabled ?? (localConfig.scope === 'project' && projectOnlyRequested());
+}
+
+/**
+ * isGitExcludeEnabled with the team config as `loadTeamConfig` returns it.
+ * `undefined` when nothing can decide: git mode, no member override, and the
+ * team's teamai.yaml could not be read or validated. That is not "off": a
+ * caller leaves what the setting governs as it is. HTTP mode has no team
+ * setting, so the member's override or the default decides there.
+ */
+export function resolveGitExclude(
+  localConfig: Parameters<typeof isGitExcludeEnabled>[0] & { repo: { kind?: string } },
+  teamConfig: Parameters<typeof isGitExcludeEnabled>[1] | null,
+): boolean | undefined {
+  if (teamConfig || localConfig.repo.kind === 'http') return isGitExcludeEnabled(localConfig, teamConfig ?? {});
+  return isUnmigratedDataHome(localConfig) ? undefined : localConfig.gitExcludeEnabled;
+}
+
+/** Whether a project config was read from the checkout's own `.teamai/` rather than its partition. */
+export function isUnmigratedDataHome(localConfig: { scope?: string; projectRoot?: string; dataHome?: string }): boolean {
+  const { scope, projectRoot, dataHome } = localConfig;
+  return scope === 'project' && !!projectRoot && !!dataHome && path.resolve(dataHome) === path.resolve(projectRoot, '.teamai');
+}
+
 /** Resolve whether recall is enabled: user override > team config > default (false). */
 export function isRecallEnabled(
   localConfig: { recallEnabled?: boolean },
@@ -211,6 +305,31 @@ export function isContributeHintEnabled(
 }
 
 /**
+ * Resolve whether the SessionStart MR hint is enabled: env kill switch >
+ * user override > team config > default (true).
+ *
+ * Deliberately not folded into isContributeHintEnabled: #988 keeps the MR hint
+ * separate from the share workflow, so neither switch may turn the other off.
+ */
+export function isMrHintEnabled(
+  localConfig: { mrHintEnabled?: boolean },
+  teamConfig: { sharing?: { mrHint?: { enabled?: boolean } } },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.TEAMAI_MR_HINT_DISABLED === '1') return false;
+  if (localConfig.mrHintEnabled !== undefined) return localConfig.mrHintEnabled;
+  return teamConfig.sharing?.mrHint?.enabled ?? true;
+}
+
+/** Resolve whether pull reports usage stats: user override > team config > default (true). */
+export function isUsageReportEnabled(
+  localConfig: { usageReportEnabled?: boolean },
+  teamConfig: { usageReport?: boolean },
+): boolean {
+  return localConfig.usageReportEnabled ?? teamConfig.usageReport ?? true;
+}
+
+/**
  * Resolve the effective co-author intent: user override > team config > no-op.
  *
  * Returns `undefined` when neither the user nor the team has an opinion — the
@@ -223,6 +342,22 @@ export function resolveCoAuthor(
 ): boolean | undefined {
   if (localConfig.coAuthorEnabled !== undefined) return localConfig.coAuthorEnabled;
   return teamConfig.sharing?.coAuthor?.enabled;
+}
+
+/**
+ * Resolve the auto-compact threshold in tokens. The member's per-machine
+ * `autoCompactTokens` wins (0 = opt out); else the team's
+ * `sharing.autoCompact.tokens`. Undefined means teamai sets nothing, and takes
+ * back what it set before.
+ */
+export function resolveAutoCompactTokens(
+  localConfig: { autoCompactTokens?: number },
+  teamConfig: { sharing?: { autoCompact?: { tokens?: number } } },
+): number | undefined {
+  if (localConfig.autoCompactTokens !== undefined) {
+    return localConfig.autoCompactTokens > 0 ? localConfig.autoCompactTokens : undefined;
+  }
+  return teamConfig.sharing?.autoCompact?.tokens;
 }
 
 // ─── Source config (cross-team subscription) ─────────
@@ -270,6 +405,8 @@ export interface SourceInstallManifest {
   installedPaths?: Record<string, string[]>;
   /** Original physical destination for each recorded relative deployment path. */
   installedPhysicalPaths?: Record<string, string>;
+  /** For each absolute destination, the tool home it lay in when recorded (#993): a home that moved since leaves the copy unmanaged. */
+  installedHomes?: Record<string, string>;
 }
 
 /** TTL for source repo pull: don't re-pull within this duration (ms). */
@@ -281,7 +418,280 @@ export const TEAMAI_SOURCES_DIR = path.join(getUserHome(), '.teamai', 'sources')
 export const ProviderNameSchema = z.enum(['tgit', 'github', 'cnb', 'gitlab', 'gitcode', 'git']);
 export type ProviderName = z.infer<typeof ProviderNameSchema>;
 
-export const TeamaiConfigSchema = z.object({
+/** One team-owned Node entrypoint. `path` is relative to the team repo root. */
+const TeamScriptSchema = z.object({
+  path: z.string().min(1),
+});
+
+/**
+ * Default tool paths for built-in tools.
+ * MCP paths are only set for tools whose config location has been verified.
+ * Tools left without `mcp` are skipped by MCP sync rather than guessed at, so a
+ * wrong guess can never create a junk config file on a user's machine.
+ */
+export const DEFAULT_TOOL_PATHS = {
+  claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
+  // Codex reads no rules directory: `.codex/rules` holds its exec-policy
+  // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
+  // which only Codex reads. In project scope they come from the session-start
+  // hook, since the project AGENTS.md is the owners' file and other tools
+  // read it too (#938, #945); so the entry has no project `claudemd`.
+  // Codex reads the project MCP config only in a trusted project (#954).
+  codex: {
+    skills: '.codex/skills',
+    settings: '.codex/hooks.json',
+    agents: '.codex/agents',
+    mcp: '.codex/config.toml',
+    mcpProject: '.codex/config.toml',
+    userScope: { claudemd: '.codex/AGENTS.md' },
+  },
+  // codex-internal and tcodex run the same Codex from their own home root, so
+  // they take the codex shape. Their user-scope AGENTS.md locations
+  // (~/.codex-internal/AGENTS.md, ~/.tcodex/AGENTS.md) are assumed from that,
+  // not verified against either build.
+  'codex-internal': {
+    skills: '.codex-internal/skills',
+    settings: '.codex-internal/hooks.json',
+    agents: '.codex-internal/agents',
+    userScope: { claudemd: '.codex-internal/AGENTS.md' },
+  },
+  'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
+  // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which
+  // relocates the whole user data dir — so its MCP file is
+  // ~/.tclaude/.claude.json, not ~/.tclaude.json. No mcpProject: project scope
+  // for the Claude family is <root>/.mcp.json, which the `claude` target
+  // already writes and tclaude reads from the same location.
+  tclaude: { skills: '.tclaude/skills', rules: '.tclaude/rules', settings: '.tclaude/settings.json', claudemd: '.tclaude/CLAUDE.md', agents: '.tclaude/agents', mcp: '.tclaude/.claude.json' },
+  // Same shape as codex; see codex-internal above.
+  tcodex: {
+    skills: '.tcodex/skills',
+    settings: '.tcodex/hooks.json',
+    agents: '.tcodex/agents',
+    userScope: { claudemd: '.tcodex/AGENTS.md' },
+  },
+  cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
+  // GitHub Copilot CLI keeps project customizations under .github and moves
+  // the complete user customization root when COPILOT_HOME is set. Agents use
+  // the official .agent.md format. Hooks and MCP use standalone files;
+  // settings.json is deliberately never managed.
+  copilot: {
+    skills: '.github/skills',
+    rules: '.github/instructions',
+    agents: '.github/agents',
+    hooks: '.github/hooks/teamai.json',
+    claudemd: '.github/copilot-instructions.md',
+    mcp: COPILOT_USER_MCP_CONFIG,
+    mcpProject: COPILOT_PROJECT_MCP_CONFIG,
+    userScope: {
+      skills: 'skills',
+      rules: 'instructions',
+      agents: 'agents',
+      hooks: 'hooks/teamai.json',
+      claudemd: 'copilot-instructions.md',
+    },
+  },
+  // JoyCode: skills, rules (.mdc), and subagents are synced to .joycode/.
+  // JoyCode currently does not provide a lifecycle hooks system or startup
+  // adapter, so it intentionally has no `settings` path. Hook reconciliation
+  // skips JoyCode cleanly without generating ghost files; users must sync
+  // manually via `teamai pull`. In user scope it reads no rules directory:
+  // its team rules are a block in ~/.joycode/rules.txt (#946).
+  joycode: { skills: '.joycode/skills', rules: '.joycode/rules', agents: '.joycode/agents', userScope: { rules: null } },
+  qoder: {
+    skills: '.qoder/skills',
+    rules: '.qoder/rules',
+    settings: '.qoder/settings.json',
+    agents: '.qoder/agents',
+    mcp: '.qoder/settings.json',
+    mcpProject: '.qoder/settings.json',
+  },
+  // Qoder CN is a separate distribution whose *user*-scope directory is
+  // ~/.qoder-cn instead of ~/.qoder, so it needs its own entry rather than
+  // sharing `qoder`. It reads the same Claude-compatible resource formats.
+  //
+  // Only the user scope differs. Top-level fields are PROJECT-scope paths and
+  // the `userScope` block below carries the user-scope overrides, so the
+  // top-level entries stay identical to `qoder`:
+  //   ASSUMPTION: Qoder CN's project-scope layout is assumed shared with Qoder
+  //   (`<root>/.qoder/`), i.e. the CN build differs from the international
+  //   build only in its user directory, not in its per-repo directory. This
+  //   could not be verified from this repository — it is a third-party product
+  //   layout. If a CN project actually keeps its resources in `<root>/.qoder-cn/`,
+  //   the top-level fields below are wrong and must move to `.qoder-cn/`.
+  // MCP stays two distinct fields: `mcp` is the user-scope file, `mcpProject`
+  // the project-scope one.
+  'qoder-cn': {
+    skills: '.qoder/skills',
+    rules: '.qoder/rules',
+    settings: '.qoder/settings.json',
+    agents: '.qoder/agents',
+    mcp: '.qoder-cn/settings.json',
+    mcpProject: '.qoder/settings.json',
+    userScope: {
+      skills: '.qoder-cn/skills',
+      rules: '.qoder-cn/rules',
+      settings: '.qoder-cn/settings.json',
+      agents: '.qoder-cn/agents',
+    },
+  },
+  // Kiro: skills, steering (rules), and custom agents sync to .kiro/. Kiro CLI
+  // V3 reads the standalone .kiro/hooks/teamai.json lifecycle hook. Legacy
+  // TeamAI agentSpawn entries are migrated out of agent files; Kiro 2.x
+  // does not support this standalone lifecycle integration.
+  // MCP uses the dedicated, mcpServers-only .kiro/settings/mcp.json:
+  // https://kiro.dev/docs/mcp/configuration/
+  kiro: {
+    skills: '.kiro/skills',
+    rules: '.kiro/steering',
+    agents: '.kiro/agents',
+    mcp: '.kiro/settings/mcp.json',
+    mcpProject: '.kiro/settings/mcp.json',
+  },
+  // Trae (trae.ai) is a VS Code-family IDE. Per its docs and its bundled
+  // code (verified against the installed app): project skills live in
+  // <root>/.trae/skills/<name>/SKILL.md, project rules in .trae/rules/*.md
+  // (frontmatter `alwaysApply` / `globs`, globs comma-separated, parsed by
+  // lines — see trae-rule.ts), and project MCP in .trae/mcp.json holding a
+  // Claude-shaped `mcpServers` object map. User rules are NOT ~/.trae/rules
+  // but ~/.trae/user_rules (the default file is user_rules.md), so
+  // userScope.rules carries that name. User-level MCP has no
+  // teamai-writable cross-platform file: the IDE keeps it next to its
+  // user settings (~/Library/Application Support/Trae/User/mcp.json on
+  // macOS, %APPDATA%/… on Windows), so only `mcpProject` is set. Trae has
+  // no settings-based hook surface and no subagents directory, so those
+  // keys stay absent (like JoyCode, users sync via `teamai pull`).
+  trae: {
+    skills: '.trae/skills',
+    rules: '.trae/rules',
+    mcpProject: '.trae/mcp.json',
+    userScope: { rules: '.trae/user_rules' },
+  },
+  // Trae CN (domestic.trae.cn) shares every project path with the
+  // international build (verified on installed apps: only the user
+  // directory differs, ~/.trae-cn). Both map the same .trae/mcp.json, and
+  // one shared ownership record covers the pair
+  // (MCP_MANIFEST_KEY_ALIAS), so whichever build a member runs, its
+  // target writes, updates and cleans the file.
+  'trae-cn': {
+    skills: '.trae/skills',
+    rules: '.trae/rules',
+    mcpProject: '.trae/mcp.json',
+    userScope: {
+      skills: '.trae-cn/skills',
+      rules: '.trae-cn/user_rules',
+    },
+  },
+  // ZCode: user-level config lives at ~/.zcode/cli/config.json (a shared file
+  // that also carries plugin state — reconcile must merge, never replace).
+  // Hooks are Claude-shaped but nested under `hooks.events` and gated by
+  // `hooks.enabled` (config-file hooks are disabled by default; the writer
+  // must force it on). Subagents deploy to ~/.zcode/agents/ as Claude-style
+  // Markdown (the CLI also reads <project>/.zcode/agents/ per workspace).
+  // MCP servers go under `mcp.servers` in that config.json, and in a
+  // project's .zcode/config.json (#1221). ZCode has no user-level rules dir convention.
+  zcode: {
+    skills: '.zcode/skills', agents: '.zcode/agents', settings: '.zcode/cli/config.json', mcp: '.zcode/cli/config.json', mcpProject: '.zcode/config.json',
+  },
+  // Oh My Pi (OMP): the config root is ~/.omp on every platform (no %APPDATA%
+  // on Windows); user-scope resources live in the agent dir ~/.omp/agent/, a
+  // different prefix from the project <root>/.omp/, hence userScope. Rules are
+  // plain .md, instructions land in AGENTS.md, and MCP uses the Claude-shaped
+  // {"mcpServers": …} mcp.json. OMP runs lifecycle hooks as in-process TS
+  // extensions rather than a settings hook list, so there is no `settings`
+  // path — the adapter in omp-hooks.ts writes the single user-root extension
+  // (~/.omp/agent/extensions/teamai-hooks.ts). Profiles (OMP_PROFILE /
+  // PI_CODING_AGENT_DIR / PI_CONFIG_DIR) move the agent dir and are not
+  // supported for hooks.
+  omp: {
+    skills: '.omp/skills',
+    rules: '.omp/rules',
+    claudemd: '.omp/AGENTS.md',
+    agents: '.omp/agents',
+    mcp: '.omp/agent/mcp.json',
+    mcpProject: '.omp/mcp.json',
+    userScope: {
+      skills: '.omp/agent/skills',
+      rules: '.omp/agent/rules',
+      claudemd: '.omp/agent/AGENTS.md',
+      agents: '.omp/agent/agents',
+    },
+  },
+  // Pi Coding Agent: skills/rules/extensions live under the agent root. Pi
+  // discovers global context from ~/.pi/agent/AGENTS.md and project context
+  // from AGENTS.md/CLAUDE.md walking up the workspace tree. Hooks are
+  // TypeScript extensions rather than a settings hook list, so the adapter
+  // keeps one user extension and forwards the active cwd to hook-dispatch.
+  // MCP, model profiles and the extension follow PI_CODING_AGENT_DIR. Pi reads no rules
+  // directory: its user team rules are a block in ~/.pi/agent/AGENTS.md, and
+  // in a project teamai's extension adds them to the system prompt (#946).
+  pi: {
+    mcp: '.pi/agent/mcp.json',
+    mcpProject: '.pi/mcp.json',
+    skills: '.pi/skills',
+    claudemd: 'AGENTS.md',
+    userScope: {
+      skills: '.pi/agent/skills',
+      claudemd: '.pi/agent/AGENTS.md',
+    },
+  },
+  codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', mcp: '.codebuddy/mcp.json', mcpProject: '.mcp.json' },
+  // OpenClaw reads no rules directory: in user scope its team rules are a
+  // block in the workspace AGENTS.md, and a project gets none (#946).
+  openclaw: { skills: '.openclaw/skills', claudemd: '.openclaw/workspace/AGENTS.md' },
+  hermes: { skills: '.hermes/skills', claudemd: 'AGENTS.md' },
+  // DeepSeek Harness: skills synced to ~/.dsh/skills, which its skill-filesystem
+  // provider scans as user-dsh root (rank 400). dsh discovers both directory
+  // bundles (<name>/SKILL.md) and flat Markdown files there natively.
+  dsh: { skills: '.dsh/skills' },
+  // WorkBuddy runs CodeBuddy's engine: in a project it reads CodeBuddy's
+  // .codebuddy/rules, which the two share (one copy), and in user scope its
+  // own ~/.workbuddy/rules (#946). Its install probe stays .workbuddy
+  // (`isToolInstalledForConfig`), whatever directory its rules land in.
+  workbuddy: {
+    skills: '.workbuddy/skills',
+    rules: '.codebuddy/rules',
+    settings: '.workbuddy/settings.json',
+    claudemd: 'AGENTS.md',
+    agents: '.workbuddy/agents',
+    mcp: '.workbuddy/mcp.json',
+    mcpProject: '.mcp.json',
+    userScope: { rules: '.workbuddy/rules' },
+  },
+  // OpenCode reads project config from <root>/.opencode/ but user config from
+  // ~/.config/opencode/ — a different prefix, hence userScope. Skills are also
+  // read natively from .claude/skills, but we write .opencode/skills so an
+  // OpenCode-only user (no Claude) still gets them. Rules land in .opencode/rules
+  // but must be activated via the `instructions` glob in opencode.json (OpenCode
+  // does not auto-scan a rules dir). MCP shares opencode.json under the `mcp` key.
+  opencode: {
+    skills: '.opencode/skills',
+    rules: '.opencode/rules',
+    agents: '.opencode/agents',
+    mcp: '.config/opencode/opencode.json',
+    mcpProject: 'opencode.json',
+    userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents' },
+  },
+  // Muse Code (Meta, binary `muse`) keeps its user config in ~/.config/muse
+  // and reads user skills from ~/.config/muse/skills, ahead of the
+  // ~/.claude/skills and ~/.agents/skills it also scans. Hooks take Codex's
+  // shape: user hooks in the `hooks` block of ~/.config/muse/settings.json,
+  // which runs in every workspace, project hooks in <root>/.muse/hooks.json,
+  // which runs only in a trusted one.
+  muse: {
+    skills: '.agents/skills',
+    settings: '.muse/hooks.json',
+    // User MCP servers sit in the same settings.json. A project's come from
+    // the <root>/.mcp.json the claude target writes, as for tclaude.
+    mcp: '.config/muse/settings.json',
+    agents: '.agents/agents',
+    userScope: { skills: '.config/muse/skills', settings: '.config/muse/settings.json', agents: '.config/muse/agents' },
+  },
+} satisfies Record<string, z.infer<typeof ToolPathsSchema>>;
+
+/** A built-in tool. Custom tools in a team's `toolPaths` stay plain strings. */
+export type ToolId = keyof typeof DEFAULT_TOOL_PATHS;
+
+export const TeamaiConfigBaseSchema = z.object({
   team: z.string(),
   description: z.string().default(''),
   repo: z.string(),
@@ -309,243 +719,72 @@ export const TeamaiConfigSchema = z.object({
    * can override via `updatePolicy` in local config. Undefined = team has no
    * opinion (preserves legacy behavior). */
   autoUpdate: z.boolean().optional(),
-  /** Write reports (member registration, sessions, usage stats, votes) to the
-   * team repo's `teamai-reports` branch. Off = the team repo never receives
-   * report commits or pushes (e.g. read-only pull setups).
-   * Default: off (c12 fork): only `usageReport: true` enables it. */
+  /** Report session/usage stats back into the team repo on pull. Off = the
+   * team repo never receives stat commits (e.g. read-only pull setups).
+   * Default: on. */
   usageReport: z.boolean().optional(),
   /** Run `git submodule update --init` on pull so skills distributed as git
    * submodules are populated and kept current. Off by default. */
   submodules: z.boolean().optional(),
-  /** Team-owned scripts the CLI runs at defined points of a pull — repo-committed
-   * entrypoints, distinct from `sharing.hooks.requireTeamScripts` (the
-   * `~/.teamai/team-scripts/` trust boundary for hook commands). Every entry is
-   * optional, and older CLIs strip the unknown section instead of rejecting the
-   * file — so a team repo can adopt one before its members upgrade. */
+  /**
+   * Language of the agent-facing texts teamai injects: the built-in
+   * teamai-recall rule, the todowrite-hint, and the mr-hint.
+   * `en` is English only. `zh` or omitted keeps the historical bilingual
+   * text, byte for byte (#1014).
+   */
+  language: z.enum(['en', 'zh']).optional(),
+  /** Team-owned Node scripts. Distinct from `sharing.hooks.requireTeamScripts`
+   * (the `~/.teamai/team-scripts/` trust boundary for hook commands). Every
+   * entry is optional. An older CLI that only knows `postPull` strips the
+   * other keys instead of rejecting the file, so a team can add one before
+   * every member upgrades. Each `path` is relative to the team repo root and
+   * must stay inside it, symlinks included. */
   scripts: z.object({
-    /** Run at the end of a pull, after every sync step (resources,
-     * hooks, MCP, reports) has finished. `path` is a Node entrypoint (`.mjs`,
-     * `.js`, `.cjs`) relative to the team repo root, and must resolve inside it:
-     * a symlink leaving the clone is rejected, since this script runs on every
-     * member's machine. */
-    postPull: z.object({
-      path: z.string().min(1),
-    }).optional(),
+    /** During `teamai init`, after local config is saved and before hooks. */
+    preInit: TeamScriptSchema.optional(),
+    /** During `teamai init`, after hooks are installed. Init then syncs MCP. */
+    postInit: TeamScriptSchema.optional(),
+    /** At the start of a full pull, before that scope is synced. Not on an inline pull. */
+    prePull: TeamScriptSchema.optional(),
+    /** At the end of a full pull, after resources, hooks, MCP and reports. Not on an inline pull. */
+    postPull: TeamScriptSchema.optional(),
+    /**
+     * After the inline delivery that prepares a new checkout (a linked
+     * worktree, or a submodule's first checkout that already runs teamai's
+     * git hook), before that git command returns. Init does not run there.
+     */
+    postDeploy: TeamScriptSchema.optional(),
   }).optional(),
   // MCP paths are only set for tools whose config location has been verified.
-  // Tools left without `mcp` are skipped by MCP sync rather than guessed at, so a
-  // wrong guess can never create a junk config file on a user's machine.
-  toolPaths: z.record(z.string(), ToolPathsSchema).default({
-    claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
-    // Codex reads no rules directory: `.codex/rules` holds its exec-policy
-    // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
-    // which only Codex reads. In project scope they come from the session-start
-    // hook, since the project AGENTS.md is the owners' file and other tools
-    // read it too (#938, #945); so the entry has no project `claudemd`.
-    // Codex reads the project MCP config only in a trusted project (#954).
-    codex: {
-      skills: '.codex/skills',
-      settings: '.codex/hooks.json',
-      agents: '.codex/agents',
-      mcp: '.codex/config.toml',
-      mcpProject: '.codex/config.toml',
-      userScope: { claudemd: '.codex/AGENTS.md' },
-    },
-    // codex-internal and tcodex run the same Codex from their own home root, so
-    // they take the codex shape. Their user-scope AGENTS.md locations
-    // (~/.codex-internal/AGENTS.md, ~/.tcodex/AGENTS.md) are assumed from that,
-    // not verified against either build.
-    'codex-internal': {
-      skills: '.codex-internal/skills',
-      settings: '.codex-internal/hooks.json',
-      agents: '.codex-internal/agents',
-      userScope: { claudemd: '.codex-internal/AGENTS.md' },
-    },
-    'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
-    // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which
-    // relocates the whole user data dir — so its MCP file is
-    // ~/.tclaude/.claude.json, not ~/.tclaude.json. No mcpProject: project scope
-    // for the Claude family is <root>/.mcp.json, which the `claude` target
-    // already writes and tclaude reads from the same location.
-    tclaude: { skills: '.tclaude/skills', rules: '.tclaude/rules', settings: '.tclaude/settings.json', claudemd: '.tclaude/CLAUDE.md', agents: '.tclaude/agents', mcp: '.tclaude/.claude.json' },
-    // Same shape as codex; see codex-internal above.
-    tcodex: {
-      skills: '.tcodex/skills',
-      settings: '.tcodex/hooks.json',
-      agents: '.tcodex/agents',
-      userScope: { claudemd: '.tcodex/AGENTS.md' },
-    },
-    cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
-    // GitHub Copilot CLI keeps project customizations under .github and moves
-    // the complete user customization root when COPILOT_HOME is set. Agents use
-    // the official .agent.md format. Hooks and MCP use standalone files;
-    // settings.json is deliberately never managed.
-    copilot: {
-      skills: '.github/skills',
-      rules: '.github/instructions',
-      agents: '.github/agents',
-      hooks: '.github/hooks/teamai.json',
-      claudemd: '.github/copilot-instructions.md',
-      mcp: COPILOT_USER_MCP_CONFIG,
-      mcpProject: COPILOT_PROJECT_MCP_CONFIG,
-      userScope: {
-        skills: 'skills',
-        rules: 'instructions',
-        agents: 'agents',
-        hooks: 'hooks/teamai.json',
-        claudemd: 'copilot-instructions.md',
-      },
-    },
-    // JoyCode: skills, rules (.mdc), and subagents are synced to .joycode/.
-    // JoyCode currently does not provide a lifecycle hooks system or startup
-    // adapter, so it intentionally has no `settings` path. Hook reconciliation
-    // skips JoyCode cleanly without generating ghost files; users must sync
-    // manually via `teamai pull`. In user scope it reads no rules directory:
-    // its team rules are a block in ~/.joycode/rules.txt (#946).
-    joycode: { skills: '.joycode/skills', rules: '.joycode/rules', agents: '.joycode/agents', userScope: { rules: null } },
-    qoder: {
-      skills: '.qoder/skills',
-      rules: '.qoder/rules',
-      settings: '.qoder/settings.json',
-      agents: '.qoder/agents',
-      mcp: '.qoder/settings.json',
-      mcpProject: '.qoder/settings.json',
-    },
-    // Qoder CN is a separate distribution whose *user*-scope directory is
-    // ~/.qoder-cn instead of ~/.qoder, so it needs its own entry rather than
-    // sharing `qoder`. It reads the same Claude-compatible resource formats.
-    //
-    // Only the user scope differs. Top-level fields are PROJECT-scope paths and
-    // the `userScope` block below carries the user-scope overrides, so the
-    // top-level entries stay identical to `qoder`:
-    //   ASSUMPTION: Qoder CN's project-scope layout is assumed shared with Qoder
-    //   (`<root>/.qoder/`), i.e. the CN build differs from the international
-    //   build only in its user directory, not in its per-repo directory. This
-    //   could not be verified from this repository — it is a third-party product
-    //   layout. If a CN project actually keeps its resources in `<root>/.qoder-cn/`,
-    //   the top-level fields below are wrong and must move to `.qoder-cn/`.
-    // MCP stays two distinct fields: `mcp` is the user-scope file, `mcpProject`
-    // the project-scope one.
-    'qoder-cn': {
-      skills: '.qoder/skills',
-      rules: '.qoder/rules',
-      settings: '.qoder/settings.json',
-      agents: '.qoder/agents',
-      mcp: '.qoder-cn/settings.json',
-      mcpProject: '.qoder/settings.json',
-      userScope: {
-        skills: '.qoder-cn/skills',
-        rules: '.qoder-cn/rules',
-        settings: '.qoder-cn/settings.json',
-        agents: '.qoder-cn/agents',
-      },
-    },
-    // Kiro: skills, steering (rules), and custom agents sync to .kiro/. Kiro CLI
-    // 2.x stores lifecycle hooks inside each .kiro/agents/*.json config. The
-    // Kiro agent renderer therefore embeds TeamAI's session-start dispatch as
-    // `hooks.agentSpawn`; there is no standalone `settings` hook surface.
-    // MCP uses the dedicated, mcpServers-only .kiro/settings/mcp.json:
-    // https://kiro.dev/docs/mcp/configuration/
-    kiro: {
-      skills: '.kiro/skills',
-      rules: '.kiro/steering',
-      agents: '.kiro/agents',
-      mcp: '.kiro/settings/mcp.json',
-      mcpProject: '.kiro/settings/mcp.json',
-    },
-    // ZCode: user-level config lives at ~/.zcode/cli/config.json (a shared file
-    // that also carries plugin state — reconcile must merge, never replace).
-    // Hooks are Claude-shaped but nested under `hooks.events` and gated by
-    // `hooks.enabled` (config-file hooks are disabled by default; the writer
-    // must force it on). Subagents deploy to ~/.zcode/agents/ as Claude-style
-    // Markdown (the CLI also reads <project>/.zcode/agents/ per workspace).
-    // User-scope MCP mirrors Claude's shape (`mcpServers` key) in
-    // ~/.agents/mcp.json; project scope writes `mcp.servers` inside
-    // .zcode/config.json (a different key), which the Claude writer cannot
-    // emit — so no mcpProject. ZCode has no user-level rules dir convention.
-    zcode: { skills: '.zcode/skills', agents: '.zcode/agents', settings: '.zcode/cli/config.json', mcp: '.agents/mcp.json' },
-    // Oh My Pi (OMP): the config root is ~/.omp on every platform (no %APPDATA%
-    // on Windows); user-scope resources live in the agent dir ~/.omp/agent/, a
-    // different prefix from the project <root>/.omp/, hence userScope. Rules are
-    // plain .md, instructions land in AGENTS.md, and MCP uses the Claude-shaped
-    // {"mcpServers": …} mcp.json. OMP runs lifecycle hooks as in-process TS
-    // extensions rather than a settings hook list, so there is no `settings`
-    // path — the adapter in omp-hooks.ts writes the single user-root extension
-    // (~/.omp/agent/extensions/teamai-hooks.ts). Profiles (OMP_PROFILE /
-    // PI_CODING_AGENT_DIR / PI_CONFIG_DIR) move the agent dir and are not
-    // supported for hooks.
-    omp: {
-      skills: '.omp/skills',
-      rules: '.omp/rules',
-      claudemd: '.omp/AGENTS.md',
-      agents: '.omp/agents',
-      mcp: '.omp/agent/mcp.json',
-      mcpProject: '.omp/mcp.json',
-      userScope: {
-        skills: '.omp/agent/skills',
-        rules: '.omp/agent/rules',
-        claudemd: '.omp/agent/AGENTS.md',
-        agents: '.omp/agent/agents',
-      },
-    },
-    // Pi Coding Agent: skills/rules/extensions live under the agent root. Pi
-    // discovers global context from ~/.pi/agent/AGENTS.md and project context
-    // from AGENTS.md/CLAUDE.md walking up the workspace tree. Hooks are
-    // TypeScript extensions rather than a settings hook list, so the adapter
-    // keeps one user extension and forwards the active cwd to hook-dispatch.
-    // Profile overrides (PI_CODING_AGENT_DIR / PI_CONFIG_DIR) that relocate
-    // the agent dir are not supported for hooks or MCP, same as the OMP adapter;
-    // model profiles do read PI_CODING_AGENT_DIR. Pi reads no rules
-    // directory: its user team rules are a block in ~/.pi/agent/AGENTS.md, and
-    // in a project teamai's extension adds them to the system prompt (#946).
-    pi: {
-      mcp: '.pi/agent/mcp.json',
-      mcpProject: '.pi/mcp.json',
-      skills: '.pi/skills',
-      claudemd: 'AGENTS.md',
-      userScope: {
-        skills: '.pi/agent/skills',
-        claudemd: '.pi/agent/AGENTS.md',
-      },
-    },
-    codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', mcp: '.codebuddy/mcp.json', mcpProject: '.mcp.json' },
-    // OpenClaw reads no rules directory: in user scope its team rules are a
-    // block in the workspace AGENTS.md, and a project gets none (#946).
-    openclaw: { skills: '.openclaw/skills', claudemd: '.openclaw/workspace/AGENTS.md' },
-    hermes: { skills: '.hermes/skills', claudemd: 'AGENTS.md' },
-    // DeepSeek Harness: skills synced to ~/.dsh/skills, which its skill-filesystem
-    // provider scans as user-dsh root (rank 400). dsh discovers both directory
-    // bundles (<name>/SKILL.md) and flat Markdown files there natively.
-    dsh: { skills: '.dsh/skills' },
-    // WorkBuddy runs CodeBuddy's engine: in a project it reads CodeBuddy's
-    // .codebuddy/rules, which the two share (one copy), and in user scope its
-    // own ~/.workbuddy/rules (#946). Its install probe stays .workbuddy
-    // (`isToolInstalledForConfig`), whatever directory its rules land in.
-    workbuddy: {
-      skills: '.workbuddy/skills',
-      rules: '.codebuddy/rules',
-      settings: '.workbuddy/settings.json',
-      claudemd: 'AGENTS.md',
-      agents: '.workbuddy/agents',
-      mcp: '.workbuddy/mcp.json',
-      mcpProject: '.workbuddy/mcp.json',
-      userScope: { rules: '.workbuddy/rules' },
-    },
-    // OpenCode reads project config from <root>/.opencode/ but user config from
-    // ~/.config/opencode/ — a different prefix, hence userScope. Skills are also
-    // read natively from .claude/skills, but we write .opencode/skills so an
-    // OpenCode-only user (no Claude) still gets them. Rules land in .opencode/rules
-    // but must be activated via the `instructions` glob in opencode.json (OpenCode
-    // does not auto-scan a rules dir). MCP shares opencode.json under the `mcp` key.
-    opencode: {
-      skills: '.opencode/skills',
-      rules: '.opencode/rules',
-      agents: '.opencode/agents',
-      mcp: '.config/opencode/opencode.json',
-      mcpProject: 'opencode.json',
-      userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents' },
-    },
-  }),
+  // A team's `toolPaths` section merges over the built-in defaults tool by tool (#1185):
+  // each tool named in the team config overrides that tool's default entry whole,
+  // while built-in tools not named by the team retain their defaults.
+  toolPaths: z.record(z.string(), ToolPathsSchema)
+    .default({})
+    .transform((custom): Record<string, z.infer<typeof ToolPathsSchema>> => ({
+      ...DEFAULT_TOOL_PATHS,
+      ...custom,
+    })),
+});
+
+export const TeamaiConfigSchema = TeamaiConfigBaseSchema.superRefine((config, ctx) => {
+  // The Trae builds claim their MCP files under one shared ownership record
+  // (MCP_MANIFEST_KEY_ALIAS); that contract holds only while they map the
+  // same file. A team that maps them apart would see one reconcile clear the
+  // other's record, so reject the split instead (#904).
+  const trae = config.toolPaths.trae;
+  const traeCn = config.toolPaths['trae-cn'];
+  for (const field of ['mcp', 'mcpProject'] as const) {
+    const a = trae?.[field];
+    const b = traeCn?.[field];
+    if (a !== undefined && b !== undefined && a !== b) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['toolPaths', 'trae-cn', field],
+        message: `trae and trae-cn must map the same ${field} path: they claim their MCP servers under one shared ownership record`,
+      });
+    }
+  }
 });
 
 export type TeamaiConfig = z.infer<typeof TeamaiConfigSchema>;
@@ -577,6 +816,8 @@ export const LocalConfigSchema = z.object({
     // and every resource path, none of which understand `~`.
     localPath: z.string().transform(expandHome),
     remote: z.string(),
+    /** Ref this workspace follows, exactly as passed to pull --team-ref. */
+    ref: z.string().optional(),
     /**
      * Team repo branch this member tracks, set by `init --branch` (git clones
      * only). Absent = the remote's default branch. Pull, PR bases and every
@@ -614,8 +855,8 @@ export const LocalConfigSchema = z.object({
   provider: ProviderNameSchema.optional(),
   updatePolicy: z.enum(['auto', 'prompt', 'skip']).optional(),
   // Read-compat default for historical configs that omit `scope` (pre-project era).
-  // NOT the write default for `teamai init` — init defaults to project (issue #250).
-  scope: ScopeEnum.default('user'),
+  // NOT the write default for `teamai init` — init defaults to workspace (issue #250).
+  scope: InstallScopeSchema.default('user'),
   primaryRole: z.string().min(1).optional(),
   additionalRoles: z.array(z.string()).default([]),
   /**
@@ -638,12 +879,23 @@ export const LocalConfigSchema = z.object({
   excludedSkills: z.array(z.string()).optional(),
   /** User-level override for recall feature. When set, takes precedence over team config. */
   recallEnabled: z.boolean().optional(),
+  /** Per-machine override of the team's `sharing.gitExclude.enabled` (#915),
+   *  hand-edited in the partition config. Undefined defers to the team. */
+  gitExcludeEnabled: z.boolean().optional(),
   /** User-level override for the share-learnings hint. When set, takes precedence over team config. */
   contributeHintEnabled: z.boolean().optional(),
+  /** User-level override for the SessionStart MR hint. When set, takes precedence over team config. */
+  mrHintEnabled: z.boolean().optional(),
+  /** Per-machine override of the team's `usageReport`. When set, takes
+   *  precedence over the team config. Undefined defers to the team. */
+  usageReportEnabled: z.boolean().optional(),
   /** Per-machine override for the co-author trailer in AI-tool commits. When set,
    *  takes precedence over the team `sharing.coAuthor` default. Undefined means
    *  "defer to the team" (see resolveCoAuthor). */
   coAuthorEnabled: z.boolean().optional(),
+  /** Per-machine override of the team's `sharing.autoCompact.tokens`. 0 opts
+   *  out; undefined defers to the team (see resolveAutoCompactTokens). */
+  autoCompactTokens: z.number().int().min(0).optional(),
   /** Per-machine opt-out of trusting in Codex what teamai writes for it: the
    *  hooks (`hooks.state`) and, for project hooks, the project (#955).
    *  Undefined means on. */
@@ -651,16 +903,31 @@ export const LocalConfigSchema = z.object({
   /** When set, only inject hooks into these agents. Additive across multiple init --agent runs. */
   enabledAgents: z.array(z.string()).optional(),
   /**
-   * Per-machine relocation of a tool's user-scope root, keyed by the same tool
-   * id as `toolPaths` (`claude: ~/.claude-work`). A tool that can be told to
-   * keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME` —
+   * Per-machine relocation of a tool's user-scope root. A tool that can be told
+   * to keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR`,
+   * Codex's `CODEX_HOME`, Cursor CLI's `CURSOR_DATA_DIR` / `CURSOR_CONFIG_DIR` —
    * reads nothing teamai writes to the team-wide default, and `teamai init`
    * records that variable here so every later run targets the right root.
+   * The key is the tool id in `toolPaths` for a tool whose whole layout moves
+   * with its root (`claude: ~/.claude-work`); a tool with more than one root
+   * records each of them under a name of its own (see `RELOCATABLE_TOOLS`).
    * The value must resolve inside HOME; `~/` is expanded.
    */
   toolRoots: z.record(z.string(), z.string()).optional(),
   /** Tools explicitly excluded from all teamai sync (set by `uninstall --agent`). Removed again by `init --agent`. */
   disabledAgents: z.array(z.string()).optional(),
+  /** Per-machine tool selection for locally executed workflow prompt steps. */
+  workflows: z.object({
+    tools: z.record(z.string(), z.string().min(1)).default({}),
+    /** How many command steps the local driver runs at once. Unset means 1. */
+    max_parallel: z.number().int().positive().optional(),
+    /** Whether a driver without HITL automatically answers optional approve requests and uses choose defaults. Unset means false. */
+    auto_approve: z.boolean().optional(),
+    /** This host contains what it runs, such as a CI VM or a container, so the local driver declares `sandbox` isolation. */
+    sandbox: z.boolean().optional(),
+    /** What a workflow step may use on this machine, whatever driver runs it. An unset key allows. */
+    allow: AllowSchema.optional(),
+  }).optional(),
   /**
    * Per-machine map from a gateway/proxy model alias to a known Claude model
    * name, so cost/cache estimation works when the transcript records an opaque
@@ -669,6 +936,14 @@ export const LocalConfigSchema = z.object({
    * mythos + version). Unset means "match the raw model name only".
    */
   modelAliases: z.record(z.string(), z.string()).optional(),
+  scoring: z.object({
+    /** The least isolation a judge of this scope needs, raising the team's and the scorer's. A value teamai does not know counts as `verified`. */
+    isolation: z.string().optional().catch(({ input }) => JSON.stringify(input)),
+    /** Judge this scope's finished agent sessions in the background. A value that is not true or false is kept as its text, which turns nothing on. */
+    sessions: z.union([z.boolean(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
+    /** How many sessions a local day may lease for judging; 0 turns session scoring off. Another value is kept as its text, which sets nothing. */
+    daily_limit: z.union([z.number().int().nonnegative(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
+  }).optional(),
 });
 
 /**
@@ -690,8 +965,31 @@ export const LocalConfigSchema = z.object({
  * migration could not read the roles manifest, so whether this role-less config
  * holds a role is unknown for this run; `activeRoleIds` then matches no
  * role-scoped entry instead of every one. The next load re-decides it.
+ *
+ * `children` is runtime-only too: the children a workspace read this run
+ * (`readWorkspaceChildren`, #913). It is never written, so a workspace's
+ * config keeps its own selection only.
  */
-export type LocalConfig = z.infer<typeof LocalConfigSchema> & { dataHome?: string; roleUnresolved?: true };
+export type LocalConfig = z.infer<typeof LocalConfigSchema> & {
+  dataHome?: string;
+  roleUnresolved?: true;
+  children?: WorkspaceChildren;
+  roleAssignment?: RoleAssignment;
+};
+
+/**
+ * Runtime-only, set when `manifest/members.yaml` governs this member's roles
+ * (#1186): `primaryRole` and `additionalRoles` then hold the team's assignment,
+ * read fresh on every load, and `local` keeps what the config file says so a
+ * save by any other command writes that back instead of freezing a copy of the
+ * assignment into the file.
+ */
+export interface RoleAssignment {
+  /** `assigned` — the file lists this member; `default` — it does not. */
+  source: 'assigned' | 'default';
+  /** The selection on disk, which `roles set` no longer changes. */
+  local: { primaryRole?: string; additionalRoles: string[] };
+}
 export type LocalConfigInput = z.input<typeof LocalConfigSchema>;
 
 // ─── Local state (~/.teamai/state.json) ────────────────────
@@ -715,6 +1013,13 @@ export const PendingPushItemSchema = z.object({
    * closed unmerged leaves no record behind, branch deleted or not.
    */
   placed: z.boolean().optional(),
+  /**
+   * For a placement, the path the author still edits — the shared-root form
+   * `relativePath` was derived from, e.g. "docs/guide.md" for a destination of
+   * "docs/ops/guide.md". A self-mode scan compares that file against its placed
+   * counterpart once the record lands (`state.placements`).
+   */
+  sourcePath: z.string().optional(),
   /**
    * Git blob id of the file this push wrote at `relativePath`, for a placed
    * item. Landing is proven by that blob appearing in the default branch's
@@ -769,6 +1074,38 @@ export type RecordedAgentModel = z.infer<typeof RecordedAgentModelSchema>;
 /** `RecordedAgentModel` by agent stem, then tool. */
 export type AgentModelRecords = Record<string, Record<string, RecordedAgentModel>>;
 
+/** One Codex binary teamai found, and the version its `--version` printed (null when it did not parse). */
+const CodexBuildSchema = z.object({ path: z.string(), version: z.string().nullable() });
+export type CodexBuild = z.infer<typeof CodexBuildSchema>;
+
+/**
+ * Builds that hash a teamai hook differently: teamai trusts with `chosen`, the
+ * newest, and each of `others` hashes at least one of those hooks another way.
+ */
+const CodexBuildSkewSchema = z.object({ chosen: CodexBuildSchema, others: z.array(CodexBuildSchema) });
+export type CodexBuildSkew = z.infer<typeof CodexBuildSkewSchema>;
+
+/** A repo-backed placement that landed: the placed path and the blob push delivered there. */
+const PlacementRecordSchema = z.object({ path: z.string(), blob: z.string() });
+export type PlacementRecord = z.infer<typeof PlacementRecordSchema>;
+
+/**
+ * The member's choices that decide which team assets a pull delivers (#1178), as that pull read them from
+ * `LocalConfig`. The lists are sorted, so the same choices compare equal however they were entered.
+ */
+export const DeliverySelectionSchema = z.object({
+  scope: InstallScopeSchema,
+  primaryRole: z.string().optional(),
+  additionalRoles: z.array(z.string()),
+  /** The roles came from manifest/members.yaml (#1186): holding none then filters, where a bare config does not. */
+  rolesAssigned: z.boolean().optional(),
+  projects: z.array(z.string()).optional(),
+  subscribedTags: z.array(z.string()).optional(),
+  excludedSkills: z.array(z.string()).optional(),
+  inheritUserScope: z.boolean().optional(),
+});
+export type DeliverySelection = z.infer<typeof DeliverySelectionSchema>;
+
 export const StateSchema = z.object({
   lastPush: z.string().nullable().default(null),
   lastPull: z.string().nullable().default(null),
@@ -783,6 +1120,9 @@ export const StateSchema = z.object({
    * agents and docs into the checkout it runs in: a worktree added after the
    * last pull has not received that revision, and two checkouts with different
    * tool directories must not compare against each other's targets (#807).
+   * `teamRef` is the ref this checkout's delivery followed, absent for the
+   * default branch. It keeps revision removals pending after another checkout
+   * unpins the workspace. An older CLI that saves state drops it.
    * `pushBaseRevs` are the team revisions push synced this checkout's
    * unedited rules and skills to since its last pull, newest first, the bases
    * its next push compares with; a pull's record drops them, since the pull
@@ -798,14 +1138,67 @@ export const StateSchema = z.object({
    * tool when teamai last wrote that copy, by agent stem (copies deploy
    * flattened, one file per stem) and tool (#830). An older CLI drops it too,
    * which the next pull reads as agents it has to redeploy.
+   * `root` is the project checkout the record belongs to, the path its key
+   * was computed from, written by that checkout's full pulls. A full pull in
+   * another checkout drops the record once that root is no longer a checkout
+   * of the repository under the same key; a record without one, from an older
+   * CLI, is kept (#993).
+   * `gitExcludePaths` is what each writer of the pull delivered into the
+   * checkout, by writer id (`WriterId` in git-exclude-delivered.ts), as
+   * absolute landed paths: what teamai's `delivered` git exclude block lists
+   * (#915). It is kept whatever `sharing.gitExclude` says. A record without
+   * it, saved by an older CLI, misses the fast path, so the next pull is a
+   * full sync that writes it. A writer id this CLI does not know is kept.
+   * `rootsSeeded` marks that pull's root-seeding step completed or did not
+   * apply (#1041), so a root its member removes afterwards is not recreated.
+   * An unavailable original checkout leaves it absent for a later retry. A
+   * record without it, saved before seeding existed, reads as never seeded.
    */
   lastPullByWorkspace: z.record(z.string(), z.object({
     rev: z.string(),
+    teamRef: z.string().optional(),
+    root: z.string().optional(),
     targets: z.array(z.string()),
     pushBaseRevs: z.array(z.string()).optional(),
     delivered: z.record(z.string(), z.string()).optional(),
     agentModels: z.record(z.string(), z.record(z.string(), RecordedAgentModelSchema)).optional(),
+    gitExcludePaths: z.record(z.string(), z.array(z.string())).optional(),
+    /**
+     * Per resource, each tool's places (`writesOf(locate(...))`) the last full
+     * pull of this checkout delivered into, write gates met only, and for a
+     * tool that missed an item there, the places it took the resource from
+     * before (`settlePlaces`). A tool whose skills follow the session is left
+     * out. A record without a resource, from an older CLI, misses the fast
+     * path once.
+     */
+    places: z.object({
+      skills: z.record(z.string(), z.array(z.string())).optional(),
+      rules: z.record(z.string(), z.array(z.string())).optional(),
+      blocks: z.record(z.string(), z.array(z.string())).optional(),
+      agents: z.record(z.string(), z.array(z.string())).optional(),
+    }).optional(),
+    /** An earlier release's `places.skills`: read as that when `places` is missing (`placesRecordOf`), never written. */
+    skillDirs: z.record(z.string(), z.array(z.string())).optional(),
+    /** The home (`toolHome`) of each tool whose skills follow the session, at the last full pull that delivered it every skill. */
+    sessionToolHomes: z.record(z.string(), z.string()).optional(),
+    rootsSeeded: z.boolean().optional(),
+    /** The children a workspace was last delivered with (`WorkspaceChildren.fingerprint`, #913). */
+    children: z.string().optional(),
+    /** The selection the last pull that delivered into this checkout read. Absent in a record an older CLI wrote. */
+    selection: DeliverySelectionSchema.optional(),
+    /**
+     * The `claudeMdExcludes` entries teamai wrote into this checkout's
+     * `.claude/settings.local.json` for the workspaces above it (#913).
+     */
+    claudeMdExcludes: z.array(z.string()).optional(),
   })).optional(),
+  /**
+   * The exclude files holding each git exclude owner's block that this
+   * partition writes (`delivered`), by owner name (#915). Read by the next
+   * sync, by flag off and by uninstall, to visit every file that may still
+   * hold one.
+   */
+  gitExcludeFiles: z.record(z.string(), z.array(z.string())).optional(),
   /** Git commit hash synchronized through the safe user-resource inheritance channel. */
   lastInheritedPullRev: z.string().nullable().optional(),
   /** Tool targets that completed the last inherited user-resource pull. */
@@ -831,6 +1224,28 @@ export const StateSchema = z.object({
    * `placedRules`.
    */
   placedAgents: z.record(z.string(), z.string()).optional(),
+  /** The blob that proved each agent placement landed; never inferred from the current tip. */
+  placedAgentSources: z.record(z.string(), PlacementRecordSchema).optional(),
+  /**
+   * Where push placed a repo-backed resource (docs, wiki, prompts, workflows,
+   * scorers, models, env, hooks, claudemd, learnings) that the author still edits at
+   * its shared-root path, keyed `<type>:<path the author edits>`, e.g.
+   * `{ "docs:docs/guide.md": { "path": "docs/ops/guide.md", "blob": "<git blob id>" } }`.
+   * `blob` is what that push delivered. A self-mode scan compares the author's
+   * copy with it, not with the placed file: equal means already delivered,
+   * whatever the team did to the placed file since, and different is the
+   * author's edit. Recorded only after the placement landed, in
+   * `reconcilePlacementRecords`, on the same blob-in-history proof as
+   * `placedRules`, so a PR closed unmerged leaves no record behind. An entry
+   * holding only the path, as earlier builds wrote, is dropped: without the
+   * blob nothing tells an unchanged copy from an edit.
+   */
+  placements: z.record(z.string(), z.unknown())
+    .transform((records) => Object.fromEntries(Object.entries(records).flatMap(([key, record]) => {
+      const parsed = PlacementRecordSchema.safeParse(record);
+      return parsed.success ? [[key, parsed.data] as const] : [];
+    })))
+    .optional(),
   /**
    * Default-branch commit the placement records were last checked against. A
    * record whose file was deleted after it is dropped even if something is at
@@ -865,6 +1280,12 @@ export const StateSchema = z.object({
    * inputs still match skips spawning `codex app-server`. Absent = run it.
    */
   codexTrustFingerprint: z.string().optional(),
+  /** The Codex builds that disagreed in that pass (#1244), so a pull that skips it still warns. Absent = none. */
+  codexBuildSkew: CodexBuildSkewSchema.optional(),
+  /** The Codex builds that could not list the hooks in the last uncached pass; the same set failing again is cached. Absent = none. */
+  codexBuildUncompared: z.array(CodexBuildSchema).optional(),
+  /** Project grants this installation actually created; pre-existing user choices are never recorded. */
+  codexProjectTrust: z.array(z.object({ home: z.string(), project: z.string() })).optional(),
   /**
    * OpenCode configs whose `instructions` entry for teamai's context file
    * teamai added, as `{ config, entry }`, so uninstall removes the entry even
@@ -897,9 +1318,21 @@ export interface TagsConfig {
   rules: Record<string, string[]>;
 }
 
-// ─── Resource types ─────────────────────────────────────
-
-export type ResourceType = 'skills' | 'rules' | 'docs' | 'env' | 'agents' | 'hooks' | 'mcp';
+export type ResourceType =
+  | 'skills'
+  | 'rules'
+  | 'docs'
+  | 'env'
+  | 'agents'
+  | 'hooks'
+  | 'mcp'
+  | 'models'
+  | 'claudemd'
+  | 'learnings'
+  | 'wiki'
+  | 'workflows'
+  | 'prompts'
+  | 'scorers';
 
 export type ResourceItemStatus = 'new' | 'modified';
 
@@ -910,6 +1343,10 @@ export interface ResourceItem {
   relativePath: string;
   status?: ResourceItemStatus;
   namespace?: string;
+  /** A kept skill with a recorded origin: `--role`/`--project` never relocate it (#1020). */
+  fromInactiveNamespace?: true;
+  /** When placed into a namespace, the original relative path superseded by this item. */
+  supersedes?: string;
 }
 
 export interface ResourceDiff {
@@ -949,6 +1386,28 @@ export interface DeliveryTarget {
    * cannot say, and only the destination's existence can be judged.
    */
   content?: string;
+  /**
+   * The team file `dest` is rendered from, for proving that a file already
+   * at `dest` with no delivery record is teamai's (#993). Absent: the handler
+   * offers no proof, and such a file is written over as before.
+   */
+  origin?: CopyOrigin;
+}
+
+/**
+ * A resource's file in the repo it comes from, and how teamai renders one
+ * version of it (`DeliveryTarget.origin`). A file is teamai's when its bytes
+ * equal a version `pathspec` held in `repoPath`'s history, or one of
+ * `renders` of such a version. For a skill, `pathspec` names the skill
+ * directory, and `renders` apply to its SKILL.md (`isTeamaiSkillCopy`).
+ */
+export interface CopyOrigin {
+  /** The team clone (`repo.localPath`), or a source repo. */
+  repoPath: string;
+  /** Repo-relative, `/`-separated. */
+  pathspec: string;
+  /** teamai's renders of one version; null when that version renders nothing here. */
+  renders?: ReadonlyArray<(content: Buffer, version: { path: string; blob: string }) => string | Uint8Array | null>;
 }
 
 // ─── Hook definitions (unified model, issue #19) ─────────
@@ -1025,6 +1484,8 @@ export interface ManagedMcpRecord {
   name: string;
   /** sha1 (first 16 hex) of the rendered entry; drives idempotent rewrites. */
   hash: string;
+  /** Muse only: content fingerprint ignoring object key order and an inferred stdio type. */
+  valueHash?: string;
   /**
    * Project scope: whether the entry holds a `${VAR}` value teamai resolved
    * (#882). Absent in records an older teamai wrote.
@@ -1039,6 +1500,16 @@ export interface ManagedMcpRecord {
    * notes them, the file counts as having no record.
    */
   unnoted?: true;
+  /**
+   * The file holding this server, which every MCP writer notes (#1221).
+   * Absent in records an older teamai wrote (`recordedFileOf`).
+   */
+  file?: string;
+  /**
+   * The key the server sits under in `file` when it is not the tool's current
+   * one: a retired place's, as ZCode's `mcpServers` (#1221). Absent: the current key.
+   */
+  key?: readonly [string, ...string[]];
 }
 
 /** ~/.teamai/managed-mcp.json — team MCP servers injected per tool+scope key. */
@@ -1064,9 +1535,20 @@ export type ManagedMcpManifest = Record<string, ManagedMcpRecord[]>;
  * Each project WORKTREE now has its OWN manifest file (see managedMcpManifestPath),
  * so the file already isolates ownership by worktree — the key needs no workspace
  * segment. It is `<tool>:project` for project scope and `<tool>` for user scope.
+ *
+ * `MCP_MANIFEST_KEY_ALIAS` maps a tool onto another's key: builds that write
+ * one shared project MCP file claim it under one record, so either build's
+ * target can update and clean what the other's pull wrote, instead of a
+ * per-tool claim the sibling's reconcile would skip as foreign.
  */
+const MCP_MANIFEST_KEY_ALIAS: Readonly<Record<string, string>> = {
+  // Trae and Trae CN map the same <root>/.trae/mcp.json (#904).
+  'trae-cn': 'trae',
+};
+
 export function managedMcpManifestKey(tool: string, projectScope: boolean): string {
-  return projectScope ? `${tool}:project` : tool;
+  const owner = MCP_MANIFEST_KEY_ALIAS[tool] ?? tool;
+  return projectScope ? `${owner}:project` : owner;
 }
 
 /** Stable per-worktree identity segment; names the worktree's manifest subdirectory (#374). */
@@ -1107,6 +1589,8 @@ export function legacyManagedMcpManifestPath(dataHome: string): string {
 // ─── Global options ─────────────────────────────────────
 
 export interface GlobalOptions {
+  /** Pin this workspace to a team ref; the default branch unpins it. */
+  teamRef?: string;
   dryRun?: boolean;
   global?: boolean;
   registry?: string;
@@ -1126,12 +1610,34 @@ export interface GlobalOptions {
    */
   force?: boolean;
   /**
-   * Internal (the new-worktree git hook, `pull` only): deliver what the next
-   * session reads, without network when the team clone was fetched within
+   * Internal (git hooks and checkout preparation, `pull` only): deliver what
+   * the next session reads, without network when the team clone was fetched within
    * SOURCE_PULL_TTL_MS; sources come from their cached clones. Learnings,
    * reports, usage reporting and post-pull scripts are left to a full pull.
+   * `scripts.postDeploy` still runs as `prepareCheckout` says.
    */
   inline?: boolean;
+  /**
+   * Internal (`pull` only): deliver as into a new checkout, which does not run
+   * init, so `postInit` never runs for it, and wait for `scripts.postDeploy`.
+   * - `always`: a workflow worktree whose agent files were just put back to a
+   *   base commit. postDeploy runs on every such pull.
+   * - `once`: a linked worktree, a submodule's first checkout when that repo
+   *   already has teamai's git hooks (and the pull that hook hands over to,
+   *   through TEAMAI_PREPARE_CHECKOUT), or a worktree an agent tool created
+   *   without git hooks. Only the pull that writes the checkout's first record
+   *   runs postDeploy; an inline one finding a record under the sync lock
+   *   delivers nothing. A pass whose checkout is removed under it stops
+   *   before its next write phase.
+   */
+  prepareCheckout?: 'always' | 'once';
+  /**
+   * Internal (checkout preparation from a tool use, with `inline`): deliver
+   * from the team clone as last fetched, however long ago. A tool use then
+   * never holds the sync lock through a fetch, nor retries one on every call
+   * while the team repo is unreachable; the session's full pull fetches.
+   */
+  localOnly?: boolean;
   /**
    * Internal (post-merge/post-rewrite git hooks, with `inline`): fetch the team repo
    * whatever its fetch stamp says, and give up after this many ms; the scope
@@ -1144,6 +1650,12 @@ export interface GlobalOptions {
    * recorded for `doctor` and the next interactive pull; its success clears them.
    */
   gitHook?: 'post-checkout' | 'post-merge' | 'post-rewrite';
+  /**
+   * Internal (`pull` only): detect the project from this directory instead of
+   * the process cwd. A workflow worktree is delivered without changing cwd,
+   * so parallel steps do not switch the process between checkouts.
+   */
+  cwd?: string;
   /**
    * Internal (`init --scope user`, `pull` only): pull the user scope even when
    * the current directory is a project-scoped checkout.
@@ -1188,7 +1700,22 @@ export function getUpdateLockPath(): string {
   return path.join(getTeamaiHomeDir(), '.update-lock');
 }
 
-export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'env', 'agents', 'hooks', 'mcp'];
+export const RESOURCE_TYPES: ResourceType[] = [
+  'skills',
+  'rules',
+  'docs',
+  'env',
+  'agents',
+  'hooks',
+  'mcp',
+  'models',
+  'claudemd',
+  'learnings',
+  'wiki',
+  'workflows',
+  'prompts',
+  'scorers',
+];
 
 export const TEAMAI_RULES_START = '<!-- [teamai:rules:start] -->';
 export const TEAMAI_RULES_END = '<!-- [teamai:rules:end] -->';
@@ -1235,8 +1762,11 @@ export const TEAMAI_RECALL_RULES_END = '<!-- [teamai:recall-rules:end] -->';
 
 // ─── Usage tracking ────────────────────────────────────
 
-/** Regex for valid skill names: alphanumeric, hyphens, underscores, colons, dots. Max 200 chars. */
-export const SKILL_NAME_REGEX = /^[a-zA-Z0-9_\-:.]{1,200}$/;
+/** The characters a skill name may hold: alphanumeric, hyphens, underscores, colons, dots. */
+export const SKILL_NAME_CHARS = '[a-zA-Z0-9_\\-:.]';
+
+/** Regex for valid skill names: {@link SKILL_NAME_CHARS}, at most 200 of them. */
+export const SKILL_NAME_REGEX = new RegExp(`^${SKILL_NAME_CHARS}{1,200}$`);
 
 // TEAMAI_USAGE_PATH / TEAMAI_KNOWN_SKILLS_PATH / TEAMAI_PUSHIGNORE_PATH were
 // module-load consts with no live consumers — the code uses runtime getters
@@ -1288,7 +1818,26 @@ export interface UserStats {
   tokens?: TokenUsage;
   /** UTC-day buckets used by digest trends. Existing cumulative fields remain for compatibility. */
   daily?: Record<string, DailyUserStats>;
+  /**
+   * Cumulative workflow run totals for this user (#1083): end-phase records
+   * folded at publication time. Privacy: counts and durations only — the
+   * record files under workflows/runs/ carry the per-run allowlist.
+   */
+  workflows?: { runs: number; succeeded: number; failed: number; totalDurationMs: number };
+  /**
+   * The part of `interventions`, `prompts`, `tokens` and `daily` recorded in each run mode. Those top-level counters
+   * keep every count of the member's own sessions, so what neither holds was not recorded with a mode: counts from
+   * before modes were recorded, and events without one. Sessions teamai launched count in none of them.
+   */
+  attended?: UserModeStats;
+  unattended?: UserModeStats;
 }
+
+/** The counters of {@link UserStats} one run mode holds. */
+export type UserModeStats = Pick<UserStats, 'interventions' | 'prompts' | 'tokens' | 'daily'>;
+
+/** A count split by the run mode it was recorded in; `notRecorded` is the rest, recorded without one. */
+export type RunModeSplit = Record<RunMode | 'notRecorded', number>;
 
 /** Aggregated, privacy-preserving activity for one UTC day. */
 export interface DailyUserStats {
@@ -1432,7 +1981,7 @@ export interface DashboardEvent {
    */
   dataHome?: string;
   /**
-   * Main checkout of the git repo holding `cwd` (`resolveAnchors().projectAnchor`),
+   * Stable identity of the git repo holding `cwd` (`resolveAnchors().projectAnchor`),
    * shared by all of its worktrees, so a session is attributed to its repo even
    * after its worktree is removed (#809). An event whose `cwd` no longer exists
    * carries the session's last anchor (#810). Absent outside git, on events that
@@ -1440,6 +1989,16 @@ export interface DashboardEvent {
    * attribution then uses the session's last anchor, else `cwd`.
    */
   projectAnchor?: string;
+  /**
+   * The run mode the session's hook resolved. Absent on events written before it was recorded, which count in neither
+   * mode. See `SessionRun` in launch-context.ts.
+   */
+  runMode?: RunMode;
+  /**
+   * Who launched the session when teamai did, such as `workflow` for a step. Such an event never counts as the member's:
+   * not in sessions, interventions, prompts or tokens.
+   */
+  launchedBy?: string;
   /** First user prompt (captured from UserPromptSubmit) */
   promptSummary?: string;
   /**
@@ -1460,6 +2019,15 @@ export interface DashboardEvent {
   transcriptPath?: string;
   /** Resolved PID of the AI tool main process (for liveness monitoring) */
   monitorPid?: number;
+  /**
+   * On `session_start` only: the commit checked out at `cwd` when the session
+   * (or its resume or compaction) started, and whether tracked files were
+   * modified or staged then (untracked files are not counted). Absent outside
+   * git, in a repo with no commits, on events that record no `cwd` (Copilot),
+   * when git failed or timed out, and on events written before this field
+   * existed.
+   */
+  gitAtStart?: HeadState;
   /** Last event timestamp the PID monitor observed, so a delayed exit targets that run. */
   processExitAfter?: string;
   /** Byte boundary captured at Copilot SessionStart; private log path is never stored. */
@@ -1690,8 +2258,8 @@ export interface ContributeState {
   promptSummary?: string;
   /**
    * A generated share-learnings hint awaiting delivery via UserPromptSubmit
-   * (used only for tools whose Stop hook ignores stdout — see
-   * STOP_STDOUT_UNSUPPORTED_TOOLS). Cleared once injected. Absent for tools
+   * (used only for tools whose Stop hook cannot take the payload — see
+   * stopStdoutUnsupported). Cleared once injected. Absent for tools
    * that deliver the hint directly through the Stop hook.
    */
   pendingHint?: string;
@@ -1841,8 +2409,21 @@ export interface SearchIndexEntry {
 /** Schema version of the on-disk search-index.json (bump on breaking change). */
 export const SEARCH_INDEX_VERSION = 7;
 
+/** Per-file derivation only; votes and selection are recomputed on every build. */
+export interface SearchIndexFileCache {
+  derivation: string;
+  files: Array<{
+    key: string;
+    fingerprint: string;
+    hash: string;
+    /** Selected entries refer to `SearchIndex.entries` instead of duplicating tokens. */
+    entry: number | SearchIndexEntry | null;
+  }>;
+}
+
 /** Shape of the search-index.json file. */
 export interface SearchIndex {
+  fileCache?: SearchIndexFileCache;
   /** Schema version. Phase 1 introduces v2 (multi-category index). */
   version?: number;
   /** ISO timestamp of when the index was built */
@@ -1858,6 +2439,8 @@ export interface SearchIndex {
   /** Per-domain document-frequency maps, so unrelated knowledge domains do not
    *  change the IDF score of an entry. Missing on indexes that need rebuilding. */
   dfByDomain?: Partial<Record<KnowledgeDomain, Record<string, number>>>;
+  /** The workspace children this index was built for (#913), absent outside a workspace with children. */
+  children?: string;
 }
 
 /** Per-user vote file (votes/<user>.yaml). */
@@ -1952,12 +2535,11 @@ export type CultureFrontmatter = z.infer<typeof CultureFrontmatterSchema>;
  * workspace root (subdirectory/worktree aware via `resolveAnchors`).
  *
  * This is deliberately separate from the per-project machine-data home: a later
- * phase (P1) keys machine-local data by the shared `projectAnchor` (the main
- * checkout) under `~/.teamai/projects/<slug>/`, while resources continue to land
+ * phase (P1) keys machine-local data by the shared `projectAnchor` (the repository identity) under `~/.teamai/projects/<slug>/`, while resources continue to land
  * at the workspace root returned here. This function only ever governs resource
  * landing, never machine-data location.
  */
-export function resolveBaseDir(localConfig: LocalConfig): string {
+export function resolveBaseDir(localConfig: Pick<LocalConfig, 'scope' | 'projectRoot'>): string {
   if (localConfig.scope === 'project') {
     if (!localConfig.projectRoot) {
       throw new Error(
@@ -1972,10 +2554,9 @@ export function resolveBaseDir(localConfig: LocalConfig): string {
 
 export const COPILOT_TOOL_ID = 'copilot';
 
-/** GitHub Copilot CLI's user configuration root, honoring COPILOT_HOME. */
+/** GitHub Copilot CLI's user configuration root: the recorded one (`toolHome`), else COPILOT_HOME, else `~/.copilot`. */
 export function getCopilotHome(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.COPILOT_HOME?.trim();
-  return configured ? path.resolve(configured) : path.join(getUserHome(), DEFAULT_COPILOT_HOME);
+  return toolHome(COPILOT_TOOL_ID, realHost({ env }));
 }
 
 export const CLAUDE_TOOL_ID = 'claude';
@@ -1985,8 +2566,32 @@ export const DEFAULT_CLAUDE_ROOT = '.claude';
 
 export const CODEX_TOOL_ID = 'codex';
 
+/** WorkBuddy's toolPaths id and pre-5.7 root segment (#946). */
+export const WORKBUDDY_TOOL_ID = 'workbuddy';
+export const WORKBUDDY_TOOL_ROOT = '.workbuddy';
+
+/** WorkBuddy 5.7+'s runtime root (#1273). */
+export const WORKBUDDY_NEW_GENERATION_ROOT = '.workbuddy-ai';
+
+/** Muse Code (Meta), whose CLI binary is `muse`. */
+export const MUSE_TOOL_ID = 'muse';
+
 /** The `toolPaths.codex` root segment Codex uses when `CODEX_HOME` is unset. */
 export const DEFAULT_CODEX_ROOT = '.codex';
+
+/**
+ * Cursor CLI is the one tool with two relocatable roots, and neither is the
+ * root its `toolPaths` entry hangs off, so they are recorded under these two
+ * keys instead of under `cursor` — see `RELOCATABLE_TOOLS`. The names say which
+ * directory each one moves; `CURSOR_DATA_TOOL_ID` is the data root
+ * (`CURSOR_DATA_DIR`), `CURSOR_CONFIG_TOOL_ID` the config root
+ * (`CURSOR_CONFIG_DIR`).
+ */
+export const CURSOR_DATA_TOOL_ID = 'cursor-data';
+export const CURSOR_CONFIG_TOOL_ID = 'cursor-config';
+
+/** The root segment both Cursor CLI roots fall back to when their variable is unset. */
+export const DEFAULT_CURSOR_ROOT = '.cursor';
 
 /** A tool whose user root can be moved, and the variable that moves it. */
 export interface RelocatableTool {
@@ -1998,18 +2603,41 @@ export interface RelocatableTool {
   defaultRoot: string;
 }
 
+/**
+ * The home and path flavor a tool root resolves against: this process's by
+ * default, or a member's machine described by `locate`'s host, so a Linux test
+ * can resolve a Windows member's recorded roots.
+ */
+export type HomePaths = { readonly home: string; readonly path: path.PlatformPath };
+
+function processHomePaths(): HomePaths {
+  return { home: getUserHome(), path };
+}
+
+function expandHomeAt(p: string, at: HomePaths): string {
+  if (p.startsWith('~/') || p === '~' || (at.path === path.win32 && p.startsWith('~\\'))) {
+    return at.path.join(at.home, p.slice(1));
+  }
+  return p;
+}
+
 /** True when `dir` resolves to something inside the user's home directory. */
-function isUnderUserHome(dir: string): boolean {
-  const rel = path.relative(getUserHome(), path.resolve(dir));
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+function isUnderUserHome(dir: string, at: HomePaths): boolean {
+  const rel = at.path.relative(at.home, at.path.resolve(dir));
+  return rel !== '' && !rel.startsWith('..') && !at.path.isAbsolute(rel);
 }
 
 /**
- * Root shapes the installed-tool gate can express: a single directory in HOME
- * (`.claude-work`), or `.config/<name>` — the two forms `toolInstallRoot`
- * recognises. Anything deeper (`configs/claude`) would leave every gate keying
- * on the first segment alone, so an unrelated `~/configs` would report the tool
- * as installed and teamai would write into a directory that does not exist.
+ * Root shapes a member may record: a single directory in HOME
+ * (`.claude-work`), or a directory under `.config/` at any depth
+ * (`~/.config/cloak/profiles/work/claude`).
+ *
+ * `configs/claude` is still refused: not being under `.config`, the recorded
+ * value alone does not say how deep the tool's own root sits, so nothing
+ * distinguishes it from an unrelated directory of the same name — an
+ * unrelated `~/configs` would report the tool as installed and teamai would
+ * write into a directory that does not exist. `.config` gives the gate a
+ * bounded namespace to look in; `toolGateRoot` finds the exact root within it.
  */
 function isAddressableRootSegment(segment: string): boolean {
   const segments = segment.split('/');
@@ -2017,14 +2645,14 @@ function isAddressableRootSegment(segment: string): boolean {
   // reads it as the two-segment OpenCode-style root, so the gate would look for
   // the settings FILE as the tool's directory and never find it.
   if (segments.length === 1) return segments[0] !== '.config';
-  return segments.length === 2 && segments[0] === '.config';
+  return segments[0] === '.config';
 }
 
 /**
- * Tools a member may relocate, keyed by tool id. An allowlist, not a list of
- * known offenders: a root is only honest for a tool whose every user-scope
- * write follows it, and most tools keep at least one path teamai resolves
- * elsewhere (OMP's extension dir, Cursor's co-author file, Copilot's
+ * Roots a member may relocate, keyed by the name the recorded root is filed
+ * under. An allowlist, not a list of known offenders: a root is only honest for
+ * a tool whose every user-scope write follows it, and most tools keep at least
+ * one path teamai resolves elsewhere (OMP's extension dir, Copilot's
  * `$COPILOT_HOME`, OpenCode's plugin dir), which a partial move would split in
  * half.
  *
@@ -2033,12 +2661,30 @@ function isAddressableRootSegment(segment: string): boolean {
  * fixed `.claude` path is `legacyHooksNeedReinject`, a read-only probe for a
  * pre-dispatch migration. Codex qualifies — hooks, skills, rules, agents and
  * MCP resolve through `toolPaths`, co-author through `resolveToolRootDir`, and
- * model switching reads `CODEX_HOME` itself. `toolRoots` stays a generic
+ * model switching reads `CODEX_HOME` when the shell sets it, else the recorded root. `toolRoots` stays a generic
  * record, so a tool joins this table as soon as its writes have been audited.
+ *
+ * Cursor CLI is in this table as its two roots rather than as `cursor`. It
+ * moves two directories — the transcripts under `CURSOR_DATA_DIR`, the config
+ * `cli-config.json` lives in under `CURSOR_CONFIG_DIR` — while the rest of
+ * `~/.cursor` (the user `mcp.json`, `rules/`, `commands/`) stays there whatever
+ * the variables say. `toolPaths.cursor` therefore has to stay put, and a key
+ * named `cursor` would move it: `applyToolRoots` re-roots the `toolPaths` entry
+ * of every key it finds. So the two names below stand for roots, not tools, and
+ * only the two writers that address those roots read them (`sessionStoreDir`
+ * in `locate.ts` and `cursorConfigDir` below).
+ *
+ * Those two keys carry no `toolPaths` entry, which is also why `doctor`'s
+ * `buildToolRootChecks` skips them: the check compares where teamai would write
+ * a tool's paths against where the tool reads them, and there are no such paths
+ * here for `applyToolRoots` to move. A stale record of either root is not caught
+ * by that check.
  */
 export const RELOCATABLE_TOOLS: Readonly<Record<string, RelocatableTool>> = {
   [CLAUDE_TOOL_ID]: { label: 'Claude Code', envVar: 'CLAUDE_CONFIG_DIR', defaultRoot: DEFAULT_CLAUDE_ROOT },
   [CODEX_TOOL_ID]: { label: 'Codex', envVar: 'CODEX_HOME', defaultRoot: DEFAULT_CODEX_ROOT },
+  [CURSOR_DATA_TOOL_ID]: { label: 'Cursor transcripts', envVar: 'CURSOR_DATA_DIR', defaultRoot: DEFAULT_CURSOR_ROOT },
+  [CURSOR_CONFIG_TOOL_ID]: { label: 'Cursor config', envVar: 'CURSOR_CONFIG_DIR', defaultRoot: DEFAULT_CURSOR_ROOT },
 };
 
 /**
@@ -2046,24 +2692,24 @@ export const RELOCATABLE_TOOLS: Readonly<Record<string, RelocatableTool>> = {
  * or null when it can. One place decides, so `teamai init` refuses to record
  * exactly the roots `applyToolRoots` would refuse to apply.
  */
-export function toolRootRejection(dir: string): string | null {
-  const resolved = path.resolve(expandHome(dir));
-  if (!isUnderUserHome(resolved)) {
-    return `it is outside the home directory ${getUserHome()}, and every tool path is resolved relative to it`;
+export function toolRootRejection(dir: string, at: HomePaths = processHomePaths()): string | null {
+  const resolved = at.path.resolve(expandHomeAt(dir, at));
+  if (!isUnderUserHome(resolved, at)) {
+    return `it is outside the home directory ${at.home}, and every tool path is resolved relative to it`;
   }
-  const segment = path.relative(getUserHome(), resolved).split(path.sep).join('/');
+  const segment = at.path.relative(at.home, resolved).split(at.path.sep).join('/');
   if (!isAddressableRootSegment(segment)) {
     return 'a tool root has to be a directory in the home directory other than '
-      + '~/.config itself (~/.claude-work), or a ~/.config/<name> directory, '
-      + 'because that is what the "is this tool installed?" check can look for';
+      + '~/.config itself (~/.claude-work), or a directory under a ~/.config/<name> one, '
+      + 'so the "is this tool installed?" check can tell it apart from an unrelated directory';
   }
   return null;
 }
 
 /**
- * The root a relocatable tool's variable asks for (`CLAUDE_CONFIG_DIR`,
- * `CODEX_HOME`), or null when the variable is unset or blank, or the tool is
- * not relocatable.
+ * The root a relocatable tool's variable asks for (the `envVar` in
+ * `RELOCATABLE_TOOLS`), or null when the variable is unset or blank, or the
+ * tool is not relocatable.
  *
  * A value equal to the default root is still an answer, not an absence:
  * Claude Code reads `.claude.json` from INSIDE the configured directory
@@ -2081,6 +2727,25 @@ export function detectToolRoot(tool: string, env: NodeJS.ProcessEnv = process.en
   const configured = spec ? env[spec.envVar]?.trim() : undefined;
   if (!configured) return null;
   return path.resolve(expandHome(configured));
+}
+
+/**
+ * Cursor CLI's config directory, the one that holds `cli-config.json`.
+ *
+ * Resolution order read off the cursor-agent 2026.09.28 bundle:
+ * `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`. Only
+ * the variable can be recorded in `toolRoots` — `XDG_CONFIG_HOME` names a parent
+ * directory, and `~/.config` itself is refused as a root — so the fallback is
+ * read here, where the write happens, exactly as `session-flow/ide-history.ts`
+ * reads it for the Cursor IDE.
+ */
+export function cursorConfigDir(toolRoots?: Record<string, string>): string {
+  if (toolRoots?.[CURSOR_CONFIG_TOOL_ID]) {
+    return resolveToolRootDir(CURSOR_CONFIG_TOOL_ID, DEFAULT_CURSOR_ROOT, toolRoots);
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  if (xdg) return path.join(expandHome(xdg), 'cursor');
+  return path.join(getUserHome(), DEFAULT_CURSOR_ROOT);
 }
 
 /** Base directory for one tool's resources in the active scope. */
@@ -2117,15 +2782,16 @@ export function isAgentExcluded(
 }
 
 /**
- * The directory whose existence marks a tool as "installed" for a given
- * resource path. The tool root is normally the first path segment
- * (`.claude/skills` → `.claude`, `.openclaw/workspace/AGENTS.md` → `.openclaw`).
+ * The root a set of tool paths hangs off, derived from the path's shape: the
+ * first segment (`.claude/skills` → `.claude`, `.openclaw/workspace/AGENTS.md`
+ * → `.openclaw`), except under `.config/`, where `.config` alone is a directory
+ * nearly every user has, and the root is therefore the first two segments
+ * (`.config/opencode`).
  *
- * The one exception is OpenCode's user scope, whose paths live under
- * `.config/opencode/...`: there the first segment (`.config`) is a directory
- * nearly every user has, so it would wrongly report OpenCode as installed.
- * For a `.config/<tool>/...` path the root is the first two segments
- * (`.config/opencode`) instead.
+ * This is the shape a relocation keys on and rewrites (`relocateToolPaths`
+ * matches against it, `applyToolRoots` re-roots at it), so it must stay
+ * independent of any recorded root. The installed-tool gate needs the tool's
+ * real directory instead — that is `toolGateRoot`.
  */
 export function toolInstallRoot(toolPath: string): string {
   const segments = toolPath.split('/');
@@ -2133,6 +2799,38 @@ export function toolInstallRoot(toolPath: string): string {
     return `${segments[0]}/${segments[1]}`;
   }
   return segments[0] ?? toolPath;
+}
+
+/**
+ * The directory the installed-tool gate reads for `tool`: the recorded root
+ * when one is in play, and the path-derived one otherwise.
+ *
+ * `toolInstallRoot` answers from the path's shape, which is what relocation
+ * needs. The gate needs the directory the tool actually keeps its config in,
+ * and those stop agreeing once a member records a root nested below
+ * `~/.config/<name>` (`~/.config/cloak/profiles/work/claude`): the two-segment
+ * prefix (`.config/cloak`) is a directory that may exist for an unrelated
+ * reason while the recorded root itself does not. Probing the prefix would
+ * call the tool installed and the write below it would recreate a root the
+ * user had deleted — the very thing the gate exists to prevent.
+ *
+ * The record is consulted only when `toolPath` really does hang off it: the
+ * same `toolPaths` are used unrelocated in project scope, where a HOME-relative
+ * member root says nothing, and a root that cannot be used is ignored there
+ * too (see `toolRootSegment`).
+ */
+export function toolGateRoot(
+  tool: string,
+  toolPath: string,
+  toolRoots?: Readonly<Record<string, string>>,
+  at?: HomePaths,
+): string {
+  const recorded = toolRoots?.[tool];
+  if (recorded) {
+    const segment = toolRootSegment(tool, recorded, at);
+    if (segment && (toolPath === segment || toolPath.startsWith(`${segment}/`))) return segment;
+  }
+  return toolInstallRoot(toolPath);
 }
 
 /** Path fields of ToolPathsSchema that live under the tool's own user root. */
@@ -2151,20 +2849,20 @@ const warnedToolRoots = new Set<string>();
  * of the sync is still correct, and failing a whole pull over one member's typo
  * would be worse than telling them about it.
  */
-function toolRootSegment(tool: string, configured: string): string | null {
+function toolRootSegment(tool: string, configured: string, at: HomePaths = processHomePaths()): string | null {
   if (!(tool in RELOCATABLE_TOOLS)) {
     if (!warnedToolRoots.has(tool)) {
       warnedToolRoots.add(tool);
       log.warn(
-        `Ignoring toolRoots.${tool}: toolRoots currently supports ${Object.keys(RELOCATABLE_TOOLS).join(' and ')} only — `
+        `Ignoring toolRoots.${tool}: toolRoots currently supports ${Object.keys(RELOCATABLE_TOOLS).join(', ')} only — `
         + `${tool} has writes teamai does not resolve through toolPaths.`
         + (tool === COPILOT_TOOL_ID ? ' Copilot CLI is relocated with COPILOT_HOME instead.' : ''),
       );
     }
     return null;
   }
-  const resolved = path.resolve(expandHome(configured));
-  const rejection = toolRootRejection(resolved);
+  const resolved = at.path.resolve(expandHomeAt(configured, at));
+  const rejection = toolRootRejection(resolved, at);
   if (rejection) {
     const key = `${tool}:${resolved}`;
     if (!warnedToolRoots.has(key)) {
@@ -2173,7 +2871,7 @@ function toolRootSegment(tool: string, configured: string): string | null {
     }
     return null;
   }
-  return path.relative(getUserHome(), resolved).split(path.sep).join('/');
+  return at.path.relative(at.home, resolved).split(at.path.sep).join('/');
 }
 
 /**
@@ -2235,14 +2933,15 @@ function relocateToolPaths(
  */
 export function applyToolRoots(
   toolPaths: Record<string, z.infer<typeof ToolPathsSchema>>,
-  toolRoots?: Record<string, string>,
+  toolRoots?: Readonly<Record<string, string>>,
+  at?: HomePaths,
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
   if (!toolRoots || Object.keys(toolRoots).length === 0) return toolPaths;
   let out: Record<string, z.infer<typeof ToolPathsSchema>> | undefined;
   for (const [tool, configured] of Object.entries(toolRoots)) {
     const paths = toolPaths[tool];
     if (!paths) continue;
-    const newRoot = toolRootSegment(tool, configured);
+    const newRoot = toolRootSegment(tool, configured, at);
     if (!newRoot) continue;
     // Every root the tool's paths hang off, not just the first one: a team that
     // customized `toolPaths.claude` field by field may have spread them over
@@ -2262,6 +2961,34 @@ export function applyToolRoots(
     out[tool] = relocateToolPaths(paths, oldRoots, newRoot);
   }
   return out ?? toolPaths;
+}
+
+/**
+ * WorkBuddy 5.7+ moved its runtime to `.workbuddy-ai/` and stops reading
+ * `.workbuddy/` (#1273), so skills go to the directory the app actually scans
+ * — live-verified in the issue (13 team skills showed in the live `/` menu).
+ * The new root wins whenever it exists, because an upgrade leaves the old one
+ * behind as an unread leftover. Only the default skills path swaps, so a team
+ * that redirected on purpose keeps its own. Every other surface keeps its
+ * `.workbuddy/` path: written there while that root exists, held by `locate`
+ * once it is gone. Returns the same object when no swap fires.
+ */
+function applyWorkBuddyGeneration(
+  toolPaths: Record<string, z.infer<typeof ToolPathsSchema>>,
+  localConfig: { scope?: Scope; projectRoot?: string },
+): Record<string, z.infer<typeof ToolPathsSchema>> {
+  const workbuddy = toolPaths[WORKBUDDY_TOOL_ID];
+  if (!workbuddy || workbuddy.skills !== '.workbuddy/skills') return toolPaths;
+  const baseDir = localConfig.scope === 'project' && localConfig.projectRoot !== undefined
+    ? localConfig.projectRoot
+    : getUserHome();
+  // The new root present means 5.7+ is the live generation (an upgrade leaves
+  // `.workbuddy/` behind as a leftover the app no longer reads), so it wins
+  // even when both roots exist (#1290).
+  if (fs.existsSync(path.join(baseDir, WORKBUDDY_NEW_GENERATION_ROOT))) {
+    return { ...toolPaths, [WORKBUDDY_TOOL_ID]: { ...workbuddy, skills: `${WORKBUDDY_NEW_GENERATION_ROOT}/skills` } };
+  }
+  return toolPaths;
 }
 
 /**
@@ -2285,12 +3012,14 @@ export function applyToolRoots(
  * HOME-relative member root has nothing to say about.
  */
 export function scopedToolPaths(
-  teamConfig: TeamaiConfig,
-  localConfig: { scope?: Scope; toolRoots?: Record<string, string> },
+  teamConfig: Pick<TeamaiConfig, 'toolPaths'>,
+  localConfig: { scope?: Scope; toolRoots?: Readonly<Record<string, string>> },
+  at?: HomePaths,
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
-  if (isProjectOnly(localConfig)) return projectOnlyToolPaths(teamConfig.toolPaths);
-  if (localConfig.scope !== 'user') return teamConfig.toolPaths;
-  const rooted = applyToolRoots(teamConfig.toolPaths, localConfig.toolRoots);
+  const generationAdjusted = applyWorkBuddyGeneration(teamConfig.toolPaths, localConfig);
+  if (isProjectOnly(localConfig)) return projectOnlyToolPaths(generationAdjusted);
+  if (localConfig.scope !== 'user') return generationAdjusted;
+  const rooted = applyToolRoots(generationAdjusted, localConfig.toolRoots, at);
   const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
   for (const [tool, paths] of Object.entries(rooted)) {
     const us = paths.userScope;
@@ -2311,7 +3040,13 @@ export function scopedToolPaths(
     if (us.rules === null) delete scoped.rules;
     out[tool] = scoped;
   }
-  return out;
+  // Copilot loads user hooks only from files directly in `$COPILOT_HOME/hooks/`.
+  const copilot = out[COPILOT_TOOL_ID];
+  if (copilot?.hooks) out[COPILOT_TOOL_ID] = { ...copilot, hooks: `hooks/${path.basename(copilot.hooks)}` };
+  // Re-apply the WorkBuddy generation swap after the user-scope merge: a
+  // `userScope.skills` carrying the default `.workbuddy/skills` restores the
+  // unread old path over the adjusted one (#1290).
+  return applyWorkBuddyGeneration(out, localConfig);
 }
 
 /**
@@ -2517,8 +3252,10 @@ export function getTeamaiHome(scope: Scope, projectRoot?: string): string {
 }
 
 /**
- * Path of the machine-local KEY=value env backup file that the env channel writes
- * on pull and mcp-reconcile reads for ${VAR} resolution.
+ * Path of the machine-local record of what this CLI's pull wrote to env.sh,
+ * which mcp-reconcile reads for ${VAR} resolution. env.sh cannot replace this
+ * backup: an older version may have left a secret there that the failed pull
+ * must not apply.
  *
  * Normally this is `<teamaiHome>/env`. But in single-repo mode `<teamaiHome>` is
  * `<repo>/.teamai`, where `env/` is a committed DIRECTORY holding the shared
@@ -2531,7 +3268,7 @@ export function getEnvBackupPath(localConfig: LocalConfig): string {
   // Route through getDataHome (not getTeamaiHome directly) so the plaintext
   // env backup follows the machine-data home together with env.sh. Otherwise
   // P1-2's partition redirect would move env.sh into ~/.teamai/projects/<slug>/
-  // while leaving the KEY=value backup (which carries plaintext values) behind
+  // while leaving the env backup (which carries plaintext values) behind
   // in <projectRoot>/.teamai — breaking "zero workspace residue" and leaking
   // sensitive values into the business repo directory.
   const home = getDataHome(localConfig);
@@ -2555,12 +3292,38 @@ export function getStatePath(localConfig: LocalConfig): string {
 }
 
 /**
- * Get the managed-hooks manifest path for a given scope. This file indexes the
- * team (B) hooks injected into each tool, so reconcile can clean up hooks that
- * were removed from hooks.yaml (esp. for Cursor, whose entries carry no marker).
+ * The managed-hooks manifest: the team (B) hooks teamai injected into each
+ * tool, so reconcile can clean up hooks removed from hooks.yaml (esp. for
+ * Cursor and Copilot, whose entries carry no marker).
+ *
+ * User scope keeps one file in `~/.teamai`. A project scope's hook files are
+ * per checkout (Copilot's `.github/hooks/`, self mode's tool dirs), so its
+ * manifest is too, in the data home beside `managed-mcp.json`
+ * (`workspaces/<id>/`), never in the working tree (#993).
  */
-export function getManagedHooksPath(scope: Scope, projectRoot?: string): string {
-  return path.join(getTeamaiHome(scope, projectRoot), 'managed-hooks.json');
+export function getManagedHooksPath(localConfig: LocalConfig): string {
+  if (localConfig.scope !== 'project') return getUserManagedHooksPath();
+  if (!localConfig.projectRoot) {
+    throw new Error('getManagedHooksPath: scope is "project" but projectRoot is missing.');
+  }
+  return path.join(
+    getDataHome(localConfig), 'workspaces', managedMcpWorkspaceId(localConfig.projectRoot), 'managed-hooks.json',
+  );
+}
+
+/** `~/.teamai/managed-hooks.json`: user scope, and a non-self project scope's HOME hooks (#370). */
+export function getUserManagedHooksPath(): string {
+  return path.join(getTeamaiHome('user'), 'managed-hooks.json');
+}
+
+/**
+ * Where releases before #993 kept a project's managed-hooks manifest, in the
+ * working tree. Read by the pre-#370 Codex import, the legacy hook scope and
+ * uninstall; the first pull moves the Copilot records (every record in self
+ * mode) out of it (`migrateLegacyManagedHooks`).
+ */
+export function legacyManagedHooksPath(projectRoot: string): string {
+  return path.join(projectRoot, '.teamai', 'managed-hooks.json');
 }
 
 /**
@@ -2600,13 +3363,20 @@ export function resolveHookScope(
     // one (OpenCode, Qoder CN) would otherwise be written under the project
     // prefix, inside HOME. `scope` is returned so callers resolve paths and
     // base dir from one decision instead of re-deriving it (#370, #667).
-    return { baseDir: getUserHome(), manifestPath: getManagedHooksPath('user'), scope: 'user' };
+    return { baseDir: getUserHome(), manifestPath: getUserManagedHooksPath(), scope: 'user' };
   }
   return {
     baseDir: resolveBaseDir(localConfig),
-    manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
+    manifestPath: getManagedHooksPath(localConfig),
     scope: localConfig.scope,
   };
+}
+
+/** Hook paths follow their delivery scope; a tool that takes its user hooks in self mode too (`HooksChannels.self`, ZCode's CLI) keeps its user ones. */
+export function hookToolPathsForConfig(teamConfig: TeamaiConfig, localConfig: LocalConfig): TeamaiConfig['toolPaths'] {
+  const paths = scopedToolPaths(teamConfig, { ...localConfig, scope: resolveHookScope(localConfig).scope });
+  const user = scopedToolPaths(teamConfig, { ...localConfig, scope: 'user' });
+  return Object.fromEntries(Object.entries(paths).map(([tool, scoped]) => [tool, channelsOf(tool).hooks.self === 'user' ? user[tool] ?? scoped : scoped]));
 }
 
 /**
@@ -2617,11 +3387,21 @@ export function resolveHookScope(
 export function resolveToolRootDir(
   tool: string,
   defaultRoot: string,
-  toolRoots?: Record<string, string>,
+  toolRoots?: Readonly<Record<string, string>>,
+  at: HomePaths = processHomePaths(),
 ): string {
+  return recordedToolRootDir(tool, toolRoots, at) ?? at.path.join(at.home, ...defaultRoot.split('/'));
+}
+
+/** The member's recorded root of `tool` under `at.home`, or null when none is recorded or it is ignored (and warned). */
+export function recordedToolRootDir(
+  tool: string,
+  toolRoots: Readonly<Record<string, string>> | undefined,
+  at: HomePaths = processHomePaths(),
+): string | null {
   const configured = toolRoots?.[tool];
-  const segment = configured ? toolRootSegment(tool, configured) : null;
-  return path.join(getUserHome(), segment ?? defaultRoot);
+  const segment = configured ? toolRootSegment(tool, configured, at) : null;
+  return segment === null ? null : at.path.join(at.home, ...segment.split('/'));
 }
 
 /**
@@ -2654,7 +3434,7 @@ export function resolveLegacyProjectHookScope(
   if (path.resolve(localConfig.projectRoot) === path.resolve(getUserHome())) return null;
   return {
     baseDir: localConfig.projectRoot,
-    manifestPath: getManagedHooksPath('project', localConfig.projectRoot),
+    manifestPath: legacyManagedHooksPath(localConfig.projectRoot),
     scope: 'project',
   };
 }
@@ -2696,6 +3476,42 @@ export interface MRData {
   author?: string;
   /** MR 原始 URL */
   url: string;
+  /**
+   * The MR's review threads, in the order the platform returns them, without
+   * system notes or teamai's own CI comments. Absent when the fetch left them
+   * out (`--no-discussions`) or the platform has none (#1187).
+   */
+  discussions?: MRThread[];
+}
+
+/** One note of an MR review thread. */
+export interface MRThreadNote {
+  /** Username; the extraction prompt marks it as the MR author or a reviewer. */
+  author?: string;
+  body: string;
+}
+
+/** An MR review thread, with the diff position it is anchored to when it has one. */
+export interface MRThread {
+  /** Path of the file the thread is anchored to, for a diff comment. */
+  file?: string;
+  line?: number;
+  /** Whether the platform marks the thread resolved; undefined when it does not say. */
+  resolved?: boolean;
+  /** The notes in order; the first opens the thread. */
+  notes: MRThreadNote[];
+}
+
+/** What `fetchMergeRequest` reads besides the MR, its commits and its diff. */
+export interface MRFetchOptions {
+  /** Read the review threads too (default true). */
+  discussions?: boolean;
+  /**
+   * The marker `teamai ci extract-mr --comment-marker` posts its comments
+   * with; those are left out of the threads, as comments with the default
+   * `<!-- teamai:` prefix always are.
+   */
+  commentMarker?: string;
 }
 
 /**

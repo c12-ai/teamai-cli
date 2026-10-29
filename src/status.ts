@@ -1,10 +1,12 @@
 import path from 'node:path';
 import YAML from 'yaml';
 import { autoDetectInit, loadStateForScope } from './config.js';
-import { getRepoStatus } from './utils/git.js';
+import { summarizeWorkspaceChildren } from './workspace-children.js';
+import { teamRefNotice } from './team-ref.js';
+import { getDefaultBranch, getHeadRev, getRepoStatus } from './utils/git.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
 import { log } from './utils/logger.js';
-import { getAllHandlers } from './resources/index.js';
+import { getAllHandlers, getHandler } from './resources/index.js';
 import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { SkillsHandler } from './resources/skills.js';
 import { DocsHandler } from './resources/docs.js';
@@ -16,13 +18,15 @@ import {
   truncate,
   type AgentSkillsView,
 } from './agent-skills.js';
-import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, type GlobalOptions, type ResourceType } from './types.js';
+import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, installScopeName, type GlobalOptions, type ResourceType } from './types.js';
 import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from './utils/partition.js';
+import { checkoutForProjectAnchor } from './utils/git.js';
 import { mcpEntryReader } from './resources/mcp.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { envEntryReader } from './resources/env.js';
 import { envListing } from './env-listing.js';
 import { resolveTeamEnv } from './env-resolution.js';
+import { cachedScorerNames, SCORING_FILE } from './scorers/cache.js';
 import {
   describeEntryFailure, describeOrigin, describeOrigins, reportUndeliveredEntryNotices, resolveEntriesFor,
   type EntryResolution, type EntryType,
@@ -51,14 +55,18 @@ export async function status(options: GlobalOptions): Promise<void> {
   // report below still tells the truth, and the migration then persists on the
   // next command that writes.
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
-  const scopeLabel = localConfig.scope;
-
   // Scope info
   console.log('');
-  log.info(`Scope: ${scopeLabel}${scopeLabel === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`);
+  log.info(`Scope: ${installScopeName(localConfig.scope)}${localConfig.scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`);
   // Machine-data partition: where this project's teamai data actually lives
   // (~/.teamai/projects/<slug>/ for a partitioned install, else legacy .teamai).
   log.info(`  data: ${getDataHome(localConfig)}`);
+  const children = summarizeWorkspaceChildren(localConfig);
+  if (children) log.info(`  ${children}`);
+
+  if (localConfig.repo.ref !== undefined) {
+    log.info(teamRefNotice(localConfig.repo.ref, await getHeadRev(localConfig.repo.localPath), await getDefaultBranch(localConfig.repo.localPath)));
+  }
 
   // Git status
   console.log('');
@@ -125,9 +133,21 @@ export async function status(options: GlobalOptions): Promise<void> {
   count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
   count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
 
+  // Repo-backed types: count what's in the team repo tree.
+  for (const type of ['models', 'claudemd', 'learnings', 'wiki', 'workflows', 'prompts', 'scorers'] as const) {
+    try {
+      counts[type] = (await getHandler(type).scanTeamForPull(teamConfig, localConfig))
+        .filter((item) => type !== 'scorers' || path.posix.basename(item.relativePath) !== SCORING_FILE).length;
+    } catch {
+      counts[type] = 0;
+    }
+  }
+
   for (const type of RESOURCE_TYPES) {
     console.log(`  ${type}: ${counts[type] ?? 0}${origins[type] ?? ''}`);
   }
+  const scorers = await cachedScorerNames(localConfig);
+  console.log(`  scorers: ${scorers.length}${scorers.length > 0 ? ` (${scorers.join(', ')})` : ''}`);
 
   // Local pushable items
   console.log('');
@@ -211,9 +231,11 @@ async function statusAll(): Promise<void> {
     if (cfgRaw) {
       try {
         const parsed = LocalConfigSchema.parse(YAML.parse(cfgRaw));
-        scope = parsed.scope;
+        scope = installScopeName(parsed.scope);
         kind = parsed.repo.kind;
-        if (!projectPath) projectPath = parsed.repo.businessRepoRoot ?? parsed.projectRoot ?? null;
+        const recordedRoot = parsed.repo.businessRepoRoot ?? parsed.projectRoot;
+        projectPath = anchor ? await checkoutForProjectAnchor(anchor, recordedRoot) ?? recordedRoot ?? anchor
+          : recordedRoot ?? null;
       } catch { /* unreadable config — leave fields undefined */ }
     }
 

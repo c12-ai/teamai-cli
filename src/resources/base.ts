@@ -1,21 +1,16 @@
 import path from 'node:path';
-import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, toolInstallRoot } from '../types.js';
-import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig, State } from '../types.js';
+import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, toolGateRoot, toolInstallRoot } from '../types.js';
+import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig, PendingPush, State } from '../types.js';
 
 /** The placement records `publishedNameFor` resolves a bare name through. */
 export type PlacementRecords = Pick<State, 'placedRules' | 'placedAgents'>;
 import { readFileSafe, writeFile, ensureDir, pathExists } from '../utils/fs.js';
 import { getUserHome } from '../utils/home.js';
+import { installGateOf, isToolId } from '../tools.js';
+import { defaultToolHome, homeRoot } from '../tool-home.js';
 import type { DeliveryLedger } from './delivered-copies.js';
 
 const TOMBSTONE_FILE = '.removed';
-
-/**
- * The root that says a tool is installed, for a tool with a path under
- * another tool's root: WorkBuddy reads a project's rules from CodeBuddy's
- * `.codebuddy/rules` (#946), which says nothing about WorkBuddy.
- */
-const INSTALL_ROOTS: Readonly<Record<string, string>> = { workbuddy: '.workbuddy' };
 
 /** Detect an installed tool while respecting tool-specific user roots. */
 export async function isToolInstalledForConfig(
@@ -30,7 +25,28 @@ export async function isToolInstalledForConfig(
       || (exactConfigPath !== undefined && await pathExists(exactConfigPath))
       || pathExists(getCopilotHome());
   }
-  return ResourceHandler.isToolInstalled(Object.hasOwn(INSTALL_ROOTS, tool) ? INSTALL_ROOTS[tool] : toolPath, baseDir);
+  // The `--agent` entry is the bootstrap a project-only init needs before the
+  // app has ever run and created its root (#904).
+  if (isToolId(tool)) {
+    const gate = installGateOf(tool);
+    switch (gate) {
+      case 'home-edition':
+        return localConfig.enabledAgents?.includes(tool) === true || pathExists(defaultToolHome(tool, { home: getUserHome(), path }));
+      case 'home':
+        return pathExists(defaultToolHome(tool, { home: getUserHome(), path }));
+      case 'own-root': {
+        const root = homeRoot(tool);
+        return ResourceHandler.isToolInstalled(root, baseDir, toolGateRoot(tool, root, localConfig.toolRoots));
+      }
+      case undefined:
+        break;
+      default: {
+        const unhandled: never = gate;
+        return unhandled;
+      }
+    }
+  }
+  return ResourceHandler.isToolInstalled(toolPath, baseDir, toolGateRoot(tool, toolPath, localConfig.toolRoots));
 }
 
 /**
@@ -38,15 +54,21 @@ export async function isToolInstalledForConfig(
  * Each resource type (skills, rules, docs, env, agents, hooks, mcp) implements this.
  */
 /**
- * What `push` knows before it scans. Only the destination an explicit
- * `--role`/`--project` names, and only agents read it: their scan has to
+ * What `push` knows before it scans. The destination an explicit
+ * `--role`/`--project` names, which only agents read: their scan has to
  * decide which team file a local edit is an edit OF, and that answer changes
  * when the user has named a namespace (see `AgentsHandler.scanLocalForPush`).
- * Rules and skills are placed after selection, so their scan needs nothing.
+ * And the open-PR records, which only skills read: an open PR is proof of
+ * where a new skill goes, so it decides the copy's destination before copies
+ * from several tools are merged (see `SkillsHandler.scanLocalForPush`).
  */
 export interface ScanForPushOptions {
   /** The namespace `--role <ns>` / `--project <id>` resolved to, if any. */
   namespace?: string;
+  /** Open-PR records whose branch is still on origin. */
+  pending?: readonly PendingPush[];
+  /** The real path of the copy `push --skill` names: --skill, not the scan, says why it is left out as another namespace's. */
+  requestedSkillPath?: string;
 }
 
 export abstract class ResourceHandler {
@@ -149,10 +171,13 @@ export abstract class ResourceHandler {
    * e.g. for toolPath ".codebuddy/skills", checks if ~/.codebuddy/ exists.
    * This prevents creating directories for tools the user hasn't installed.
    * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
+   * @param rootSegment - The root to probe, when the caller can name it better
+   *   than the path's shape can (a member's recorded `toolRoots` entry; see
+   *   `toolGateRoot`). Defaults to `toolInstallRoot(toolPath)`.
    */
-  static async isToolInstalled(toolPath: string, baseDir?: string): Promise<boolean> {
+  static async isToolInstalled(toolPath: string, baseDir?: string, rootSegment?: string): Promise<boolean> {
     const base = baseDir ?? getUserHome();
-    const toolRoot = path.join(base, toolInstallRoot(toolPath));
+    const toolRoot = path.join(base, rootSegment ?? toolInstallRoot(toolPath));
     return pathExists(toolRoot);
   }
 

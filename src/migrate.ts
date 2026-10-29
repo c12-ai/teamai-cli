@@ -158,6 +158,8 @@ const SUPERSEDED_ENTRIES = [
   'env.sh',
   'env.local',
   'team-repo',
+  // When the clone was last fetched, kept beside it since #964.
+  'last-fetch.json',
   'search-index.json',
   'managed-mcp.json',
   'workspaces',
@@ -563,7 +565,7 @@ async function settleOrphanQueue(): Promise<void> {
  */
 export async function queueKeptInCheckout(
   migration: MigrationResult | undefined,
-  options: { dryRun?: boolean } = {},
+  options: { dryRun?: boolean; selfHeal?: boolean } = {},
 ): Promise<string | null> {
   switch (migration) {
     case 'dry-run':
@@ -720,6 +722,9 @@ async function retireLegacy(legacyDir: string): Promise<string> {
         `selectively, never by renaming the whole directory.`,
     );
   }
+  // Its config leaves the checkout: mark it as a project's for the env loader first.
+  const { markEnvScopePending } = await import('./resources/env-loader.js');
+  await markEnvScopePending(path.dirname(legacyDir));
   // Make the backup ignore everything it contains, independent of repo rules and
   // the backup's eventual name. Written before the rename so there is never a
   // window in which the credentials sit in a non-ignored directory.

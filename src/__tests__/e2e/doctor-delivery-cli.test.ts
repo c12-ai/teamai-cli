@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { commitTeamRepo } from '../helpers/team-repo-history.js';
+import { writeEnvLoader } from '../../resources/env-loader.js';
+import { envLoaderProfiles } from '../../utils/shell-profile.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
@@ -163,7 +166,7 @@ describe('teamai doctor delivery checks (e2e)', () => {
     expect(env.fix).toContain('declares no variables');
   });
 
-  it('passes every check once each file is where its tool reads it', () => {
+  it('passes every check once each file is where its tool reads it', async () => {
     write(path.join(home, '.claude/skills/alpha/SKILL.md'), '---\nname: alpha\ndescription: d\n---\n');
     write(path.join(home, '.claude/rules/coding-style.md'), 'Coding style body\n');
     write(path.join(home, '.cursor/rules/coding-style.mdc'), '---\nalwaysApply: true\n---\n\nCoding style body\n');
@@ -174,8 +177,15 @@ describe('teamai doctor delivery checks (e2e)', () => {
     write(path.join(home, '.codebuddy/rules/coding-style.md'), '---\nalwaysApply: true\n---\n\nCoding style body\n');
     write(path.join(home, '.codebuddy/agents/reviewer.md'), CLAUDE_AGENT_MD);
     write(path.join(home, '.config/opencode/rules/coding-style.md'), 'Coding style body\n');
-    // The glob the pull adds; without it every .md above is inert.
-    write(path.join(home, '.config', 'opencode', 'opencode.json'), JSON.stringify({ instructions: [opencodeUserGlob()] }));
+    // The glob the pull adds; without it every .md above is inert. The `mcp`
+    // entry is what teamai renders for OpenCode (command is an array, env is
+    // `environment`), placeholder resolved — the check compares the value.
+    write(path.join(home, '.config', 'opencode', 'opencode.json'), JSON.stringify({
+      instructions: [opencodeUserGlob()],
+      mcp: {
+        jira: { type: 'local', command: ['jira-server'], environment: { TOKEN: 's3cret' }, enabled: true },
+      },
+    }));
     // The entry teamai renders for claude, placeholder resolved — the check
     // compares the value, so a hand-shaped entry of the same name is not it.
     write(path.join(home, '.claude.json'), JSON.stringify({
@@ -186,12 +196,28 @@ describe('teamai doctor delivery checks (e2e)', () => {
     // The machine-local KEY=VALUE backup the env channel writes beside env.sh;
     // it is what the MCP placeholder resolution reads.
     write(path.join(home, '.teamai', 'env'), 'JIRA_PASSWORD=s3cret\n');
-    const envSh = path.join(home, '.teamai', 'env.sh');
-    write(path.join(home, '.bashrc'), [
-      '# [teamai:env:start]',
-      `[ -f ${envSh} ] && source ${envSh}`,
-      '# [teamai:env:end]',
-    ].join('\n'));
+    // The profile block and the loader it sources, as a pull writes them (#1018).
+    const loader = path.join(home, '.teamai', 'env-loader.sh');
+    const realHome = process.env.HOME;
+    const realShell = process.env.SHELL;
+    process.env.HOME = home;
+    process.env.SHELL = '/bin/bash';
+    let profiles: string[];
+    try {
+      await writeEnvLoader();
+      // Every file a pull puts the block in on this machine, e.g. ~/.zshenv when zsh is installed.
+      ({ paths: profiles } = await envLoaderProfiles(undefined, loader));
+    } finally {
+      process.env.HOME = realHome;
+      process.env.SHELL = realShell;
+    }
+    for (const profile of profiles) {
+      write(profile, [
+        '# [teamai:env:start]',
+        `[ -f '${loader}' ] && . '${loader}'`,
+        '# [teamai:env:end]',
+      ].join('\n'));
+    }
 
     const report = runDoctor();
     const failed = report.checks.filter((c) => !c.ok).map((c) => c.name);
@@ -213,6 +239,14 @@ describe('teamai doctor delivery checks (e2e)', () => {
   });
 
   it('reports an agent copy left behind by an older spec', () => {
+    // The older spec is in the team repo's history: with no delivery record,
+    // that is what makes the copy teamai's rather than the member's (#993).
+    const spec = path.join(repo, 'agents', 'reviewer.yaml');
+    const current = fs.readFileSync(spec, 'utf8');
+    write(spec, current.replace('Review.', 'Review it the old way.'));
+    commitTeamRepo(repo, 'older spec');
+    write(spec, current);
+    commitTeamRepo(repo, 'current spec');
     write(path.join(home, '.claude/agents/reviewer.md'), CLAUDE_AGENT_MD.replace('Review.', 'Review it the old way.'));
 
     const agents = check(runDoctor(), 'Agents delivered to claude');
@@ -234,20 +268,29 @@ describe('teamai doctor delivery checks (e2e)', () => {
   it('reports a Cursor rule whose globs no longer match the team rule', () => {
     // Legal frontmatter, wrong scope: Cursor applies it to `**/*.py` while the
     // team rule scopes it to `**/*.ts`. Reading the keys for presence calls
-    // this delivered; comparing against the render does not.
-    write(path.join(repo, 'rules', 'coding-style.md'), '---\npaths:\n  - "**/*.ts"\n---\nCoding style body\n');
-    write(
-      path.join(home, '.cursor/rules/coding-style.mdc'),
-      '---\nglobs: "**/*.py"\nalwaysApply: false\n---\n\nCoding style body\n',
-    );
+    // this delivered; comparing against the render does not. The copy is the
+    // render of the team rule's earlier `**/*.py` version, in its history: with
+    // no delivery record, that is what makes it teamai's (#993).
+    const rule = path.join(repo, 'rules', 'coding-style.md');
+    try {
+      write(rule, '---\npaths:\n  - "**/*.py"\n---\nCoding style body\n');
+      commitTeamRepo(repo, 'python scope');
+      write(rule, '---\npaths:\n  - "**/*.ts"\n---\nCoding style body\n');
+      commitTeamRepo(repo, 'typescript scope');
+      write(
+        path.join(home, '.cursor/rules/coding-style.mdc'),
+        '---\nglobs: "**/*.py"\nalwaysApply: false\n---\n\nCoding style body\n',
+      );
 
-    const cursor = check(runDoctor(), 'Rules delivered to cursor');
+      const cursor = check(runDoctor(), 'Rules delivered to cursor');
 
-    expect(cursor.ok).toBe(false);
-    expect(cursor.fix).toContain('delivered from an older copy: coding-style');
-
-    write(path.join(repo, 'rules', 'coding-style.md'), 'Coding style body\n');
-    write(path.join(home, '.cursor/rules/coding-style.mdc'), '---\nalwaysApply: true\n---\n\nCoding style body\n');
+      expect(cursor.ok).toBe(false);
+      expect(cursor.fix).toContain('delivered from an older copy: coding-style');
+    } finally {
+      // Later cases expect the team rule and every copy as delivered.
+      write(rule, 'Coding style body\n');
+      write(path.join(home, '.cursor/rules/coding-style.mdc'), '---\nalwaysApply: true\n---\n\nCoding style body\n');
+    }
   });
 
   it('reports an mcp.yaml that does not parse instead of reading it as no MCP', () => {

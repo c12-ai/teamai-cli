@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { applyOpencodeAgentHook } from '../../opencode-hooks.js';
 
 const ROOT = process.cwd();
@@ -46,20 +47,29 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
     fs.writeFileSync(path.join(team, 'teamai.yaml'), `team: opencode-hooks-e2e\nrepo: ${team}\nprovider: tgit\ntoolPaths:\n  opencode:\n    skills: .opencode/skills\n`);
     fs.writeFileSync(path.join(home, '.teamai/config.yaml'), `repo:\n  localPath: ${team}\n  remote: ${team}\nusername: ci\nscope: user\nenabledAgents:\n  - opencode\n`);
     fs.writeFileSync(path.join(env.OPENCODE_CONFIG_DIR, 'opencode.json'), '{}');
+    // With any plugin configured, OpenCode's first request for a directory waits
+    // until it has npm-installed @opencode-ai/plugin into its config dir: a
+    // registry fetch that, when slow, outlasts the session request below (CI).
+    // teamai's plugins import nothing from it, so record it as installed; with
+    // node_modules present and the name locked, OpenCode installs nothing.
+    fs.mkdirSync(path.join(env.OPENCODE_CONFIG_DIR, 'node_modules'));
+    fs.writeFileSync(path.join(env.OPENCODE_CONFIG_DIR, 'package-lock.json'), JSON.stringify({ packages: { '': { dependencies: { '@opencode-ai/plugin': '*' } } } }));
     const shim = path.join(bin, 'capture.cjs');
-    fs.writeFileSync(shim, `let stdin='';process.stdin.on('data',d=>stdin+=d);process.stdin.on('end',()=>require('node:fs').appendFileSync(${JSON.stringify(records)},JSON.stringify({args:process.argv.slice(2),payload:JSON.parse(stdin)})+'\\n'));`);
-    fs.writeFileSync(path.join(bin, process.platform === 'win32' ? 'teamai.cmd' : 'teamai'), process.platform === 'win32'
-      ? `@"${process.execPath}" "${shim}" %*\r\n`
-      : `#!/bin/sh\nexec '${process.execPath}' '${shim}' "$@"\n`, { mode: 0o755 });
+    // Run injection through the installed-entry stand-in: dispatch captures
+    // the payload, while every other command executes the real built CLI.
+    fs.writeFileSync(shim, `if(process.argv[2]==='hook-dispatch'){let stdin='';process.stdin.on('data',d=>stdin+=d);process.stdin.on('end',()=>require('node:fs').appendFileSync(${JSON.stringify(records)},JSON.stringify({args:process.argv.slice(2),payload:JSON.parse(stdin)})+'\\n'));}else{import(${JSON.stringify(pathToFileURL(CLI).href)});}`);
     let server: ReturnType<typeof spawn> | undefined;
     let logs = '';
     try {
-      const output = execFileSync(process.execPath, [CLI, 'hooks', 'inject'], { env, cwd: work, encoding: 'utf8' });
+      const output = execFileSync(process.execPath, [shim, 'hooks', 'inject'], { env, cwd: work, encoding: 'utf8' });
       expect(output).toContain('OpenCode hook');
+      // In-process, the agent hook finds OpenCode's config home from this sandbox's environment, as the CLI does.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('OPENCODE_CONFIG_DIR', env.OPENCODE_CONFIG_DIR);
       await applyOpencodeAgentHook({ slug: 'start-proof', event: 'SessionStart', command: `node -e ${JSON.stringify(`require('node:fs').appendFileSync(${JSON.stringify(commands)},'start\\n')`)}`, baseDir: home, scope: 'user' });
       const port = await freePort();
       const url = `http://127.0.0.1:${port}`;
-      server = spawn(binary!, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env, cwd: work, stdio: ['ignore', 'pipe', 'pipe'] });
+      server = spawn(binary!, ['serve', '--print-logs', '--hostname', '127.0.0.1', '--port', String(port)], { env, cwd: work, stdio: ['ignore', 'pipe', 'pipe'] });
       server.stdout?.on('data', (data: Buffer) => { logs += data.toString(); });
       server.stderr?.on('data', (data: Buffer) => { logs += data.toString(); });
       const auth = Buffer.from(`opencode:${version === 'V1' ? env.OPENCODE_SERVER_PASSWORD : env.OPENCODE_PASSWORD}`).toString('base64');
@@ -81,8 +91,9 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
           return ['teamai.hooks', 'teamai.agent.start-proof'].map((id) => plugins.find((p) => p.id === id)?.state.status);
         }, { timeout: 20_000 }).toEqual(['active', 'active']);
       }
-      // The first session installs the config-dir plugins' npm dependencies, which takes seconds and varies with load.
-      const session = await request(version === 'V1' ? '/session' : '/api/session', version === 'V1' ? {} : { location: { directory: work } }, 20_000);
+      // The first session can still install the config-dir plugins' npm dependencies, which takes seconds and varies with load.
+      const session = await request(version === 'V1' ? '/session' : '/api/session', version === 'V1' ? {} : { location: { directory: work } }, 20_000)
+        .catch((error: unknown) => { throw new Error(`Creating the session failed: ${String(error)}\nOpenCode server log:\n${logs}`); });
       const dispatches = () => fs.existsSync(records) ? fs.readFileSync(records, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { args: string[]; payload: Record<string, unknown> }) : [];
       await expect.poll(() => dispatches().length, { timeout: 10_000 }).toBe(1);
       expect(dispatches()).toEqual([{ args: ['hook-dispatch', 'session-start', '--tool', 'opencode'], payload: { cwd: work, session_id: session.id } }]);
@@ -97,6 +108,7 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
         await closed;
         clearTimeout(force);
       }
+      vi.unstubAllEnvs();
       fs.rmSync(sandbox, { recursive: true, force: true });
     }
   });

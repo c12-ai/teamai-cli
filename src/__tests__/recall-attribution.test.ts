@@ -19,9 +19,25 @@ import type { ExtensionContext } from './helpers/pi-extensions.js';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   // The dispatcher's detached background pass: nothing under test runs there.
-  spawn: vi.fn(() => ({ on: vi.fn(), stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) }, unref: vi.fn() })),
+  // A foreground dispatch with a background handler still spawns the detached
+  // child for real (spawnBackground): on win32 that goes through the WMI
+  // escape first, whose promise only settles via the process's own
+  // 'close'/'error' event. A bare `on: vi.fn()` never fires it, hanging every
+  // such test until timeout -- so this fires 'close' with a success code,
+  // same as hook-dispatch-cli.test.ts's fakePowerShell helper.
+  spawn: vi.fn(() => {
+    const child = {
+      stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
+      on(event: string, cb: (...args: unknown[]) => void) {
+        if (event === 'close') setTimeout(() => cb(0), 0);
+        return child;
+      },
+      unref: vi.fn(),
+    };
+    return child;
+  }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../update.js')>()),
   doUpdate: vi.fn(async () => undefined),
@@ -31,7 +47,9 @@ vi.mock('../code-knowledge-recall.js', () => ({ queryCodeKnowledge: vi.fn(async 
 // The opt-in judge's local-CLI verdict: every candidate it is sent was used.
 const { judgeAdoption } = vi.hoisted(() => ({ judgeAdoption: vi.fn(async (_reply: string, ids: string[]) => ids) }));
 vi.mock('../votes-judge.js', () => ({ judgeAdoption }));
-// A vote sync lands in a reports checkout beside the clone instead of being pushed.
+// A vote sync lands in a reports checkout beside the clone instead of being
+// pushed. The mock publishes immediately: the write lands, `onDelivered` hooks
+// run, and "origin" is that same directory's current content.
 vi.mock('../utils/reports-branch.js', async () => {
   const nodePath = await import('node:path');
   const nodeFs = await import('node:fs');
@@ -42,7 +60,18 @@ vi.mock('../utils/reports-branch.js', async () => {
     return dir;
   };
   return {
-    updateReports: vi.fn(async (config: LocalConfig, write: (wt: string) => Promise<unknown>) => (await write(checkout(config))) !== null),
+    updateReports: vi.fn(async (
+      config: LocalConfig,
+      write: (wt: string, ctx: { onDelivered: (fn: () => Promise<void>) => void }) => Promise<unknown>,
+    ) => {
+      const delivered: (() => Promise<void>)[] = [];
+      const change = await write(checkout(config), { onDelivered: (fn) => { delivered.push(fn); } });
+      if (change != null) for (const fn of delivered) await fn();
+      return { status: change != null ? 'published' : 'already-present' };
+    }),
+    readReportsOriginFile: vi.fn(async (wt: string, relPath: string) => {
+      try { return nodeFs.readFileSync(nodePath.join(wt, relPath), 'utf8'); } catch { return null; }
+    }),
     ensureReportsWorktree: vi.fn(async (config: LocalConfig) => checkout(config)),
     readableReportsWorktree: vi.fn(async (config: LocalConfig) => checkout(config)),
     indexableVotesDir: vi.fn(async (config: LocalConfig) => nodePath.join(checkout(config), 'votes')),
@@ -63,6 +92,7 @@ const { loadOpencodePlugin } = await import('./helpers/opencode-plugin.js');
 const { loadOmpExtension, loadPiExtension } = await import('./helpers/pi-extensions.js');
 const { showStats } = await import('../stats.js');
 const { setStderrOnly } = await import('../utils/logger.js');
+const { reconcileHooks } = await import('../hooks.js');
 
 const SESSION = 'sess-main';
 /** A Codex session started from the main session's shell, which also sees CLAUDE_CODE_SESSION_ID. */
@@ -147,6 +177,8 @@ class Harness {
   async setUp(options: { inheritUserScope?: boolean } = {}): Promise<void> {
     process.env.HOME = path.join(this.tmp, 'home');
     fs.mkdirSync(process.env.HOME, { recursive: true });
+    // Copilot runs the built-ins it has installed.
+    await reconcileHooks(path.join(process.env.HOME, '.copilot', 'hooks', 'teamai.json'), 'copilot');
 
     // User scope: one learning in the machine-local mirror, which is a knowledge root.
     const userRepo = path.join(process.env.HOME, '.teamai', 'team-repo');
@@ -429,13 +461,13 @@ class Harness {
    * The main session's Stop with TEAMAI_UPVOTE_JUDGE=1, as its detached pass
    * runs the judge: Claude's transcript holds `entries`, then a final reply.
    */
-  async judgeStop(entries: object[]): Promise<void> {
+  async judgeStop(entries: object[], payload: Record<string, unknown> = {}): Promise<void> {
     const transcript = path.join(this.tmp, 'transcript.jsonl');
     const reply = { type: 'assistant', message: { id: 'msg-final', content: [{ type: 'text', text: 'Raised the pool size.' }] } };
     fs.writeFileSync(transcript, [...entries, reply].map((e) => `${JSON.stringify(e)}\n`).join(''));
     this.env({ TEAMAI_UPVOTE_JUDGE: '1' });
     try {
-      await this.dispatch('stop', { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: transcript },
+      await this.dispatch('stop', { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: transcript, ...payload },
         this.root, 'claude', { background: true });
     } finally {
       this.env({ TEAMAI_UPVOTE_JUDGE: undefined });
@@ -464,6 +496,17 @@ class Harness {
     }) as never);
     try {
       await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: options.background });
+      // The real dispatcher runs background handlers in a detached child
+      // process; the mocked spawn above does nothing, so simulate that pass
+      // here. post-tool-use needs it since recall-attribution and
+      // dashboard-report moved to the background (#1216) — without this the
+      // attribution these tests assert never runs.
+      if (!options.background && event === 'post-tool-use') {
+        // readStdinFile removes the file; the real parent hands the child a
+        // fresh serialization of the same payload, so rewrite it here.
+        fs.writeFileSync(stdinFile, JSON.stringify({ session_id: SESSION, ...(cwd ? { cwd } : {}), ...payload }));
+        await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: true });
+      }
     } finally {
       write.mockRestore();
     }
@@ -484,7 +527,7 @@ class Harness {
     for (const { args: argv, payload } of dispatches.splice(0)) {
       // The Skill / TodoWrite matcher pass repeats the wildcard pass's payload.
       if (argv.includes('--matcher')) continue;
-      await this.dispatch(argv[1], { session_id: undefined, ...payload }, null, 'opencode');
+      await this.dispatch(argv[2], { session_id: undefined, ...payload }, null, 'opencode');
     }
   }
 
@@ -1063,6 +1106,15 @@ const ROWS: Row[] = [
       await h.stop();
     },
     project: {},
+  },
+  {
+    name: '05: Claude recall; pwd; cat <doc> (a read that ends a command list, status success) → +1',
+    trace: async (h) => {
+      const { files } = await h.recall('redis timeout');
+      await h.shell(`pwd; cat '${files[0]}'`, '/w\n---');
+      await h.stop();
+    },
+    project: { 'redis-timeout': 1 },
   },
   {
     name: '05: Claude recall; sed -i \'s/pool/POOL/\' <doc> → 0',
@@ -2087,6 +2139,57 @@ describe('recall attribution acceptance (#884)', () => {
     expect(updateReports).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['codex', 'muse', 'zcode'])('12: %s Stop judges its final reply using settled recall-log candidates without a Claude transcript', async tool => {
+    await h.setUp();
+    await h.recall('redis timeout');
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    const stop = () => h.dispatch('stop', { hook_event_name: 'Stop', last_assistant_message: 'Raised the pool size.' }, h.root, tool, { background: true });
+    await stop();
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array));
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+    judgeAdoption.mockClear();
+    await stop();
+    expect(judgeAdoption).not.toHaveBeenCalled();
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: a Claude Stop that also carries the final reply is still judged from its transcript', async () => {
+    await h.setUp();
+    // The recall log has no run of this session; only the transcript shows the recall.
+    const { output, files } = await h.recall('redis timeout', { env: { CLAUDE_CODE_SESSION_ID: '00000000-0000-4000-8000-000000000001' }, claim: false });
+    await h.judgeStop(Harness.bashEntries('toolu_recall', 'teamai recall "redis timeout"', output), { last_assistant_message: 'Raised the pool size.' });
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': files[0] }, expect.any(Array));
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: a Codex Stop whose transcript_path is its own rollout is judged from the recall log', async () => {
+    await h.setUp();
+    await h.recall('redis timeout');
+    const rollout = path.join(h.tmp, 'rollout.jsonl');
+    fs.writeFileSync(rollout, `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'Raised the pool size.' } })}\n`);
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { hook_event_name: 'Stop', transcript_path: rollout, last_assistant_message: 'Raised the pool size.' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array));
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: native Stop keeps inherited user-scope recall read-only in a project', async () => {
+    await h.setUp({ inheritUserScope: true });
+    await h.recall('cache warmup');
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { last_assistant_message: 'Applied the cache warmup.' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption.mock.calls.flatMap(call => call[1])).not.toContain('cache-warmup');
+    expect((await h.upvotes(h.project))['cache-warmup']).toBeUndefined();
+  });
+
+  it('12: a final reply alone cannot invent recall candidates', async () => {
+    await h.setUp();
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { last_assistant_message: '<!-- teamai:recalled-doc-ids: [setup] -->' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption).not.toHaveBeenCalled();
+    expect(await h.upvotes(h.project)).toEqual({});
+  });
+
   it('12: judge on: a doc the hook path credited is not sent to the judge again', async () => {
     await h.setUp();
     const { output, files } = await h.recall('redis timeout');
@@ -2120,6 +2223,50 @@ describe('recall attribution acceptance (#884)', () => {
     await h.judgeStop(Harness.bashEntries('toolu_recall', 'teamai recall "redis timeout"', output));
     expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': files[0] }, expect.any(Array));
     expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  // The recommended path: recall runs inside the teamai-recall subagent, so the
+  // main transcript carries only the `recalled-doc-ids` comment, never the
+  // `File:` lines. The judge backfills the doc's path from the recall log
+  // (recalledPathOf) so the candidate is still grounded and can be judged (#723).
+  it('12: judge on: a subagent recall (no File: line in the main transcript) is still grounded from the recall log → +1', async () => {
+    await h.setUp();
+    // The subagent ran the recall (its Bash claim settles the run + records the path).
+    await h.recall('redis timeout', { caller: 'teamai-recall' });
+    await h.stop();
+    expect(await h.upvotes(h.project)).toEqual({});
+    // The main transcript the Stop hook feeds the judge: only the doc-id comment,
+    // no recall region and no File: line — exactly what a subagent summary leaves.
+    await h.judgeStop([
+      { type: 'assistant', message: { id: 'msg-recall', content: [{ type: 'text', text: '<!-- teamai:recalled-doc-ids: [redis-timeout] -->' }] } },
+    ]);
+    // The path arg is backfilled from the recall log, not the (pathless) transcript.
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array));
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  // A `File:` basename the transcript parser gives the judge (`setup`) is NOT
+  // unique: this session recalled both `learnings/setup.md` (key `setup`) and
+  // `docs/learnings/setup.md` (key `learnings/setup`). The recall-log backfill
+  // must refuse to resolve an ambiguous basename, so the judge grounds the
+  // candidate against NO file (not the wrong one) and nothing is credited —
+  // rather than grounding/crediting the wrong doc (#723).
+  it('12: judge on: a subagent recall whose parser basename is ambiguous stays ungrounded, not mis-credited', async () => {
+    await h.setUp();
+    const { files } = await h.recall('setup installer flags', { caller: 'teamai-recall' });
+    // The query returns two docs that share the `setup` basename.
+    expect(files.some((f) => f.endsWith(path.join('docs', 'learnings', 'setup.md')))).toBe(true);
+    expect(files.some((f) => f.endsWith(path.join('team-repo', 'learnings', 'setup.md')))).toBe(true);
+    await h.stop();
+    await h.judgeStop([
+      { type: 'assistant', message: { id: 'msg-recall', content: [{ type: 'text', text: '<!-- teamai:recalled-doc-ids: [setup] -->' }] } },
+    ]);
+    // The handler refuses to backfill the ambiguous basename, so the judge gets
+    // an EMPTY path map for `setup`. In production judgeAdoption then drops it as
+    // ungrounded (votes-judge drops a candidate with no readable excerpt — see
+    // votes-judge.test.ts); the mock here echoes ids regardless, so this asserts
+    // the handler's contribution (no path handed over), which is the fix.
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['setup'], {}, expect.any(Array));
   });
 
   it('12: judge on: a doc the transcript shows only in a Glob listing, which the hook path does not credit, is judged → +1', async () => {

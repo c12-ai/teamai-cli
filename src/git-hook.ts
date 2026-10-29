@@ -26,7 +26,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getDataHome, type LocalConfig } from './types.js';
 import { execCommand } from './utils/exec.js';
+import { GIT_REPOSITORY_ENV } from './utils/git-env.js';
 import { readFileIfExists, readJson, remove, writeJson } from './utils/fs.js';
+import { gitFindsNoRepository } from './utils/git-discovery.js';
 import { log } from './utils/logger.js';
 
 export const GIT_HOOK_EVENTS = ['post-checkout', 'post-merge', 'post-rewrite'] as const;
@@ -96,20 +98,36 @@ type Git = (args: string[]) => ReturnType<typeof execCommand>;
 const gitIn = (repoDir: string): Git => (args) => execCommand('git', args, { cwd: repoDir, timeoutMs: 10_000 });
 
 async function eventsToWrite(git: Git): Promise<GitHookEvent[]> {
-  const stale: GitHookEvent[] = [];
-  for (const event of GIT_HOOK_EVENTS) {
-    const key = `hook.${hookName(event)}`;
-    const current = (await git(['config', '--local', '--get', `${key}.command`])).stdout.trim();
-    const events = (await git(['config', '--local', '--get-all', `${key}.event`])).stdout.trim();
-    if (current !== gitHookCommand(event) || events !== event) stale.push(event);
+  // Every teamai hook key in one read, each value once (`-z`: `key\nvalue\0`).
+  const values = new Map<string, string[]>();
+  for (const entry of (await git(['config', '--local', '-z', '--get-regexp', '^hook\\.teamai-'])).stdout.split('\0')) {
+    if (!entry) continue;
+    const newline = entry.indexOf('\n');
+    const key = newline === -1 ? entry : entry.slice(0, newline);
+    values.set(key, [...values.get(key) ?? [], newline === -1 ? '' : entry.slice(newline + 1)]);
   }
-  return stale;
+  return GIT_HOOK_EVENTS.filter((event) => {
+    const key = `hook.${hookName(event)}`;
+    // As `--get` reads it: the last value. As `--get-all`: every value, one per line.
+    const current = (values.get(`${key}.command`)?.at(-1) ?? '').trim();
+    const events = (values.get(`${key}.event`) ?? []).join('\n').trim();
+    return current !== gitHookCommand(event) || events !== event;
+  });
+}
+
+const gitVersions = new Map<string | undefined, Promise<string>>();
+
+/** `git --version`, asked once per PATH: it names the git every repository gets. */
+function readGitVersion(git: Git): Promise<string> {
+  let version = gitVersions.get(process.env.PATH);
+  if (!version) gitVersions.set(process.env.PATH, version = git(['--version']).then((r) => r.stdout.trim()));
+  return version;
 }
 
 /** Whether the hook is in the local config of the repository holding `repoDir`, and why not. */
 export async function gitHookStatus(repoDir: string): Promise<GitHookStatus> {
   const git = gitIn(repoDir);
-  const version = (await git(['--version'])).stdout.trim();
+  const version = await readGitVersion(git);
   if ((await git(['rev-parse', '--git-dir'])).code !== 0) return { installed: false, reason: 'not-a-repository' };
   if (!supportsConfigHooks(version)) {
     const scripts = await scriptsToWrite(git, repoDir);
@@ -179,14 +197,15 @@ export function describeMissingGitHook(status: Exclude<GitHookStatus, { installe
  */
 export async function installGitHook(repoDir: string, opts: { dryRun?: boolean } = {}): Promise<GitHookInstall> {
   const git = gitIn(repoDir);
-  const configHooks = supportsConfigHooks((await git(['--version'])).stdout);
-  if ((await git(['rev-parse', '--git-dir'])).code !== 0) return { installed: false, reason: 'not-a-repository' };
-  if (!configHooks) return installHookScripts(git, repoDir, opts);
+  // Three reads, none needing another's answer: asked together, once there is a repository to ask.
+  if (await gitFindsNoRepository(repoDir)) return { installed: false, reason: 'not-a-repository' };
+  const [scriptDirs, version, stale] = await Promise.all([hookScriptDirs(git, repoDir), readGitVersion(git), eventsToWrite(git)]);
+  if (!scriptDirs) return { installed: false, reason: 'not-a-repository' };
+  if (!supportsConfigHooks(version)) return installHookScripts(git, repoDir, opts);
 
-  const stale = await eventsToWrite(git);
   if (opts.dryRun) return { installed: true, changed: stale.length > 0 };
   // A block an older Git needed would dispatch a second time beside the config hook.
-  await removeHookScriptBlocks(git, repoDir);
+  await removeHookScriptBlocks(scriptDirs);
 
   // The wrapper is what the hook command finds `teamai` through when the app
   // that runs git has no login PATH.
@@ -238,19 +257,25 @@ async function installHookScripts(git: Git, repoDir: string, opts: { dryRun?: bo
 }
 
 /**
- * Take teamai's block out of the post-checkout, post-merge and post-rewrite scripts in the
- * repository's own hooks directory (and in core.hooksPath's, should a block
- * predate it). A script left with only the shebang is the one teamai created
- * when there was none, so it goes too. Returns the files changed.
+ * The directories teamai's hook script blocks can be in: the repository's own
+ * hooks directory, and core.hooksPath's should a block predate it. Null
+ * outside a repository. One git call, which is also the repository check.
  */
-async function removeHookScriptBlocks(git: Git, repoDir: string, opts: { dryRun?: boolean } = {}): Promise<string[]> {
-  const dirs = new Set<string>();
-  for (const args of [['rev-parse', '--git-common-dir'], ['rev-parse', '--git-path', 'hooks']]) {
-    const { code, stdout } = await git(args);
-    if (code !== 0) continue;
-    const out = path.resolve(repoDir, stdout.trim());
-    dirs.add(args.length === 2 ? path.join(out, 'hooks') : out);
-  }
+async function hookScriptDirs(git: Git, repoDir: string): Promise<string[] | null> {
+  if (await gitFindsNoRepository(repoDir)) return null;
+  const { code, stdout } = await git(['rev-parse', '--git-common-dir', '--git-path', 'hooks']);
+  if (code !== 0) return null;
+  const [commonDir = '', hooksPath = ''] = stdout.split(/\r?\n/);
+  return [...new Set([path.join(path.resolve(repoDir, commonDir.trim()), 'hooks'), path.resolve(repoDir, hooksPath.trim())])];
+}
+
+/**
+ * Take teamai's block out of the post-checkout, post-merge and post-rewrite
+ * scripts in `dirs` (see hookScriptDirs). A script left with only the shebang
+ * is the one teamai created when there was none, so it goes too. Returns the
+ * files changed.
+ */
+async function removeHookScriptBlocks(dirs: string[], opts: { dryRun?: boolean } = {}): Promise<string[]> {
   const changed: string[] = [];
   for (const dir of dirs) {
     for (const event of GIT_HOOK_EVENTS) {
@@ -277,7 +302,8 @@ async function removeHookScriptBlocks(git: Git, repoDir: string, opts: { dryRun?
  */
 export async function removeGitHook(repoDir: string, opts: { dryRun?: boolean } = {}): Promise<string[]> {
   const git = gitIn(repoDir);
-  if ((await git(['rev-parse', '--git-dir'])).code !== 0) return [];
+  const scriptDirs = await hookScriptDirs(git, repoDir);
+  if (!scriptDirs) return [];
   const removed: string[] = [];
   for (const event of GIT_HOOK_EVENTS) {
     const section = `hook.${hookName(event)}`;
@@ -286,7 +312,7 @@ export async function removeGitHook(repoDir: string, opts: { dryRun?: boolean } 
     removed.push(section);
     if (!opts.dryRun) await ok(git(['config', '--local', '--remove-section', section]), section);
   }
-  removed.push(...await removeHookScriptBlocks(git, repoDir, opts));
+  removed.push(...await removeHookScriptBlocks(scriptDirs, opts));
   return removed;
 }
 
@@ -343,34 +369,9 @@ export async function isRebaseFastForward(
   return (await gitIn(cwd)(['merge-base', '--is-ancestor', oldRef, newRef])).code === 0;
 }
 
-/**
- * Variables through which Git hands a hook the repository it runs for
- * (`git rev-parse --local-env-vars`, minus GIT_CONFIG_COUNT and its
- * GIT_CONFIG_KEY/VALUE pairs, which a member sets in their own environment and
- * Git never adds for a hook). Every git child teamai starts would inherit them
- * and act on the business repo instead of the team clone it names.
- */
-const REPOSITORY_ENV = [
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-  'GIT_CONFIG',
-  'GIT_CONFIG_PARAMETERS',
-  'GIT_OBJECT_DIRECTORY',
-  'GIT_DIR',
-  'GIT_WORK_TREE',
-  'GIT_IMPLICIT_WORK_TREE',
-  'GIT_GRAFT_FILE',
-  'GIT_INDEX_FILE',
-  'GIT_NO_REPLACE_OBJECTS',
-  'GIT_REPLACE_REF_BASE',
-  'GIT_PREFIX',
-  'GIT_INTERNAL_SUPER_PREFIX',
-  'GIT_SHALLOW_FILE',
-  'GIT_COMMON_DIR',
-] as const;
-
 /** Drop the repository Git exported for the hook, before teamai runs any git. */
 export function clearGitHookRepositoryEnv(env: NodeJS.ProcessEnv = process.env): void {
-  for (const name of REPOSITORY_ENV) delete env[name];
+  for (const name of GIT_REPOSITORY_ENV) delete env[name];
 }
 
 // ─── Recorded failures ─────────────────────────────────

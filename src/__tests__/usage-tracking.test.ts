@@ -30,6 +30,8 @@ import {
   readKnownSkills,
   extractSkillName,
   skillExistsOnDisk,
+  skillRoots,
+  type SkillRootsInput,
 } from '../usage-tracker.js';
 import { aggregateUsage, showStats } from '../stats.js';
 import { mergeStats } from '../team-push.js';
@@ -101,12 +103,8 @@ function mockStdin(data: string): () => void {
   };
 }
 
-/**
- * Helper: create a fake skill on disk so `skillExistsOnDisk()` finds it.
- * Creates `~/.claude/skills/<name>/SKILL.md` under the test tmpDir.
- */
-async function createFakeSkill(name: string): Promise<void> {
-  const skillDir = path.join(tmpDir, '.claude', 'skills', name);
+async function createFakeSkill(name: string, root = '.claude/skills'): Promise<void> {
+  const skillDir = path.join(tmpDir, root, name);
   await fse.ensureDir(skillDir);
   await fse.writeFile(path.join(skillDir, 'SKILL.md'), `# ${name}\nFake skill for testing.\n`);
 }
@@ -140,19 +138,23 @@ describe('isValidSkillName', () => {
   });
 });
 
+async function installed(skillName: string, input: Partial<SkillRootsInput> = {}): Promise<boolean> {
+  return skillExistsOnDisk(skillName, await skillRoots({ config: userScope(), ...input }));
+}
+
 describe('skillExistsOnDisk — relocated tool roots', () => {
   it('finds a skill installed only under the root the governing config records', async () => {
     const relocated = path.join(tmpDir, '.claude-work');
     await fse.outputFile(path.join(relocated, 'skills', 'relocated-only', 'SKILL.md'), '# s');
-    await expect(skillExistsOnDisk('relocated-only', { claude: relocated })).resolves.toBe(true);
-    await expect(skillExistsOnDisk('relocated-only')).resolves.toBe(false);
+    await expect(installed('relocated-only', { toolRoots: { claude: relocated } })).resolves.toBe(true);
+    await expect(installed('relocated-only')).resolves.toBe(false);
   });
 
   it('finds a skill installed only under the recorded CODEX_HOME root', async () => {
     const codexHome = path.join(tmpDir, '.codex-alt');
     await fse.outputFile(path.join(codexHome, 'skills', 'codex-only', 'SKILL.md'), '# s');
-    await expect(skillExistsOnDisk('codex-only', { codex: codexHome })).resolves.toBe(true);
-    await expect(skillExistsOnDisk('codex-only')).resolves.toBe(false);
+    await expect(installed('codex-only', { toolRoots: { codex: codexHome } })).resolves.toBe(true);
+    await expect(installed('codex-only')).resolves.toBe(false);
   });
 });
 
@@ -165,7 +167,7 @@ describe('skillExistsOnDisk — Copilot', () => {
     const previous = process.env.COPILOT_HOME;
     process.env.COPILOT_HOME = copilotHome;
     try {
-      await expect(skillExistsOnDisk('copilot-review')).resolves.toBe(true);
+      await expect(installed('copilot-review')).resolves.toBe(true);
     } finally {
       if (previous === undefined) delete process.env.COPILOT_HOME;
       else process.env.COPILOT_HOME = previous;
@@ -177,13 +179,7 @@ describe('skillExistsOnDisk — Copilot', () => {
     const skillDir = path.join(project, '.github', 'skills', 'copilot-test');
     await fse.ensureDir(skillDir);
     await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# Copilot test\n');
-    const previousCwd = process.cwd();
-    process.chdir(project);
-    try {
-      await expect(skillExistsOnDisk('copilot-test')).resolves.toBe(true);
-    } finally {
-      process.chdir(previousCwd);
-    }
+    await expect(installed('copilot-test', { hookCwd: project })).resolves.toBe(true);
   });
 
   it('does not treat the home .github directory as a user skill scope', async () => {
@@ -191,7 +187,7 @@ describe('skillExistsOnDisk — Copilot', () => {
     await fse.ensureDir(skillDir);
     await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# Project only\n');
 
-    await expect(skillExistsOnDisk('project-only')).resolves.toBe(false);
+    await expect(installed('project-only', { hookCwd: tmpDir })).resolves.toBe(false);
   });
 });
 
@@ -721,6 +717,7 @@ describe('usage recorded while every scope shared ~/.teamai/usage.jsonl (#748)',
 
 describe('track', () => {
   it('tracks Skill tool calls', async () => {
+    await createFakeSkill('code-review');
     await track('Skill', JSON.stringify({ skill: 'code-review' }));
 
     const events = await readUsageEvents(userScope());
@@ -734,6 +731,12 @@ describe('track', () => {
 
     const events = await readUsageEvents(userScope());
     expect(events).toEqual([]);
+  });
+
+  it('ignores a Skill call naming no installed skill', async () => {
+    await track('Skill', JSON.stringify({ skill: 'not-installed' }));
+
+    expect(await readUsageEvents(userScope())).toEqual([]);
   });
 
   it('ignores invalid skill names', async () => {
@@ -751,6 +754,7 @@ describe('track', () => {
   });
 
   it('updates known-skills.json on successful track', async () => {
+    await createFakeSkill('code-review');
     await track('Skill', JSON.stringify({ skill: 'code-review' }));
 
     const known = await readKnownSkills();
@@ -798,6 +802,17 @@ describe('skill tracking where teamai is not set up (#748)', () => {
 // ─── trackFromStdin tests ─────────────────────────────
 
 describe('trackFromStdin', () => {
+  beforeEach(async () => {
+    for (const name of ['plan-eng-review', 'tdd', 'code-review']) await createFakeSkill(name);
+  });
+
+  /** A skill installed in Cursor's user skills directory; returns its SKILL.md. */
+  async function createCursorSkill(name: string): Promise<string> {
+    const file = path.join(tmpDir, '.cursor', 'skills', name, 'SKILL.md');
+    await fse.outputFile(file, `# ${name}\n`);
+    return file;
+  }
+
   it('reads STDIN JSON and tracks Skill tool usage', async () => {
     const hookData = JSON.stringify({
       tool_name: 'Skill',
@@ -893,12 +908,12 @@ describe('trackFromStdin', () => {
   it('tracks Cursor Read tool when path is SKILL.md', async () => {
     const hookData = JSON.stringify({
       tool_name: 'Read',
-      tool_input: { path: '/root/.cursor/skills/tdd/SKILL.md' },
+      tool_input: { path: await createCursorSkill('tdd') },
       tool_output: '# TDD Skill\n...',
     });
     const restore = mockStdin(hookData);
     try {
-      await trackFromStdin();
+      await trackFromStdin('cursor');
     } finally {
       restore();
     }
@@ -912,12 +927,12 @@ describe('trackFromStdin', () => {
   it('tracks Cursor Read tool using file_path field (Cursor native format)', async () => {
     const hookData = JSON.stringify({
       tool_name: 'Read',
-      tool_input: { file_path: '/root/.cursor/skills/code-review-expert/SKILL.md' },
+      tool_input: { file_path: await createCursorSkill('code-review-expert') },
       tool_output: '{"file_path":"...","content_length":194}',
     });
     const restore = mockStdin(hookData);
     try {
-      await trackFromStdin();
+      await trackFromStdin('cursor');
     } finally {
       restore();
     }
@@ -948,11 +963,11 @@ describe('trackFromStdin', () => {
   it('extracts skill name from nested Cursor skill paths', async () => {
     const hookData = JSON.stringify({
       tool_name: 'Read',
-      tool_input: { path: '/home/user/.cursor/skills/plan-eng-review/SKILL.md' },
+      tool_input: { path: await createCursorSkill('plan-eng-review') },
     });
     const restore = mockStdin(hookData);
     try {
-      await trackFromStdin();
+      await trackFromStdin('cursor');
     } finally {
       restore();
     }
@@ -981,6 +996,7 @@ describe('trackFromStdin', () => {
   });
 
   it('uses --tool argument as tool source when provided', async () => {
+    await createFakeSkill('tdd', '.claude-internal/skills');
     const hookData = JSON.stringify({
       tool_name: 'Skill',
       tool_input: { skill: 'tdd' },
@@ -998,6 +1014,7 @@ describe('trackFromStdin', () => {
   });
 
   it('uses codebuddy as tool source when --tool codebuddy', async () => {
+    await createFakeSkill('code-review', '.codebuddy/skills');
     const hookData = JSON.stringify({
       tool_name: 'Skill',
       tool_input: { skill: 'code-review' },
@@ -1015,9 +1032,10 @@ describe('trackFromStdin', () => {
   });
 
   it('uses codex-internal as tool source when --tool codex-internal', async () => {
+    // Codex has no skill tool: it reads the SKILL.md with a shell command.
     const hookData = JSON.stringify({
-      tool_name: 'Skill',
-      tool_input: { skill: 'code-review' },
+      tool_name: 'Bash',
+      tool_input: { command: `cat ${path.join(tmpDir, '.claude', 'skills', 'code-review', 'SKILL.md')}` },
     });
     const restore = mockStdin(hookData);
     try {
@@ -1048,27 +1066,39 @@ describe('trackFromStdin', () => {
     expect(events[0].tool).toBe('claude');
   });
 
-  it('Read + SKILL.md always records cursor regardless of --tool argument', async () => {
+  it('credits a Read of SKILL.md to the calling tool, not to cursor (#1221)', async () => {
     const hookData = JSON.stringify({
       tool_name: 'Read',
-      tool_input: { path: '/root/.cursor/skills/tdd/SKILL.md' },
+      tool_input: { path: await createCursorSkill('tdd') },
     });
     const restore = mockStdin(hookData);
     try {
-      await trackFromStdin('some-other-tool');
+      await trackFromStdin('claude-internal');
     } finally {
       restore();
     }
 
     const events = await readUsageEvents(userScope());
     expect(events).toHaveLength(1);
-    expect(events[0].tool).toBe('cursor');
+    expect(events[0].tool).toBe('claude-internal');
+  });
+
+  it('credits a custom tool id only for a Skill call, not a Read of SKILL.md (#1221)', async () => {
+    const restore = mockStdin(JSON.stringify({ tool_name: 'Read', tool_input: { path: await createCursorSkill('tdd') } }));
+    try {
+      await trackFromStdin('some-other-tool');
+    } finally {
+      restore();
+    }
+
+    expect(await readUsageEvents(userScope())).toEqual([]);
   });
 
   it('ignores Read tool when path has no SKILL.md suffix', async () => {
+    await createCursorSkill('tdd');
     const hookData = JSON.stringify({
       tool_name: 'Read',
-      tool_input: { path: '/root/.cursor/skills/tdd/README.md' },
+      tool_input: { path: path.join(tmpDir, '.cursor', 'skills', 'tdd', 'README.md') },
     });
     const restore = mockStdin(hookData);
     try {
@@ -1234,7 +1264,7 @@ describe('getRecommendations', () => {
       },
     ];
 
-    const recs = await getRecommendations(teamStats);
+    const recs = await getRecommendations(teamStats, new Set(['code-review']));
     expect(recs.length).toBeGreaterThan(0);
     expect(recs[0].skill).toBe('code-review');
   });
@@ -1256,12 +1286,13 @@ describe('getRecommendations', () => {
       },
     ];
 
-    const recs = await getRecommendations(teamStats);
+    const recs = await getRecommendations(teamStats, new Set(['code-review']));
     expect(recs.length).toBe(0);
   });
 
   it('excludes skills after truncation when known-skills.json exists', async () => {
     // Simulate: track a skill, then report+truncate
+    await createFakeSkill('tdd');
     await track('Skill', JSON.stringify({ skill: 'tdd' }));
     await truncateUsageAfterReport(1, userScope()); // usage.jsonl is now empty
 
@@ -1279,14 +1310,34 @@ describe('getRecommendations', () => {
       },
     ];
 
-    const recs = await getRecommendations(teamStats);
+    const recs = await getRecommendations(teamStats, new Set(['tdd']));
     // tdd should NOT be recommended because it's in known-skills.json
     expect(recs.find((r) => r.skill === 'tdd')).toBeUndefined();
   });
 
   it('returns empty for no team data', async () => {
-    const recs = await getRecommendations([]);
+    const recs = await getRecommendations([], new Set());
     expect(recs).toEqual([]);
+  });
+
+  it('recommends only skills the team repo delivers, not teammates\' personal or built-in ones', async () => {
+    const used = (...names: string[]): UserStats['skills'] =>
+      Object.fromEntries(names.map((name) => [name, { count: 3, lastUsed: '2026-10-12T10:00:00Z' }]));
+    const teamStats: UserStats[] = [
+      { username: 'alice', updatedAt: '2026-10-12T10:00:00Z', skills: used('tdd', 'pr', 'code-review', 'grilling') },
+      { username: 'bob', updatedAt: '2026-10-12T10:00:00Z', skills: used('tnpm-beta-release') },
+      { username: 'carol', updatedAt: '2026-10-12T10:00:00Z', skills: used('teamai', 'vertical-clip', 'tgit', 'npm-beta-release') },
+    ];
+    await updateKnownSkills('tdd');
+    await updateKnownSkills('pr');
+    await updateKnownSkills('code-review');
+    await updateKnownSkills('grilling');
+    // The skills pull delivers here: the team repo's. The others are teammates' own or the CLI's built-in.
+    const delivered = new Set(['npm-beta-release', 'eli5', 'grill-me', 'grilling', 'i-have-adhd', 'archify']);
+
+    const recs = await getRecommendations(teamStats, delivered);
+
+    expect(recs.map((r) => r.skill)).toEqual(['npm-beta-release']);
   });
 });
 
@@ -1430,6 +1481,22 @@ describe('mergeStats', () => {
 // ─── trackSlashCommand tests ──────────────────────────
 
 describe('trackSlashCommand', () => {
+  it('does not count path segments or URL components that match installed skills', async () => {
+    for (const name of ['tdd', 'Volumes', 'External', 'project']) await createFakeSkill(name);
+    const restore = mockStdin(JSON.stringify({
+      prompt: '/tdd /Volumes/External/project https://example.test/project /tdd/notes /tdd\\notes',
+      hook_event_name: 'UserPromptSubmit',
+    }));
+    try {
+      await trackSlashCommand();
+    } finally {
+      restore();
+    }
+
+    expect((await readUsageEvents(userScope())).map((event) => event.skill)).toEqual(['tdd']);
+    expect(await readKnownSkills()).toEqual(new Set(['tdd']));
+  });
+
   it('tracks a valid slash command', async () => {
     await createFakeSkill('plan-eng-review');
     const hookData = JSON.stringify({
@@ -1626,7 +1693,7 @@ describe('trackSlashCommand', () => {
   });
 
   it('uses --tool argument as tool source', async () => {
-    await createFakeSkill('plan-eng-review');
+    await createFakeSkill('plan-eng-review', '.claude-internal/skills');
     const hookData = JSON.stringify({
       prompt: '/plan-eng-review args',
     });
@@ -1643,9 +1710,9 @@ describe('trackSlashCommand', () => {
   });
 
   it('uses codex-internal as tool source when --tool codex-internal', async () => {
-    await createFakeSkill('plan-eng-review');
+    await createFakeSkill('plan-eng-review', '.codex-internal/skills');
     const hookData = JSON.stringify({
-      prompt: '/plan-eng-review args',
+      prompt: '$plan-eng-review args',
     });
     const restore = mockStdin(hookData);
     try {
@@ -1676,12 +1743,12 @@ describe('trackSlashCommand', () => {
     expect(events[0].tool).toBe('claude');
   });
 
-  it('tracks multiple slash commands in a single prompt', async () => {
+  it('counts only the slash command that starts the prompt, as the prompt-submit hook does (#1221)', async () => {
     await createFakeSkill('plan-eng-review');
     await createFakeSkill('tdd');
     await createFakeSkill('code-review');
     const hookData = JSON.stringify({
-      prompt: '/plan-eng-review /tdd /code-review',
+      prompt: '/plan-eng-review /tdd fix the login bug /code-review',
       session_id: 'sess-multi',
       hook_event_name: 'UserPromptSubmit',
     });
@@ -1692,59 +1759,19 @@ describe('trackSlashCommand', () => {
       restore();
     }
 
-    const events = await readUsageEvents(userScope());
-    expect(events).toHaveLength(3);
-    expect(events.map((e: UsageEvent) => e.skill).sort()).toEqual(
-      ['code-review', 'plan-eng-review', 'tdd'],
-    );
-  });
-
-  it('tracks multiple slash commands with arguments between them', async () => {
-    await createFakeSkill('tdd');
-    await createFakeSkill('code-review');
-    const hookData = JSON.stringify({
-      prompt: '/tdd fix the login bug /code-review',
-      session_id: 'sess-multi-args',
-    });
-    const restore = mockStdin(hookData);
-    try {
-      await trackSlashCommand();
-    } finally {
-      restore();
-    }
-
-    const events = await readUsageEvents(userScope());
-    expect(events).toHaveLength(2);
-    expect(events.map((e: UsageEvent) => e.skill).sort()).toEqual(
-      ['code-review', 'tdd'],
-    );
-  });
-
-  it('skips non-existent skills among multiple slash commands', async () => {
-    await createFakeSkill('tdd');
-    // 'nonexistent' is NOT created on disk
-    const hookData = JSON.stringify({
-      prompt: '/tdd /nonexistent /tdd',
-      session_id: 'sess-multi-phantom',
-    });
-    const restore = mockStdin(hookData);
-    try {
-      await trackSlashCommand();
-    } finally {
-      restore();
-    }
-
-    const events = await readUsageEvents(userScope());
-    // Only 'tdd' should be tracked (twice — it appears twice in prompt)
-    expect(events).toHaveLength(2);
-    expect(events.every((e: UsageEvent) => e.skill === 'tdd')).toBe(true);
+    expect((await readUsageEvents(userScope())).map((e: UsageEvent) => e.skill)).toEqual(['plan-eng-review']);
   });
 });
 
 // ─── track() with --tool tests ────────────────────────
 
 describe('track with tool parameter', () => {
+  beforeEach(async () => {
+    for (const name of ['tdd', 'code-review']) await createFakeSkill(name);
+  });
+
   it('uses provided tool parameter', async () => {
+    await createFakeSkill('code-review', '.claude-internal/skills');
     await track('Skill', JSON.stringify({ skill: 'code-review' }), 'claude-internal');
 
     const events = await readUsageEvents(userScope());
@@ -1777,11 +1804,11 @@ describe('hook command strings', () => {
     // Check PostToolUse hooks have --tool claude-internal
     const postToolUse = settings.hooks?.PostToolUse;
     expect(postToolUse).toBeDefined();
-    const skillHook = postToolUse.find((h: { description?: string }) =>
-      h.description?.includes('Hook dispatch post-tool-use Skill'),
+    const wildcardHook = postToolUse.find((h: { description?: string }) =>
+      h.description?.includes('Hook dispatch post-tool-use wildcard'),
     );
-    expect(skillHook).toBeDefined();
-    expect(skillHook.hooks[0].command).toContain('--tool claude-internal');
+    expect(wildcardHook).toBeDefined();
+    expect(wildcardHook.hooks[0].command).toContain('--tool claude-internal');
 
     // Check UserPromptSubmit hook has --tool claude-internal
     const userPrompt = settings.hooks?.UserPromptSubmit;
@@ -1802,10 +1829,10 @@ describe('hook command strings', () => {
 
     const settings = JSON.parse(await fs.promises.readFile(settingsPath, 'utf-8'));
     const postToolUse = settings.hooks?.PostToolUse;
-    const skillHook = postToolUse.find((h: { description?: string }) =>
-      h.description?.includes('Hook dispatch post-tool-use Skill'),
+    const wildcardHook = postToolUse.find((h: { description?: string }) =>
+      h.description?.includes('Hook dispatch post-tool-use wildcard'),
     );
-    expect(skillHook.hooks[0].command).toContain('--tool claude');
+    expect(wildcardHook.hooks[0].command).toContain('--tool claude');
   });
 
   it('cleans up legacy hooks without description on inject', async () => {
@@ -1877,12 +1904,12 @@ describe('hook command strings', () => {
     );
     expect(observeHooks).toHaveLength(1);
 
-    // teamai dispatch hook should exist with Skill matcher
-    const skillHooks = result.hooks.PostToolUse.filter(
-      (h: { description?: string }) => h.description?.includes('Hook dispatch post-tool-use Skill'),
+    expect(result.hooks.PostToolUse.some((h: { matcher?: string }) => h.matcher === 'Skill')).toBe(false);
+    const wildcardHooks = result.hooks.PostToolUse.filter(
+      (h: { description?: string }) => h.description?.includes('Hook dispatch post-tool-use wildcard'),
     );
-    expect(skillHooks).toHaveLength(1);
-    expect(skillHooks[0].hooks[0].command).toContain('--tool claude');
+    expect(wildcardHooks).toHaveLength(1);
+    expect(wildcardHooks[0].hooks[0].command).toContain('--tool claude');
   });
 
   it('cleans up hooks with outdated description keywords', async () => {

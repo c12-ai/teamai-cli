@@ -37,6 +37,7 @@
 - **Rule 4, operation feasibility questions go to G9**: constraint matrix + decision tree → `graph/G9_*.md`
 - **Rule 5, content marked `[UNVERIFIED]` must not be used for code generation** until confirmed by a human
 - **Rule 6, `AMBIGUOUS` relations must not be used for change impact assessment** until clarified
+- **Rule 7, source freshness is limited evidence**: `current` means only that a cited source file matches the scan baseline, not that the knowledge document is correct. Before relying on implementation claims from `stale`, `missing` or `unknown` sources, check the current source when available and state any unresolved uncertainty.
 
 ---
 
@@ -78,7 +79,7 @@
 
 ### Knowledge base update notes
 
-- **Incremental update**: `teamai codebase --extract <repo> --project <slug> --incremental` re-extracts only the changed files
+- **Incremental update**: `teamai import --dir <repo> --incremental --skip-enrich` re-extracts only the changed files
 - **Full rebuild**: recommended after large-scale code refactoring
 - **Last updated**: `<ISO8601>`
 
@@ -138,7 +139,7 @@
 
 ## Code baseline version
 
-> ⚠️ This knowledge base was generated from the code version below. After the code evolves, run `teamai codebase --extract <repo> --project <slug> --incremental` for an incremental update.
+> ⚠️ This knowledge base was generated from the code version below. After the code evolves, run `teamai import --dir <repo> --incremental --skip-enrich` for an incremental update.
 
 - **Commit**: `<git commit SHA>`
 - **Tag**: `<tag or "no tag">`

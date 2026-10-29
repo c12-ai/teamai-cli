@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   TeamaiConfigSchema,
   LocalConfigSchema,
+  installScopeName,
   StateSchema,
   getUserConfigPath,
   getUserStatePath,
@@ -18,11 +19,13 @@ import {
   getDataHome,
 } from './types.js';
 import { readFileSafe, readJson, writeFileAtomic, writeJsonAtomic, expandHome, pathExists } from './utils/fs.js';
-import { resolveAnchors } from './utils/git.js';
+import { nearestGitEntry, resolveAnchors } from './utils/git.js';
 import { getUserHome } from './utils/home.js';
 import { resolvePartitionDir, writeAnchorFile } from './utils/partition.js';
 import { log } from './utils/logger.js';
-import { loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
+import { listRoleIds, loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
+import { loadRoleAssignmentsIfPresent, resolveAssignedRoles, ROLE_ASSIGNMENTS_FILE } from './role-assignments.js';
+import { warnOnce } from './utils/warn-once.js';
 
 /**
  * Loads that serve a --dry-run write nothing: the legacy role migration, the
@@ -32,6 +35,11 @@ type LoadOptions = {
   dryRun?: boolean;
   /** Omit the legacy-role preview notice for a read-only load on a plain command. */
   suppressMigrationNotice?: boolean;
+  /**
+   * false: a single-repo clone with no config yet loads as no config, without
+   * the clone-time self-heal. For `init`, which sets the project up itself.
+   */
+  selfHeal?: boolean;
 };
 
 async function migrateLegacyRoleConfig(
@@ -39,7 +47,24 @@ async function migrateLegacyRoleConfig(
   configPath: string,
   options: LoadOptions = {},
 ): Promise<LocalConfig> {
-  if (config.primaryRole) {
+  const migrated = await resolveLegacyRole(config);
+  if (migrated.primaryRole === config.primaryRole) return migrated;
+
+  if (options.dryRun) {
+    if (!options.suppressMigrationNotice) log.info('[dry-run] Would migrate legacy teamai config to default role profile: hai');
+    return migrated;
+  }
+  await writeFileAtomic(expandHome(configPath), serializeLocalConfig(migrated));
+  log.info('Migrated legacy teamai config to default role profile: hai');
+  return migrated;
+}
+
+/** `config` with the `hai` role the team declares, when it holds no role; nothing is written. */
+export async function resolveLegacyRole(config: LocalConfig): Promise<LocalConfig> {
+  // The assignment overlay runs first, and an assignment already decided this
+  // member's roles — holding none is one of its answers (`default: []`).
+  // Migrating would persist a `hai` the team did not assign.
+  if (config.primaryRole || config.roleAssignment) {
     return config;
   }
 
@@ -63,20 +88,142 @@ async function migrateLegacyRoleConfig(
     return config;
   }
 
-  const migrated: LocalConfig = {
+  return {
     ...config,
     primaryRole: 'hai',
     additionalRoles: config.additionalRoles ?? [],
     resourceProfileVersion: manifest.version,
   };
+}
 
-  if (options.dryRun) {
-    if (!options.suppressMigrationNotice) log.info('[dry-run] Would migrate legacy teamai config to default role profile: hai');
-    return migrated;
+/**
+ * The roles `manifest/members.yaml` assigns this member, overlaid on the config
+ * this machine holds (#1186).
+ *
+ * Every reader of `primaryRole`/`additionalRoles` — pull, push, the namespace
+ * filter, the hooks and env a role scopes — then sees the team's assignment
+ * without knowing it was assigned, and `teamai roles set` has nothing left to
+ * change. The overlay is runtime-only: `serializeLocalConfig` writes the local
+ * selection back, so a save by any other command never freezes a copy of the
+ * assignment into the config file.
+ *
+ * Absence of the file is the only case that leaves the local selection in
+ * charge. A file that exists but cannot be read, or that assigns a role
+ * `roles.yaml` does not declare, leaves this member with fewer roles — never
+ * with the selection the file was written to take over.
+ */
+async function applyRoleAssignment(config: LocalConfig): Promise<LocalConfig> {
+  // Idempotent: a project config passes through `readConfigFrom` and then the
+  // loader that migrates it, and the second pass must not read the overlaid
+  // roles as the local selection to keep.
+  if (config.roleAssignment) return config;
+
+  let assignments;
+  try {
+    assignments = await loadRoleAssignmentsIfPresent(config.repo.localPath, config.repo);
+  } catch (error) {
+    warnOnce(`${ROLE_ASSIGNMENTS_FILE} could not be read: ${(error as Error).message}`);
+    warnOnce(`Roles are assigned in ${ROLE_ASSIGNMENTS_FILE} while that file exists, so this run holds none. `
+      + 'Fix it in the team repo, or ask a code owner of manifest/ to.');
+    return withAssignedRoles(config, [], 'default');
   }
-  await writeFileAtomic(expandHome(configPath), YAML.stringify(migrated));
-  log.info('Migrated legacy teamai config to default role profile: hai');
-  return migrated;
+  if (!assignments) return config;
+
+  const { roles, source } = resolveAssignedRoles(assignments, config.username);
+  return withAssignedRoles(config, await declaredRoles(config.repo.localPath, roles), source);
+}
+
+/** The assigned ids `manifest/roles.yaml` still declares, with a word about the rest. */
+async function declaredRoles(repoPath: string, roles: string[]): Promise<string[]> {
+  if (roles.length === 0) return roles;
+
+  let declared: Set<string>;
+  try {
+    declared = new Set(listRoleIds(await loadRolesManifest(repoPath)));
+  } catch (error) {
+    // Without a roles manifest nothing maps an assigned id to its namespaces.
+    // The id doubles as a namespace in the legacy fallback, but guessing that
+    // here would deliver directories no reviewed manifest named.
+    warnOnce(`${ROLE_ASSIGNMENTS_FILE} assigns ${roles.join(', ')}, but manifest/roles.yaml could not be read: `
+      + `${(error as Error).message}. No role resources are delivered until it can.`);
+    return [];
+  }
+
+  const unknown = roles.filter((role) => !declared.has(role));
+  if (unknown.length > 0) {
+    warnOnce(`${ROLE_ASSIGNMENTS_FILE} assigns ${unknown.join(', ')}, which manifest/roles.yaml does not declare. `
+      + `Ignoring ${unknown.length === 1 ? 'it' : 'them'}; fix one file or the other in the team repo.`);
+  }
+  return roles.filter((role) => declared.has(role));
+}
+
+/** `config` with the member's own selection back in place of an overlay. */
+function withLocalRoles(config: LocalConfig): LocalConfig {
+  const { roleAssignment, ...local } = config;
+  if (!roleAssignment) return config;
+  const restored: LocalConfig = { ...local, additionalRoles: roleAssignment.local.additionalRoles };
+  if (roleAssignment.local.primaryRole) restored.primaryRole = roleAssignment.local.primaryRole;
+  else delete restored.primaryRole;
+  return restored;
+}
+
+/**
+ * Resolve the assignment again on a config that is already in memory (#1186).
+ *
+ * Two callers:
+ *
+ *  - `pull` loads the config before it updates the team repo, so the assignment
+ *    it read is the one the previous pull left on disk. Re-resolving after the
+ *    refresh is what makes a reassignment take effect on the pull that fetches
+ *    it, instead of delivering the old roles and recording the new revision as
+ *    synced — which the fast path would then skip until `pull --force`.
+ *  - `init` builds the config in memory and hands it straight to the hook, MCP
+ *    and env reconciliation, before any load can overlay it. Without this the
+ *    config would reach them role-less, which matches every role-scoped entry.
+ *
+ * Mutates `config` rather than returning a new one. Pull keys `teamEnvs` and
+ * `instructions` on config identity and reconciles hooks, MCP and env on the
+ * object its caller holds, so a replacement would reach neither.
+ */
+export async function refreshRoleAssignment(config: LocalConfig): Promise<void> {
+  // The local selection is restored first, so an assignments file that just
+  // arrived is applied over it — and one that just went away hands it back.
+  let resolved = await applyRoleAssignment(withLocalRoles(config));
+  // A load runs the legacy migration after the overlay, and skipped it while
+  // the assignment held. A member the assignment just handed back falls back
+  // to `hai` here, as the next load would.
+  if (config.roleAssignment && !resolved.roleAssignment) resolved = await resolveLegacyRole(resolved);
+  if (resolved.primaryRole) config.primaryRole = resolved.primaryRole;
+  else delete config.primaryRole;
+  config.additionalRoles = resolved.additionalRoles;
+  if (resolved.roleAssignment) {
+    config.roleAssignment = resolved.roleAssignment;
+    // The assignment decides the role the legacy migration could not, as it
+    // does on a load, where the migration then never runs.
+    delete config.roleUnresolved;
+  } else {
+    delete config.roleAssignment;
+    if (resolved.roleUnresolved) config.roleUnresolved = true;
+  }
+}
+
+/** `roles` as this member's effective selection, primary first. */
+function withAssignedRoles(config: LocalConfig, roles: string[], source: 'assigned' | 'default'): LocalConfig {
+  const [primaryRole, ...additionalRoles] = roles;
+  const assigned: LocalConfig = {
+    ...config,
+    additionalRoles,
+    roleAssignment: {
+      source,
+      local: {
+        ...(config.primaryRole ? { primaryRole: config.primaryRole } : {}),
+        additionalRoles: config.additionalRoles ?? [],
+      },
+    },
+  };
+  if (primaryRole) assigned.primaryRole = primaryRole;
+  else delete assigned.primaryRole;
+  return assigned;
 }
 
 /**
@@ -98,6 +245,35 @@ export async function loadTeamConfig(repoPath: string): Promise<TeamaiConfig | n
 }
 
 /**
+ * `teamai.yaml` `language` for the scope that owns `config` (#1014).
+ * No config, a missing file, or a file that does not parse means no override:
+ * callers keep the historical bilingual agent text.
+ */
+export async function loadTeamAgentLanguage(
+  config: { repo: { localPath: string } } | null,
+): Promise<'en' | 'zh' | undefined> {
+  if (!config) return undefined;
+  return (await loadTeamConfig(config.repo.localPath))?.language;
+}
+
+/**
+ * Same as {@link loadTeamAgentLanguage}, resolved the way a hook finds its
+ * scope: project over user, and a removed worktree keeps the scope its session
+ * recorded. A lookup failure keeps the historical bilingual text.
+ */
+export async function loadTeamAgentLanguageForHook(
+  payload: Record<string, unknown>,
+  tool?: string,
+): Promise<'en' | 'zh' | undefined> {
+  try {
+    const { resolveHookConfig } = await import('./dashboard-collector.js');
+    return loadTeamAgentLanguage(await resolveHookConfig(payload, tool ?? 'claude'));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Load the local config (~/.teamai/config.yaml)
  */
 export async function loadLocalConfig(options: LoadOptions = {}): Promise<LocalConfig | null> {
@@ -107,7 +283,7 @@ export async function loadLocalConfig(options: LoadOptions = {}): Promise<LocalC
   try {
     const raw = YAML.parse(content);
     const parsed = LocalConfigSchema.parse(raw);
-    return await migrateLegacyRoleConfig(parsed, configPath, options);
+    return await migrateLegacyRoleConfig(await applyRoleAssignment(parsed), configPath, options);
   } catch (e) {
     log.error(`Invalid local config: ${describeConfigError(e)}`);
     return null;
@@ -119,11 +295,18 @@ export async function loadLocalConfig(options: LoadOptions = {}): Promise<LocalC
  * `dataHome` is derived from the projectAnchor at runtime and the config file
  * lives inside that directory, so it must never be persisted (a stale absolute
  * path would defeat the anchor-derived design and break on another machine).
- * `roleUnresolved` describes one load of the roles manifest, not the member.
+ * `roleUnresolved` describes one load of the roles manifest, not the member,
+ * and `children` one read of a workspace (#913).
+ * The workspace scope is written under its current name, `workspace` (#1099).
+ * Only a write that happens anyway uses it (a save, or the legacy role
+ * migration); a plain load leaves a `scope: project` file as it is.
  */
 function serializeLocalConfig(config: LocalConfig): string {
-  const { dataHome: _dataHome, roleUnresolved: _roleUnresolved, ...persisted } = config;
-  return YAML.stringify(persisted);
+  // The overlaid roles are the team's, read fresh on every load. Writing them
+  // would leave a stale copy behind once the assignment changes or the file
+  // goes, and a stale copy is exactly what a member must not be able to keep.
+  const { dataHome: _dataHome, roleUnresolved: _roleUnresolved, children: _children, roleAssignment: _assignment, ...persisted } = withLocalRoles(config);
+  return YAML.stringify({ ...persisted, scope: installScopeName(persisted.scope) });
 }
 
 /**
@@ -249,9 +432,9 @@ export async function loadLocalConfigForScope(
     if (!projectRoot) return null;
     // Reuse the single detection path so config location never drifts between
     // "detect the active project" and "load a named project's config".
-    const detected = await detectProjectConfig(projectRoot, undefined, options);
+    const detected = await findProjectConfig(projectRoot, undefined, options);
     if (!detected) return null;
-    return migrateLegacyRoleConfig(detected, path.join(getDataHome(detected), 'config.yaml'), options);
+    return migrateLegacyRoleConfig(await applyRoleAssignment(detected), path.join(getDataHome(detected), 'config.yaml'), options);
   }
   const configPath = getConfigPath(scope, projectRoot);
   const content = await readFileSafe(expandHome(configPath));
@@ -259,9 +442,9 @@ export async function loadLocalConfigForScope(
   try {
     const raw = YAML.parse(content);
     const parsed = LocalConfigSchema.parse(raw);
-    return await migrateLegacyRoleConfig(parsed, configPath, options);
+    return await migrateLegacyRoleConfig(await applyRoleAssignment(parsed), configPath, options);
   } catch (e) {
-    log.error(`Invalid ${scope} config at ${configPath}: ${describeConfigError(e)}`);
+    log.error(`Invalid ${installScopeName(scope)} config at ${configPath}: ${describeConfigError(e)}`);
     return null;
   }
 }
@@ -295,6 +478,12 @@ export async function saveLocalConfigForScope(
     }
   } catch {
     // anchor file is a best-effort convenience for status --all; never fail a save
+  }
+  // Nothing in the checkout says a partition project governs it until its first
+  // pull registers it, so the env loader must not give it the user env meanwhile.
+  if (config.scope === 'project' && config.projectRoot) {
+    const { markEnvScopePending } = await import('./resources/env-loader.js');
+    await markEnvScopePending(config.projectRoot);
   }
 }
 
@@ -377,7 +566,9 @@ export async function resolveDataHomeForScope(scope: Scope, projectRoot?: string
  * never the user scope, nor a lower-priority project config that detection
  * reads after it (a legacy `.teamai/` behind a broken partition may name
  * another team): that project's hooks and usage must not reach a team it may
- * not belong to (#748). The hook dispatcher and every usage reader and writer
+ * not belong to (#748). So is a directory with a `.git` entry in it or above
+ * whose repository git cannot read: which project governs it is unknown, and
+ * `onUnreadable` is told that `.git`. The hook dispatcher and every usage reader and writer
  * resolve through this, so they always agree on the scope. A directory that no
  * longer exists (a hook payload naming a deleted worktree) holds no project
  * config; git refuses to open it, so it is not asked. Hooks go through
@@ -392,6 +583,11 @@ export async function resolveConfigForDir(
 ): Promise<LocalConfig | null> {
   const target = dir ?? process.cwd();
   if (!(await pathExists(target))) return loadLocalConfig(options);
+  const gitEntry = await nearestGitEntry(target);
+  if (gitEntry && !(await resolveAnchors(target))) {
+    onUnreadable?.(gitEntry, 'git could not read this repository, so which project governs this directory is unknown. Run `git status` here to see why');
+    return null;
+  }
   let unreadable = false;
   const project = await detectProjectConfig(target, (configPath, error) => {
     unreadable = true;
@@ -431,6 +627,17 @@ export async function detectProjectConfig(
   cwd?: string,
   onUnreadable?: UnreadableConfigSink,
   options: LoadOptions = {},
+): Promise<LocalConfig | null> {
+  // `hai` is resolved in memory: many callers are metadata lookups or dry
+  // runs, which must not write the config. loadLocalConfigForScope persists it.
+  const found = await findProjectConfig(cwd, onUnreadable, options);
+  return found && resolveLegacyRole(found);
+}
+
+async function findProjectConfig(
+  cwd: string | undefined,
+  onUnreadable: UnreadableConfigSink | undefined,
+  options: LoadOptions,
 ): Promise<LocalConfig | null> {
   const dir = cwd ?? process.cwd();
 
@@ -499,6 +706,7 @@ async function selfHealAndReadPartition(
   onUnreadable?: UnreadableConfigSink,
   options: LoadOptions = {},
 ): Promise<LocalConfig | null> {
+  if (options.selfHeal === false) return null;
   if (options.dryRun) return previewSelfHeal(workspaceRoot, partitionDir, workspaceRoot);
   try {
     const { bootstrapSelfRepo } = await import('./bootstrap.js');
@@ -519,7 +727,7 @@ export async function readConfigFrom(
 ): Promise<LocalConfig | null> {
   const configPath = path.join(dataHomeDir, 'config.yaml');
   if (!(await pathExists(configPath))) {
-    if (!selfHealRepoRoot) return null;
+    if (!selfHealRepoRoot || options.selfHeal === false) return null;
     if (options.dryRun) return previewSelfHeal(selfHealRepoRoot, dataHomeDir, projectRoot);
     try {
       const { bootstrapSelfRepo } = await import('./bootstrap.js');
@@ -544,11 +752,11 @@ export async function readConfigFrom(
       // Anywhere else a config here that is not scope: project cannot say which
       // project it serves, and detection would read past it to the user config.
       if (!isUserTeamaiDir(dataHomeDir, projectRoot)) {
-        onUnreadable?.(configPath, `it is scope: ${config.scope}, but a config inside a project must be scope: project`);
+        onUnreadable?.(configPath, `it is scope: ${installScopeName(config.scope)}, but a config inside a workspace must be scope: workspace`);
       }
       return null;
     }
-    return anchorProjectConfig(config, dataHomeDir, projectRoot);
+    return await applyRoleAssignment(anchorProjectConfig(config, dataHomeDir, projectRoot));
   } catch (e) {
     onUnreadable?.(configPath, describeConfigError(e));
     return null;
@@ -617,10 +825,17 @@ function isUserTeamaiDir(dataHomeDir: string, projectRoot: string): boolean {
 /**
  * One line naming what is wrong. A Zod message is a JSON dump of its issues,
  * whose first line is `[`; each issue's field and reason is what a member fixes.
+ * A scope this CLI does not know is most likely one a newer teamai wrote, as
+ * `workspace` is for a CLI older than #1099, so it says how to get past it.
  */
 function describeConfigError(e: unknown): string {
   if (e instanceof ZodError) {
-    return e.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
+    return e.issues.map((issue) => {
+      if (issue.code === 'invalid_enum_value' && issue.path.join('.') === 'scope') {
+        return `scope "${String(issue.received)}" is not one this teamai knows; a newer teamai may have written it. Run \`teamai update\``;
+      }
+      return `${issue.path.join('.') || '(root)'}: ${issue.message}`;
+    }).join('; ');
   }
   return e instanceof Error ? e.message : String(e);
 }
@@ -651,7 +866,7 @@ export async function requireInitForScope(
   const localConfig = await loadLocalConfigForScope(scope, projectRoot);
   if (!localConfig) {
     if (scope === 'project') {
-      throw new NotInitializedError(`teamai is not initialized in project scope at ${projectRoot}. Run \`teamai init\` first.`);
+      throw new NotInitializedError(`teamai is not initialized in workspace scope at ${projectRoot}. Run \`teamai init\` first.`);
     }
     return throwMissingOrInvalid(expandHome(getConfigPath(scope, projectRoot)));
   }
@@ -666,8 +881,11 @@ export async function requireInitForScope(
  * cannot be read, throws instead of falling back to another team's config.
  * Otherwise falls back to user scope.
  * This is the recommended entry point for commands that support both scopes.
+ * A workspace comes with the children set up under it (#913), so a command
+ * resolves what pull delivers; `children: false` skips that walk, for a path
+ * a hook runs that reads no selection.
  */
-export async function autoDetectInit(cwd?: string, options: LoadOptions = {}): Promise<TeamaiInit> {
+export async function autoDetectInit(cwd?: string, options: LoadOptions & { children?: boolean } = {}): Promise<TeamaiInit> {
   let unreadable: string | undefined;
   const projectConfig = await detectProjectConfig(cwd, (configPath, error) => {
     unreadable ??= `${configPath}: ${error}`;
@@ -676,7 +894,10 @@ export async function autoDetectInit(cwd?: string, options: LoadOptions = {}): P
   if (projectConfig) {
     const teamConfig = await loadTeamConfig(projectConfig.repo.localPath);
     if (!teamConfig) return throwTeamConfigMissingOrInvalid(projectConfig.repo.localPath);
-    return { localConfig: projectConfig, teamConfig };
+    if (options.children === false) return { localConfig: projectConfig, teamConfig };
+    // Loaded here: the walk reaches this module through the resolvers it imports.
+    const { readWorkspaceChildren } = await import('./workspace-children.js');
+    return { localConfig: await readWorkspaceChildren(projectConfig), teamConfig };
   }
   return requireInit(options);
 }

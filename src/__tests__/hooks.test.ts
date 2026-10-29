@@ -7,12 +7,15 @@ let mockFiles: Record<string, unknown> = {};
 
 vi.mock('../utils/fs.js', () => ({
   readJson: vi.fn(async (filePath: string) => mockFiles[filePath] ?? null),
+  readJsonObject: vi.fn(async (filePath: string) => (filePath in mockFiles
+    ? { kind: 'ok', value: mockFiles[filePath] } : { kind: 'missing' })),
   writeJson: vi.fn(async (filePath: string, data: unknown) => {
     mockFiles[filePath] = JSON.parse(JSON.stringify(data));
   }),
   expandHome: (p: string) => p,
   ensureDir: vi.fn(),
   pathExists: vi.fn(async () => true),
+  readFileSafe: vi.fn(async () => null),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -25,7 +28,7 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-import { getHookStatus, injectHooks, removeHooks, injectHooksToAllTools, TEAMAI_HOOK_SUBCOMMANDS, TEAMAI_LEGACY_HOOK_SUBCOMMANDS, CLAUDE_TO_CURSOR_EVENTS, reconcileHooks, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, agentHookDescription } from '../hooks.js';
+import { getHookStatus, injectHooks, removeHooks, injectHooksToAllTools, reconcileHooksToAllTools, TEAMAI_HOOK_SUBCOMMANDS, TEAMAI_LEGACY_HOOK_SUBCOMMANDS, CLAUDE_TO_CURSOR_EVENTS, reconcileHooks, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, agentHookDescription } from '../hooks.js';
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -64,7 +67,7 @@ describe('hooks', () => {
   });
 
   describe('inject — empty file', () => {
-    it('Claude format: injects 5 events with 7 dispatch hooks into empty settings.json', async () => {
+    it('Claude format: injects 5 events with 6 dispatch hooks into empty settings.json', async () => {
       await injectHooks('/test/settings.json', 'claude');
 
       const result = mockFiles['/test/settings.json'] as { hooks: Record<string, unknown[]> };
@@ -75,15 +78,15 @@ describe('hooks', () => {
 
       // Merged dispatch format: one dispatch entry per event+matcher.
       // SessionStart(*:1), Stop(*:1),
-      // PostToolUse(*:1, Skill:1, TodoWrite:1), UserPromptSubmit(*:1), SubagentStop(*:1)
+      // PostToolUse(*:1, TodoWrite:1), UserPromptSubmit(*:1), SubagentStop(*:1)
       expect(result.hooks['SessionStart']).toHaveLength(1);
       expect(result.hooks['Stop']).toHaveLength(1);
-      expect(result.hooks['PostToolUse']).toHaveLength(3);
+      expect(result.hooks['PostToolUse']).toHaveLength(2);
       expect(result.hooks['UserPromptSubmit']).toHaveLength(1);
       expect(result.hooks['SubagentStop']).toHaveLength(1);
     });
 
-    it('Cursor format: injects 4 events with 6 dispatch hooks into empty hooks.json', async () => {
+    it('Cursor format: injects 4 events with 5 dispatch hooks into empty hooks.json', async () => {
       await injectHooks('/test/hooks.json', 'cursor');
 
       const result = mockFiles['/test/hooks.json'] as { version: number; hooks: Record<string, unknown[]> };
@@ -96,7 +99,7 @@ describe('hooks', () => {
       // Same merged structure (with TodoWrite dispatch entry)
       expect(result.hooks['sessionStart']).toHaveLength(1);
       expect(result.hooks['stop']).toHaveLength(1);
-      expect(result.hooks['postToolUse']).toHaveLength(3);
+      expect(result.hooks['postToolUse']).toHaveLength(2);
       expect(result.hooks['beforeSubmitPrompt']).toHaveLength(1);
     });
 
@@ -106,7 +109,7 @@ describe('hooks', () => {
       const result = mockFiles['/test/codex-hooks.json'] as { hooks: Record<string, Array<{ matcher?: string; description?: string; hooks: Array<{ command: string }> }>> };
       expect(result.hooks).toBeDefined();
       expect(Object.keys(result.hooks)).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit', 'SubagentStop', 'SubagentStart']);
-      expect(result.hooks.PostToolUse).toHaveLength(3);
+      expect(result.hooks.PostToolUse).toHaveLength(2);
       expect(result.hooks.SessionStart[0].hooks[0].command).toContain('--tool codex');
       expect(result.hooks.SessionStart[0].description).toBeUndefined();
     });
@@ -117,6 +120,27 @@ describe('hooks', () => {
       const result = mockFiles['/test/codex-hooks.json'] as { hooks: Record<string, Array<{ hooks: Array<{ additionalContextLimit?: number }> }>> };
       expect(result.hooks.SessionStart[0].hooks[0].additionalContextLimit).toBe(0);
       expect(result.hooks.Stop[0].hooks[0]).not.toHaveProperty('additionalContextLimit');
+    });
+
+    it('Codex format: gives every built-in entry its cmd.exe form in commandWindows (#1215)', async () => {
+      await injectHooks('/test/codex-hooks.json', 'codex');
+
+      const result = mockFiles['/test/codex-hooks.json'] as { hooks: Record<string, Array<{ hooks: Array<{ command: string; commandWindows?: string }> }>> };
+      // `command` keeps the POSIX fail-open form on every platform (#1074);
+      // Windows reads `commandWindows` under %COMSPEC% /C, where the
+      // pre-#1215 PowerShell syntax never ran: `2>$null` created a file named
+      // $null and `;` is an argument delimiter, so `exit 0` arrived as junk
+      // arguments. The cmd form redirects to `nul` and separates with `&`,
+      // which also restores the not-found fail-open on the real shell.
+      expect(result.hooks.SessionStart[0].hooks[0].command).toBe('bash -lc "teamai hook-dispatch session-start --tool codex 2>/dev/null" || true');
+      expect(result.hooks.SessionStart[0].hooks[0].commandWindows).toBe('teamai hook-dispatch session-start --tool codex 2>nul & exit 0');
+      const todoWrite = result.hooks.PostToolUse.flatMap((group) => group.hooks).find((hook) => hook.command.includes('--matcher TodoWrite'));
+      expect(todoWrite?.commandWindows).toBe('teamai hook-dispatch post-tool-use --tool codex --matcher TodoWrite 2>nul & exit 0');
+      for (const hook of Object.values(result.hooks).flat().flatMap((group) => group.hooks)) {
+        expect(hook.commandWindows).toBeDefined();
+        expect(hook.commandWindows).not.toContain('$null');
+        expect(hook.commandWindows).not.toContain(';');
+      }
     });
 
     it('Claude uses PascalCase event names', async () => {
@@ -144,7 +168,7 @@ describe('hooks', () => {
       const result = mockFiles['/test/settings.json'] as { hooks: Record<string, unknown[]> };
       expect(result.hooks['SessionStart']).toHaveLength(1);
       expect(result.hooks['Stop']).toHaveLength(1);
-      expect(result.hooks['PostToolUse']).toHaveLength(3);
+      expect(result.hooks['PostToolUse']).toHaveLength(2);
       expect(result.hooks['UserPromptSubmit']).toHaveLength(1);
     });
 
@@ -155,7 +179,7 @@ describe('hooks', () => {
       const result = mockFiles['/test/hooks.json'] as { hooks: Record<string, unknown[]> };
       expect(result.hooks['sessionStart']).toHaveLength(1);
       expect(result.hooks['stop']).toHaveLength(1);
-      expect(result.hooks['postToolUse']).toHaveLength(3);
+      expect(result.hooks['postToolUse']).toHaveLength(2);
       expect(result.hooks['beforeSubmitPrompt']).toHaveLength(1);
     });
 
@@ -387,6 +411,26 @@ describe('hooks', () => {
       }
     });
 
+    it('writes no settings hooks for a tool that reads none, whatever toolPaths names', async () => {
+      const originalHome = process.env.HOME;
+      process.env.HOME = '/test-home';
+
+      try {
+        await injectHooksToAllTools({ joycode: { settings: '.joycode/settings.json' }, trae: { settings: '.trae/settings.json' } });
+        await reconcileHooksToAllTools({ joycode: { settings: '.joycode/settings.json' } }, '/test-home', [], '/test-home/.teamai/managed-hooks.json', {});
+
+        expect(Object.keys(mockFiles)).toEqual([]);
+
+        // Removal still clears what an earlier release wrote there.
+        await injectHooks(path.join('/test-home', '.joycode/settings.json'), 'claude');
+        await reconcileHooksToAllTools({ joycode: { settings: '.joycode/settings.json' } }, '/test-home', [], '/test-home/.teamai/managed-hooks.json', { removeAll: true });
+
+        expect(JSON.stringify(mockFiles[path.join('/test-home', '.joycode/settings.json')])).not.toContain('teamai hook-dispatch');
+      } finally {
+        process.env.HOME = originalHome;
+      }
+    });
+
     it('skips tools whose root directory does not exist', async () => {
       const originalHome = process.env.HOME;
       process.env.HOME = '/test-home';
@@ -531,21 +575,15 @@ describe('hooks', () => {
       }
     });
 
-    it('PostToolUse/postToolUse Skill matcher dispatch hook exists in both formats', async () => {
+    it('PostToolUse/postToolUse carry no Skill dispatch hook in either format: the wildcard pass tracks skill use (#1221)', async () => {
       await injectHooks('/test/claude.json', 'claude');
       await injectHooks('/test/cursor.json', 'cursor');
 
       const claudeResult = mockFiles['/test/claude.json'] as { hooks: Record<string, Array<{ matcher: string }>> };
       const cursorResult = mockFiles['/test/cursor.json'] as { hooks: Record<string, Array<{ matcher?: string; command: string }>> };
 
-      const claudeSkill = claudeResult.hooks.PostToolUse.find((h) => h.matcher === 'Skill');
-      expect(claudeSkill).toBeDefined();
-
-      const cursorSkill = cursorResult.hooks.postToolUse.find(
-        (h) => h.matcher === 'Skill'
-      );
-      expect(cursorSkill).toBeDefined();
-      expect(cursorSkill!.command).toContain('hook-dispatch');
+      expect(claudeResult.hooks.PostToolUse.map((h) => h.matcher)).toEqual(['*', 'TodoWrite']);
+      expect(cursorResult.hooks.postToolUse.some((h) => h.matcher === 'Read' || h.command.includes('--matcher Skill'))).toBe(false);
     });
 
     it('Cursor hooks have timeout values', async () => {
@@ -631,12 +669,12 @@ describe('hooks', () => {
   });
 
   describe('agent hooks (issue #238)', () => {
-    it('isAgentHookSupportedTool: claude/codex/workbuddy/codebuddy/openclaw yes, cursor no', () => {
-      for (const t of ['claude', 'codex', 'workbuddy', 'codebuddy', 'codex-internal', 'openclaw', 'qclaw', 'easyclaw', 'autoclaw']) {
-        expect(isAgentHookSupportedTool(t)).toBe(true);
+    it('isAgentHookSupportedTool: a Claude or Codex settings file, or an adapter that takes agent hooks; not Cursor, Copilot, ZCode, OMP, dsh or a tool with no hook channel', () => {
+      for (const t of ['claude', 'codex', 'workbuddy', 'codebuddy', 'codex-internal', 'muse', 'openclaw', 'qclaw', 'easyclaw', 'autoclaw', 'hermes', 'opencode', 'pi', 'my-tool']) {
+        expect(isAgentHookSupportedTool(t), t).toBe(true);
       }
-      for (const t of ['cursor']) {
-        expect(isAgentHookSupportedTool(t)).toBe(false);
+      for (const t of ['cursor', 'copilot', 'zcode', 'omp', 'dsh', 'kiro', 'trae']) {
+        expect(isAgentHookSupportedTool(t), t).toBe(false);
       }
     });
 
@@ -652,7 +690,7 @@ describe('hooks', () => {
     it('applyAgentHook (claude): writes a slug-tagged entry with timeout', async () => {
       await applyAgentHook('/t/settings.json', 'claude', {
         slug: 's1', event: 'SessionStart', command: 'echo hi', timeout: 10,
-      });
+      }, { kind: 'disabled' });
       const s = mockFiles['/t/settings.json'] as any;
       const e = s.hooks.SessionStart.find((x: any) => x.description === agentHookDescription('s1'));
       expect(e).toBeDefined();
@@ -662,8 +700,8 @@ describe('hooks', () => {
     });
 
     it('applyAgentHook (claude): re-install same slug replaces, no duplicate', async () => {
-      await applyAgentHook('/t/s.json', 'claude', { slug: 's2', event: 'Stop', command: 'echo a' });
-      await applyAgentHook('/t/s.json', 'claude', { slug: 's2', event: 'Stop', command: 'echo b' });
+      await applyAgentHook('/t/s.json', 'claude', { slug: 's2', event: 'Stop', command: 'echo a' }, { kind: 'disabled' });
+      await applyAgentHook('/t/s.json', 'claude', { slug: 's2', event: 'Stop', command: 'echo b' }, { kind: 'disabled' });
       const s = mockFiles['/t/s.json'] as any;
       const mine = s.hooks.Stop.filter((x: any) => x.description === agentHookDescription('s2'));
       expect(mine).toHaveLength(1);
@@ -674,14 +712,14 @@ describe('hooks', () => {
       mockFiles['/t/s.json'] = {
         hooks: { SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: 'user-cmd' }] }] },
       };
-      await applyAgentHook('/t/s.json', 'claude', { slug: 's3', event: 'SessionStart', command: 'echo hi' });
+      await applyAgentHook('/t/s.json', 'claude', { slug: 's3', event: 'SessionStart', command: 'echo hi' }, { kind: 'disabled' });
       const s = mockFiles['/t/s.json'] as any;
       expect(s.hooks.SessionStart.some((x: any) => x.hooks[0].command === 'user-cmd')).toBe(true);
       expect(s.hooks.SessionStart.some((x: any) => x.description === agentHookDescription('s3'))).toBe(true);
     });
 
     it('applyAgentHook (codex): writes entry without description, matched by command', async () => {
-      await applyAgentHook('/t/codex.json', 'codex', { slug: 's4', event: 'PreToolUse', command: 'echo cx' });
+      await applyAgentHook('/t/codex.json', 'codex', { slug: 's4', event: 'PreToolUse', command: 'echo cx' }, { kind: 'disabled' });
       const s = mockFiles['/t/codex.json'] as any;
       const e = s.hooks.PreToolUse.find((x: any) => x.hooks[0].command === 'echo cx');
       expect(e).toBeDefined();
@@ -689,15 +727,15 @@ describe('hooks', () => {
     });
 
     it('removeAgentHook (claude): removes by slug, drops empty event key', async () => {
-      await applyAgentHook('/t/s.json', 'claude', { slug: 's5', event: 'SessionStart', command: 'echo hi' });
-      await removeAgentHook('/t/s.json', 'claude', { slug: 's5' });
+      await applyAgentHook('/t/s.json', 'claude', { slug: 's5', event: 'SessionStart', command: 'echo hi' }, { kind: 'disabled' });
+      await removeAgentHook('/t/s.json', 'claude', { slug: 's5' }, { kind: 'disabled' });
       const s = mockFiles['/t/s.json'] as any;
       expect(s.hooks.SessionStart).toBeUndefined();
     });
 
     it('removeAgentHook (codex): removes by command', async () => {
-      await applyAgentHook('/t/codex.json', 'codex', { slug: 's6', event: 'Stop', command: 'echo cx6' });
-      await removeAgentHook('/t/codex.json', 'codex', { slug: 's6', command: 'echo cx6' });
+      await applyAgentHook('/t/codex.json', 'codex', { slug: 's6', event: 'Stop', command: 'echo cx6' }, { kind: 'disabled' });
+      await removeAgentHook('/t/codex.json', 'codex', { slug: 's6', command: 'echo cx6' }, { kind: 'disabled' });
       const s = mockFiles['/t/codex.json'] as any;
       expect(s.hooks.Stop).toBeUndefined();
     });
@@ -705,7 +743,7 @@ describe('hooks', () => {
     it('normal reconcile leaves an agent hook untouched; removeAll sweeps it', async () => {
       // Seed a claude settings file with a built-in inject + an agent hook.
       await injectHooks('/t/rec.json', 'claude');
-      await applyAgentHook('/t/rec.json', 'claude', { slug: 's7', event: 'SessionStart', command: 'echo hi' });
+      await applyAgentHook('/t/rec.json', 'claude', { slug: 's7', event: 'SessionStart', command: 'echo hi' }, { kind: 'disabled' });
       const marker = agentHookDescription('s7');
       const has = () => {
         const s = mockFiles['/t/rec.json'] as any;

@@ -90,16 +90,24 @@ says so and why.)
    session, use the name of **this** tool — do not assume Claude Code or Cursor.
    Some hosts need extra manual steps for hooks — see the troubleshooting
    reference ("Agent-specific caveats").
-5. **Team secrets: the user types the value, you run the CLI.** When the team
-   declares secrets (the session-start context lists them; `teamai env list`
-   shows them), run the CLIs that use them through `teamai env exec -- <command>`,
-   `--` first, so they get this team's value. It is for CLIs, not for starting
-   an agent: a secret named like a model profile's (`ANTHROPIC_*`) overrides it.
+5. **Team env: run the CLI through `teamai env exec`; the user types secret values.**
+   When the team delivers env variables or secrets (the session-start context
+   lists them; `teamai env list` shows them), run the CLIs that use them through
+   `teamai env exec -- <command>`, `--` first, so they get this directory's team
+   values: the shell you run commands in may carry another project's. It is for
+   CLIs, not for starting an agent: a secret named like a model profile's
+   (`ANTHROPIC_*`) overrides it.
    When a secret is missing, ask the user to run `teamai env set KEY` in their
    own terminal. Never ask for a value in chat, pass one to `--stdin` or
    `--secret`, read the files under `~/.teamai/secrets/`, or print one
    (`teamai env exec -- env` and `printenv` do). Declaring a secret with
    `teamai env add KEY --secret` takes no value, so you can run it.
+
+Treat recalled codebase knowledge as a reference for architecture. If a result
+reports `Source freshness: ...=stale`, `missing`, or `unknown`, inspect available
+source before relying on its implementation details and state when freshness
+cannot be established. `current` means the cited file matches the scan baseline;
+it does not prove the knowledge document is correct.
 
 ## Daily commands
 
@@ -117,24 +125,31 @@ Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 
 `teamai pull` mirrors the non-hidden docs you receive into `sharing.docs.localDir`,
-removing stale and local-only documents; an edited doc of a docs namespace you left
-is kept and named. Use a dedicated directory; preview with `--dry-run`.
+removing teamai's copies of documents the team removed; the user's own files there
+stay, and an edited doc of a docs namespace you left is kept and named. Preview
+with `--dry-run`.
 
 `teamai pull` keeps a skill, rule or agent copy the user changed since teamai
 delivered it, `--force` included, and names it (`Kept <path>: ...`). To share
 the change, `teamai push`; when pull says the version teamai would deploy has
 changed since, or push says so for that copy, merge that change into the copy first, or the push replaces it. To take the team version instead, delete
-the copy and run `teamai pull --force`. The first pull after upgrading, and a
-new worktree's first pull, still overwrite: nothing is recorded yet.
+the copy and run `teamai pull --force`. A skill, rule, agent or docs-mirror
+file that teamai has no record of (first pull after upgrading, a new or restored
+checkout, the user's own) is teamai's only if it holds a team version from the team repo's
+history (a skill: every file in it); any other is kept as the user's
+(`Kept <path>: it is not teamai's ...`): rename or delete it, then `teamai pull`,
+to receive the team version.
 
-In project scope, `init` and `pull` also install a git hook in the repository's
+In workspace scope, `init` and `pull` also install a git hook in the repository's
 local git config (`hook.teamai-post-checkout`, `hook.teamai-post-merge`, `hook.teamai-post-rewrite`; Git
 2.54+; older Git without `core.hooksPath` gets a marked block in `.git/hooks/`
 scripts, and with it `teamai doctor` advises), beside any `core.hooksPath` manager or `.git/hooks` script. When a
 worktree is created by `git worktree add` or an app that runs checkout hooks, it creates the project roots
 of `enabledAgents` (else the ones the main checkout has) and pulls into it before
 the command returns, from the team clone as last fetched when that was within
-24 h; a full pull then runs in the background. A branch switch does nothing.
+24 h; a full pull then runs in the background. A worktree an agent tool creates without git hooks
+(Claude Code's `EnterWorktree`, Codex CLI) is prepared the same way, in the background, on the first
+session start or tool use there. A branch switch does nothing.
 After `git pull` (merge or a completed rebase) it fetches the team repo (5 s cap, then the background pull) and
 delivers; in single-repo mode it delivers what `git pull` brought, offline. It prints nothing and always
 exits 0; a failure inside it is recorded, and `teamai doctor` names it (`Last git
@@ -162,7 +177,7 @@ aliases:
 in that tool's own field: `effort` for the Claude family, CodeBuddy, Qoder and Qoder CN,
 `model_reasoning_effort` for the Codex family, `variant` for OpenCode. Cursor takes
 effort inside its model string (`claude-opus-5[effort=high]`); Copilot, Kiro, WorkBuddy,
-JoyCode, ZCode and OMP take none, and pull warns and drops an effort mapped for them.
+JoyCode, ZCode, OMP and Muse Code take none, and pull warns and drops an effort mapped for them.
 Qoder CN uses the `qoder` entry; only the Claude and Codex variants and Qoder CN inherit
 an entry, so never expect a `claude` model in Qoder or ZCode. A tool the alias does
 not map gets no `model` and uses its default; a concrete model such as `opus` is

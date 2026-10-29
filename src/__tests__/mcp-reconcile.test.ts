@@ -22,6 +22,19 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
+// Makes every `git ls-files` spawn fail, as a process table at its limit does.
+const failLsFilesSpawn = vi.hoisted(() => ({ on: false }));
+vi.mock('../utils/exec.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/exec.js')>();
+  return {
+    ...actual,
+    execCommand: (cmd: string, args: string[], opts?: Parameters<typeof actual.execCommand>[2]) =>
+      failLsFilesSpawn.on && cmd === 'git' && args.includes('ls-files')
+        ? Promise.reject(new Error('spawn git EAGAIN'))
+        : actual.execCommand(cmd, args, opts),
+  };
+});
+
 // What .git/info/exclude held at the moment each JSON config was written (#882).
 const excludeAtWrite = vi.hoisted(() => new Map<string, string | null>());
 // Runs just before each JSON config write, as a concurrent command would.
@@ -42,11 +55,15 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   };
 });
 
+import { _setExcludeLockRetryMs } from '../git-exclude.js';
 import { reconcileMcpForConfig, releaseCleanMcpGitExcludes, resolveMcpTargets, spliceCodexBlock, codexServerNames, writeCodexAtomic } from '../mcp-reconcile.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { log } from '../utils/logger.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { TeamaiConfigSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
+
+// The held-lock cases here wait out the whole retry budget; none races a writer.
+_setExcludeLockRetryMs(1);
 
 const TOOL_PATHS = {
   claude: { skills: '.claude/skills', settings: '.claude/settings.json', mcp: '.claude.json', mcpProject: '.mcp.json' },
@@ -108,6 +125,7 @@ describe('MCP reconcile', () => {
   });
 
   afterEach(async () => {
+    failLsFilesSpawn.on = false;
     vi.unstubAllEnvs();
     await fse.remove(tmpDir);
   });
@@ -184,6 +202,32 @@ servers:
     const second = await reconcileMcpForConfig(teamConfig, localConfig);
     expect(second.wrote).toBe(false);
     expect((await fse.stat(claudeJson)).mtimeMs).toBe(mtimeBefore);
+  });
+
+  // `teamai pull` and `teamai mcp inject` both reconcile: whichever runs second
+  // must find nothing to change in what the first wrote.
+  it.each([
+    ['no config.toml', null],
+    ['a config.toml of the member\'s', 'model = "gpt-5"\n'],
+  ])('is idempotent for Codex — a second run over %s changes nothing', async (_label, initial) => {
+    const configToml = path.join(homeDir, '.codex', 'config.toml');
+    await fse.ensureDir(path.join(homeDir, '.codex', 'skills'));
+    if (initial !== null) await fse.writeFile(configToml, initial);
+    await writeMcpYaml(`
+servers:
+  - name: s1
+    transport: http
+    url: https://example.com/mcp
+    tools: [codex]
+`);
+
+    expect((await reconcileMcpForConfig(teamConfig, localConfig)).wrote).toBe(true);
+    const written = await fse.readFile(configToml, 'utf-8');
+
+    const second = await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(second.changes).toEqual([]);
+    expect(second.wrote).toBe(false);
+    expect(await fse.readFile(configToml, 'utf-8')).toBe(written);
   });
 
   it('does not overwrite a user-owned server with a colliding name', async () => {
@@ -829,8 +873,7 @@ servers:
 
     const targets = await resolveMcpTargets(defaults, projectConfig);
     expect(targets.find((target) => target.tool === 'codebuddy')?.file).toBe(projectFile);
-    expect(targets.find((target) => target.tool === 'workbuddy')?.file)
-      .toBe(path.join(projectRoot, '.workbuddy', 'mcp.json'));
+    expect(targets.find((target) => target.tool === 'workbuddy')?.file).toBe(projectFile);
     const userTargets = await resolveMcpTargets(defaults, localConfig);
     expect(userTargets.find((target) => target.tool === 'codebuddy')?.file).toBe(userFile);
 
@@ -875,6 +918,31 @@ servers:
     await reconcileMcpForConfig(defaults, projectConfig);
     expect(codexServerNames(await fse.readFile(projectFile, 'utf-8'))).toEqual([]);
     expect(await fse.readFile(projectFile, 'utf-8')).toContain(own.trimEnd());
+  });
+
+  it('deletes a project config the team\'s last server leaves empty, unless git tracks it', async () => {
+    const projectRoot = path.join(tmpDir, 'empty-project');
+    execFileSync('git', ['init', '-q', projectRoot]);
+    await fse.ensureDir(path.join(projectRoot, '.codex', 'skills'));
+    await fse.ensureDir(path.join(projectRoot, '.cursor', 'skills'));
+    const codexFile = path.join(projectRoot, '.codex', 'config.toml');
+    const cursorFile = path.join(projectRoot, '.cursor', 'mcp.json');
+    const defaults = TeamaiConfigSchema.parse({ team: 't', repo: 'r', provider: 'git' });
+    const projectConfig: LocalConfig = { ...localConfig, scope: 'project', projectRoot };
+    const files = async (): Promise<string[]> => (await resolveMcpTargets(defaults, projectConfig)).map((target) => target.file);
+    await writeMcpYaml('servers:\n  - name: team-docs\n    transport: stdio\n    command: docs-server\n');
+
+    await reconcileMcpForConfig(defaults, projectConfig);
+    expect(await files()).toEqual(expect.arrayContaining([codexFile, cursorFile]));
+    expect(codexServerNames(await fse.readFile(codexFile, 'utf-8'))).toEqual(['team-docs']);
+    expect((await fse.readJson(cursorFile)).mcpServers['team-docs']).toBeDefined();
+    execFileSync('git', ['add', '-f', '.cursor/mcp.json'], { cwd: projectRoot });
+
+    await writeMcpYaml('servers: []\n');
+    await reconcileMcpForConfig(defaults, projectConfig);
+
+    expect(await fse.pathExists(codexFile)).toBe(false);
+    expect(await fse.readJson(cursorFile)).toEqual({ mcpServers: {} });
   });
 
   it('resolves a project secret to plaintext in every tool, keyed off `type`', async () => {
@@ -1058,6 +1126,49 @@ servers:
       expect((doc.mcpServers as Record<string, unknown>)['with-secret']).toBeDefined();
       expect(JSON.stringify(doc['with-secret'])).toContain('super-secret-value');
       expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+    });
+
+    it('never lets a tool whose MCP path links to another tool\'s file adopt the server that tool\'s record claims', async () => {
+      const shared = { ...teamConfig, toolPaths: TOOL_PATHS } as TeamaiConfig;
+      await fse.ensureDir(path.join(projectRoot, '.cursor', 'skills'));
+      await fse.writeJson(path.join(projectRoot, '.mcp.json'), {});
+      await fse.symlink('../.mcp.json', path.join(projectRoot, '.cursor', 'mcp.json'));
+      await writeMcpYaml('servers:\n  - name: x\n    transport: http\n    url: https://example.com/x\n    tools: [claude, cursor]\n');
+      await reconcileMcpForConfig(shared, projectConfig);
+      const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+      const manifestFile = managedMcpManifestPath(getDataHome(projectConfig), projectRoot);
+      const manifest = await fse.readJson(manifestFile) as Record<string, Array<{ name: string }>>;
+      expect(manifest['claude:project'].map((r) => r.name)).toEqual(['x']);
+      // Cursor's record is lost: the x in the file it reads through the link is Claude's.
+      delete manifest['cursor:project'];
+      await fse.writeJson(manifestFile, manifest);
+
+      await reconcileMcpForConfig(shared, projectConfig);
+
+      const after = await fse.readJson(manifestFile) as Record<string, Array<{ name: string }> | undefined>;
+      expect((after['cursor:project'] ?? []).map((r) => r.name)).not.toContain('x');
+      expect(Object.keys((await fse.readJson(path.join(projectRoot, '.mcp.json')) as { mcpServers: object }).mcpServers)).toEqual(['x']);
+    });
+
+    it('restores a file two tools write through linked paths to what it was before the run, when ownership cannot be saved', async () => {
+      const shared = { ...teamConfig, toolPaths: TOOL_PATHS } as TeamaiConfig;
+      await fse.ensureDir(path.join(projectRoot, '.cursor', 'skills'));
+      await fse.writeJson(path.join(projectRoot, '.mcp.json'), {});
+      await fse.symlink('../.mcp.json', path.join(projectRoot, '.cursor', 'mcp.json'));
+      await writeMcpYaml('servers:\n  - name: x\n    transport: http\n    url: https://example.com/x\n    tools: [claude, cursor]\n');
+      await reconcileMcpForConfig(shared, projectConfig);
+      const before = await fse.readFile(path.join(projectRoot, '.mcp.json'), 'utf8');
+      const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+      const manifestDir = path.dirname(managedMcpManifestPath(getDataHome(projectConfig), projectRoot));
+      await writeMcpYaml('servers:\n  - name: x\n    transport: http\n    url: https://example.com/x2\n    tools: [claude, cursor]\n'
+        + '  - name: y\n    transport: http\n    url: https://example.com/y\n    tools: [cursor]\n');
+      await fse.chmod(manifestDir, 0o555);
+      try {
+        await expect(reconcileMcpForConfig(shared, projectConfig)).rejects.toThrow();
+      } finally {
+        await fse.chmod(manifestDir, 0o755);
+      }
+      expect(await fse.readFile(path.join(projectRoot, '.mcp.json'), 'utf8')).toBe(before);
     });
 
     it('never lets one format\'s record claim a server of the same name under another format\'s key', async () => {
@@ -1699,7 +1810,7 @@ servers:
       expect(await excludeOf(projectRoot)).toMatch(/^\/\.codex\/config\.toml$/m);
     });
 
-    it('writes a symlinked Codex project config at its own path, never into the tracked file it links to', async () => {
+    it('withholds a resolved value from a symlinked Codex project config whose target git tracks, and keeps the link', async () => {
       const withCodex = { ...teamConfig, toolPaths: { ...TOOL_PATHS, codex: { ...TOOL_PATHS.codex, mcpProject: '.codex/config.toml' } } } as TeamaiConfig;
       const tracked = path.join(projectRoot, 'config', 'codex.toml');
       const link = path.join(projectRoot, '.codex', 'config.toml');
@@ -1713,9 +1824,25 @@ servers:
       await reconcileMcpForConfig(withCodex, projectConfig);
 
       expect(await fse.readFile(tracked, 'utf-8')).toBe('model = "gpt-5"\n');
-      expect((await fse.lstat(link)).isSymbolicLink()).toBe(false);
-      expect(await fse.readFile(link, 'utf-8')).toContain('super-secret-value');
-      expect(await excludeOf(projectRoot)).toMatch(/^\/\.codex\/config\.toml$/m);
+      expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(`git already tracks ${path.join(await fse.realpath(projectRoot), 'config', 'codex.toml')}`));
+    });
+
+    it('writes a resolved value into the untracked target of a symlinked Codex project config, and lists the target', async () => {
+      const withCodex = { ...teamConfig, toolPaths: { ...TOOL_PATHS, codex: { ...TOOL_PATHS.codex, mcpProject: '.codex/config.toml' } } } as TeamaiConfig;
+      const target = path.join(projectRoot, 'config', 'codex.toml');
+      const link = path.join(projectRoot, '.codex', 'config.toml');
+      await fse.outputFile(target, 'model = "gpt-5"\n');
+      await fse.ensureDir(path.join(projectRoot, '.codex', 'skills'));
+      await fse.symlink(path.join('..', 'config', 'codex.toml'), link);
+      await writeMcpYaml(`${withSecret}    tools: [codex]\n`);
+
+      await reconcileMcpForConfig(withCodex, projectConfig);
+
+      expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await fse.readFile(target, 'utf-8')).toContain('model = "gpt-5"');
+      expect(await fse.readFile(target, 'utf-8')).toContain('super-secret-value');
+      expect(await excludeOf(projectRoot)).toMatch(/^\/config\/codex\.toml$/m);
     });
 
     describe('a config an older teamai wrote under a mapping an earlier teamai.yaml made', () => {
@@ -1864,6 +1991,30 @@ servers:
 
           expect(Object.keys((await ledger()).files)).not.toContain(customFile());
           expect(await excludeOf(projectRoot)).not.toMatch(/team-mcp\.json/);
+        });
+
+        // Gone from disk, still in git's index: only git saying it no longer tracks the file forgets it.
+        it('keeps its record when git cannot say whether it still tracks it', async () => {
+          commitIt();
+          await reconcileMcpForConfig(teamConfig, projectConfig);
+          expect((await ledger()).files[customFile()]).toEqual({ tools: ['cursor'], tracked: true });
+          await fse.remove(customFile());
+          failLsFilesSpawn.on = true;
+
+          await reconcileMcpForConfig(teamConfig, projectConfig);
+
+          expect((await ledger()).files[customFile()]).toEqual({ tools: ['cursor'], tracked: true });
+        });
+
+        it('forgets it once it is gone from disk and no repository holds it', async () => {
+          commitIt();
+          await reconcileMcpForConfig(teamConfig, projectConfig);
+          await fse.remove(customFile());
+          await fse.remove(path.join(projectRoot, '.git'));
+
+          await reconcileMcpForConfig(teamConfig, projectConfig);
+
+          expect(Object.keys((await ledger()).files)).not.toContain(customFile());
         });
       });
 
@@ -2634,6 +2785,20 @@ servers:
         expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/not writable[\s\S]*teamai pull/));
       });
 
+      it.skipIf(process.getuid?.() === 0)('writes no value when .git/info/exclude exists but cannot be read, and keeps the member\'s lines (#915)', async () => {
+        await fse.outputFile(path.join(infoDir(), 'exclude'), 'scratch/\n');
+        await writeMcpYaml(withSecret);
+        await fse.chmod(path.join(infoDir(), 'exclude'), 0o200);
+
+        const { changes } = await reconcileMcpForConfig(teamConfig, claudeOnly());
+
+        expect(await fse.pathExists(mcpJson())).toBe(false);
+        expect(changes).toContainEqual(expect.objectContaining({ tool: 'claude', server: 'with-secret', action: 'skipped' }));
+        expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/cannot be read[\s\S]*readable[\s\S]*teamai pull/));
+        await fse.chmod(path.join(infoDir(), 'exclude'), 0o644);
+        expect(await fse.readFile(path.join(infoDir(), 'exclude'), 'utf-8')).toBe('scratch/\n');
+      });
+
       it.skipIf(process.getuid?.() === 0)('keeps an earlier entry as it was', async () => {
         await writeMcpYaml(withSecret);
         await reconcileMcpForConfig(teamConfig, claudeOnly());
@@ -2646,6 +2811,24 @@ servers:
         await reconcileMcpForConfig(teamConfig, claudeOnly());
 
         expect(await fse.readFile(mcpJson(), 'utf-8')).toBe(before);
+      });
+
+      it('writes no value when git cannot confirm it ignores the config after listing it (#915)', async () => {
+        const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+        const bin = path.join(tmpDir, 'bin');
+        await fse.outputFile(
+          path.join(bin, 'git'),
+          `#!/bin/sh\nif [ "$1" = check-ignore ]; then echo 'fatal: cannot check' >&2; exit 128; fi\nexec '${realGit}' "$@"\n`,
+          { mode: 0o755 },
+        );
+        vi.stubEnv('PATH', `${bin}${path.delimiter}${process.env.PATH ?? ''}`);
+        await writeMcpYaml(withSecret);
+
+        const { changes } = await reconcileMcpForConfig(teamConfig, claudeOnly());
+
+        expect(await fse.pathExists(mcpJson())).toBe(false);
+        expect(changes).toContainEqual(expect.objectContaining({ tool: 'claude', server: 'with-secret', action: 'skipped' }));
+        expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/could not confirm that it ignores[\s\S]*teamai pull/));
       });
 
       it('writes no value while another command holds the exclude file\'s lock', async () => {
@@ -4219,6 +4402,16 @@ describe('spliceCodexBlock', () => {
     const out = spliceCodexBlock(src, 'newone', '[mcp_servers.newone]\ncommand = "x"\n');
     expect(out).toContain('model = "gpt-5"');
     expect(out).toContain('[mcp_servers.newone]');
+  });
+
+  it.each([
+    ['an empty file', ''],
+    ['a file of the member\'s', 'model = "gpt-5"\n'],
+    ['a file ending in another server', '[mcp_servers.other]\ncommand = "y"\n'],
+  ])('splices the same block into %s once and only once', (_label, src) => {
+    const block = '[mcp_servers.newone]\ncommand = "x"\n';
+    const once = spliceCodexBlock(src, 'newone', block);
+    expect(spliceCodexBlock(once, 'newone', block)).toBe(once);
   });
 
   it('lists existing server names', () => {

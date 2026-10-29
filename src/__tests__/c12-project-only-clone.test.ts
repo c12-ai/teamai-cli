@@ -1,10 +1,8 @@
 /**
  * C12 fork: in project-only mode (`TEAMAI_PROJECT_ONLY=1`) the GitHub clone
- * keeps no credential. Upstream writes the token into the clone's remote URL,
- * i.e. into `.git/config` on disk; a container that receives the token only
- * for setup must not end up storing it. The token then authenticates the clone
- * through a header in the child's environment (not its argv), and the remote
- * URL stays plain.
+ * authenticates through a header in the child's environment, never its argv
+ * (readable by other users of a shared host). Upstream keeps no token on disk
+ * either, but passes the header as a `-c` argument.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -70,10 +68,12 @@ describe('ghRepoClone in project-only mode (C12 fork)', () => {
     expect(env.GIT_CONFIG_KEY_2).toBe('http.https://github.com/.extraHeader');
   });
 
-  it('without the variable: upstream behaviour, token in the remote URL', () => {
+  it('without the variable: upstream behaviour, the header in a -c argument', () => {
     delete process.env.TEAMAI_PROJECT_ONLY;
     ghRepoClone('owner/repo', '/tmp/clone');
     const { args } = cloneCall();
-    expect(args[1]).toBe(`https://x-access-token:${TOKEN}@github.com/owner/repo.git`);
+    expect(args[0]).toBe('-c');
+    expect(args[1]).toMatch(/^http\.extraHeader=Authorization: Basic /);
+    expect(args.slice(2)).toEqual(['clone', 'https://github.com/owner/repo.git', '/tmp/clone']);
   });
 });

@@ -40,7 +40,7 @@ and create-repo URLs, and the per-provider caveats, and points at
 ## Rules for these flows
 
 1. **Always use a full URL** for the team repo (e.g.
-   `https://github.com/yourorg/yourrepo`). Never the `owner/repo` short form.
+   `https://github.com/your-org/your-repo`). Never the `owner/repo` short form.
 2. **Don't limit which AI tools get set up — cover all of them by default.**
    Unless the user names specific tools, do **not** pass `--agent` to restrict the
    install. Let `teamai init` set up every AI tool already installed (omitting
@@ -50,13 +50,13 @@ and create-repo URLs, and the per-provider caveats, and points at
    design), and any installed hooks that still need trust (e.g. Codex with
    automatic trust disabled or unavailable). Verify the real per-tool result with
    `teamai doctor` and `teamai hooks list`.
-3. **`teamai init` ends with a pull.** In user scope, and in project scope for each
-   tool named with `--agent` (or picked in init's tool picker when a person runs it
-   in a terminal), the team's skills, rules and MCP servers are in place when init
-   exits; there is no need to run `teamai pull` after it. Run from an agent shell
-   (no terminal), a project-scope init without `--agent` creates no tool directory: a tool's directory appears and
-   fills when the user opens that tool in the project. Init also injects a
-   session-start hook that keeps resources synced from then on.
+3. **`teamai init` does not pull.** It saves the config and installs hooks. It does
+   not copy team skills, rules or MCP. In workspace scope it creates a tool directory
+   only for a tool named with `--agent`, or picked when a person runs it in a
+   terminal. Those resources arrive on that tool's next session start, or when you
+   run `teamai pull`. Run from an agent shell (no terminal), a workspace-scope init
+   without `--agent` creates no tool directory: the directory appears when the user
+   opens that tool in the project, and that session start pulls.
 4. **Finish with `teamai doctor`.** Every setup or onboarding flow ends by running
    it and resolving what it reports before you call the job done.
 

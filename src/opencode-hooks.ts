@@ -13,8 +13,8 @@
  * built-in hook set as closely as OpenCode's event model allows:
  *   - `session.created`     → session-start  (report / sync / ack)
  *   - `session.idle`        → stop           (update / votes / contribute)
- *   - `chat.message`        → prompt-submit   (track-slash / dashboard)
- *   - `tool.execute.after`  → post-tool-use   (dashboard; matcher-scoped track)
+ *   - `chat.message`        → prompt-submit   (skill mentions / dashboard)
+ *   - `tool.execute.after`  → post-tool-use   (dashboard / skill use)
  *
  * The generated plugin is fire-and-forget: OpenCode's `event` hook has no
  * channel to inject a hook's stdout back into the session, so — like the Hermes
@@ -23,8 +23,14 @@
  */
 
 import path from 'node:path';
-import { writeFile, writeIfChanged, ensureDir, pathExists, remove } from './utils/fs.js';
+import { hookSourceMatches } from './utils/hook-source.js';
+import { writeFile, writeIfChanged, ensureDir, pathExists, readFileSafe, remove } from './utils/fs.js';
+import { probeBinary } from './utils/exec.js';
 import { log } from './utils/logger.js';
+import { earlierHookAdapterDir, hookAdapterDir } from './locate.js';
+import { toolHome } from './tool-home.js';
+import { isGitExcludeEnabled, type LocalConfig, type TeamaiConfig } from './types.js';
+import { resolveCliEntry } from './builtin-hooks.js';
 
 /** Plugin directory name under an OpenCode config dir. OpenCode scans both
  *  `plugin/` and `plugins/`; we use the singular, matching the docs examples. */
@@ -33,36 +39,44 @@ export const OPENCODE_PLUGIN_DIR = 'plugin';
 /** Filename of the teamai-managed OpenCode plugin. */
 export const OPENCODE_HOOK_FILE = 'teamai-hooks.ts';
 
+/**
+ * The file in a project's `.opencode/` that teamai's plugin reads the team MCP
+ * servers from on OpenCode V2 (#915): teamai's alone, and kept out of git.
+ */
+export const OPENCODE_MCP_FILE = 'teamai-mcp.json';
+
+/** A project's `OPENCODE_MCP_FILE`. */
+export function opencodeMcpFile(projectRoot: string): string {
+  return path.join(projectRoot, '.opencode', OPENCODE_MCP_FILE);
+}
+
 /** Marker so `teamai doctor` / `uninstall` can recognize our generated plugin. */
 const TEAMAI_MARKER = '[teamai]';
 
 /**
  * Resolve the plugin directory for an OpenCode scope.
  *
- * - project scope: `<baseDir>/.opencode/plugin`
- * - user scope:    `<baseDir>/.config/opencode/plugin`
- *
- * (baseDir is the repo root in project scope and $HOME in user scope, matching
- * how teamai resolves every other OpenCode path.)
+ * - project scope: `<baseDir>/.opencode/plugin`, where earlier releases put a copy
+ * - user scope:    the `plugin` directory of OpenCode's config home, which a
+ *   recorded or env move relocates (`hookAdapterDir`), whatever `baseDir` says
  */
 export function resolveOpencodePluginDir(baseDir: string, scope: 'project' | 'user'): string {
-  const configDir = scope === 'project' ? '.opencode' : path.join('.config', 'opencode');
-  return path.join(baseDir, configDir, OPENCODE_PLUGIN_DIR);
+  return scope === 'project' ? path.join(baseDir, '.opencode', OPENCODE_PLUGIN_DIR) : hookAdapterDir('opencode-plugin');
 }
 
 /**
  * Build the teamai OpenCode plugin source.
  *
  * The plugin subscribes to OpenCode events and shells out to `teamai
- * hook-dispatch <event> --tool opencode [--matcher <m>]`, feeding the same JSON
+ * hook-dispatch <event> --tool opencode`, feeding the same JSON
  * payload on STDIN that every other agent's hooks send (`cwd`, `tool_name`,
  * `tool_input`, `prompt`). It uses Node's `child_process.spawn` with
  * `windowsHide: true` so a missing `teamai` binary or a non-zero exit never
  * surfaces as an error inside the agent session or opens a console window.
  *
- * Two OpenCode-specific bridges are required:
- *   - STDIN payload: hook-dispatch's track / track-slash / todowrite-hint
- *     handlers read `tool_name` / `tool_input` / `prompt` off STDIN, and the
+ * One OpenCode-specific bridge is required:
+ *   - STDIN payload: hook-dispatch's skill-use / skill-mention handlers read
+ *     `tool_name` / `tool_input` / `prompt` off STDIN, and the
  *     provider-config gate reads `cwd` to pick the project-scope config. Without
  *     a payload those handlers no-op and project gating falls back to the user
  *     config. We forward the plugin's `directory` as `cwd` plus the per-event
@@ -72,12 +86,9 @@ export function resolveOpencodePluginDir(baseDir: string, scope: 'project' | 'us
  *     the subagent's child session to its parent. `shell.env` names the session
  *     in V1's bash environment (`TEAMAI_AGENT_SESSION_ID`); V2's shell supplies
  *     its native `OPENCODE_SESSION_ID`, read by the same session resolver.
- *   - Tool-id casing: OpenCode passes lowercase tool ids (`skill`, `todowrite`),
- *     but the handler registry keys matchers on Claude's PascalCase names
- *     (`Skill`, `TodoWrite`). We map the id back before dispatching a
- *     matcher-scoped pass.
  */
-export function buildPluginSource(): string {
+export function buildPluginSource(userConfigDir = toolHome('opencode'), entry = resolveCliEntry()): string {
+  if (!entry) throw new Error('Cannot resolve the teamai CLI entry');
   return `// ${TEAMAI_MARKER} hooks plugin — generated by teamai, do not edit by hand.
 //
 // Bridges OpenCode's plugin events to \`teamai hook-dispatch\`, mirroring the
@@ -91,29 +102,24 @@ export function buildPluginSource(): string {
 // the dispatch is not truly fire-and-forget for those two — see the timeout
 // note below.
 
-/** OpenCode lowercase tool ids → Claude PascalCase matcher names. */
-const TOOL_MATCHER = { skill: 'Skill', todowrite: 'TodoWrite' };
-
 /** A host field read defensively: a non-empty string, or undefined. */
 const nonEmpty = (value) => (typeof value === 'string' && value ? value : undefined);
+const NODE = ${JSON.stringify(process.execPath)};
+const ENTRY = ${JSON.stringify(entry)};
 
 /** @param {{ directory?: string, worktree?: string }} ctx */
 const TeamaiHooks = async ({ directory, worktree }) => {
   const cwd = directory || worktree;
   // Dispatch one hook event, forwarding a JSON payload on STDIN. \`payload\`
   // fields (cwd / tool_name / tool_input / prompt) match what hook-dispatch's
-  // handlers read; \`matcher\` scopes PostToolUse handlers (Skill / TodoWrite).
-  const dispatch = async (event, matcher, payload) => {
+  // handlers read.
+  const dispatch = async (event, payload) => {
     try {
-      const args = ['hook-dispatch', event, '--tool', 'opencode'];
-      if (matcher) {
-        args.push('--matcher', matcher);
-      }
+      const args = [ENTRY, 'hook-dispatch', event, '--tool', 'opencode'];
       const stdin = JSON.stringify({ cwd, ...(payload || {}) });
       const { spawn } = await import('node:child_process');
       await new Promise((resolve) => {
-        const child = spawn('teamai', args, {
-          shell: process.platform === 'win32',
+        const child = spawn(NODE, args, {
           windowsHide: true,
           stdio: ['pipe', 'ignore', 'ignore'],
         });
@@ -139,14 +145,13 @@ const TeamaiHooks = async ({ directory, worktree }) => {
       const props = (event && event.properties) || {};
       const session = { session_id: nonEmpty(props.sessionID) || nonEmpty(props.info && props.info.id) };
       if (event.type === 'session.created') {
-        await dispatch('session-start', undefined, session);
+        await dispatch('session-start', session);
       } else if (event.type === 'session.idle') {
-        await dispatch('stop', undefined, session);
+        await dispatch('stop', session);
       }
     },
     // A new user message maps to Claude's UserPromptSubmit. The prompt text
-    // lives in output.parts (text parts); forward it so track-slash can see
-    // slash-command usage.
+    // lives in output.parts (text parts); forward it so a skill mention counts.
     'chat.message': async (input, output) => {
       let prompt = '';
       const parts = (output && output.parts) || [];
@@ -155,22 +160,20 @@ const TeamaiHooks = async ({ directory, worktree }) => {
           prompt += part.text;
         }
       }
-      await dispatch('prompt-submit', undefined, { session_id: nonEmpty(input && input.sessionID), prompt });
+      await dispatch('prompt-submit', { session_id: nonEmpty(input && input.sessionID), prompt });
     },
-    // Fires after every tool call. Dispatch the wildcard matcher always, plus a
-    // matcher-scoped pass so Skill / TodoWrite handlers can fire. input.tool is
-    // the lowercase OpenCode tool id; input.args is the tool input; output.output
+    // Fires after every tool call. input.tool is the lowercase OpenCode tool
+    // id; input.args is the tool input; output.output
     // is what the model saw. There is no error flag: only bash reports an exit
     // code, so any other tool's status is unknown. A task call names the
     // child session its subagent ran in, which links it to this session.
     'tool.execute.after': async (input, output) => {
       const tool = (input && input.tool) || '';
-      const matcher = TOOL_MATCHER[tool];
       const metadata = (output && output.metadata) || {};
       const exit = tool === 'bash' ? metadata.exit : undefined;
       const payload = {
         session_id: nonEmpty(input && input.sessionID),
-        tool_name: matcher || tool,
+        tool_name: tool,
         tool_input: (input && input.args) || {},
         tool_response: typeof (output && output.output) === 'string' ? output.output : undefined,
         tool_status: typeof exit === 'number' ? (exit === 0 ? 'success' : 'failure') : (output && output.status) || 'unknown',
@@ -180,10 +183,7 @@ const TeamaiHooks = async ({ directory, worktree }) => {
       if (child && parent) {
         payload.session_link = { child, parent };
       }
-      await dispatch('post-tool-use', undefined, payload);
-      if (matcher) {
-        await dispatch('post-tool-use', matcher, payload);
-      }
+      await dispatch('post-tool-use', payload);
     },
     // Names the session in the bash tool's environment, so teamai recall
     // run there records its run under the session its hooks carry.
@@ -196,19 +196,135 @@ const TeamaiHooks = async ({ directory, worktree }) => {
   };
 };
 
-${buildDualPluginDefinition('teamai.hooks', 'TeamaiHooks')}
+// OpenCode V2 ignores the \`instructions\` entries teamai writes for V1, so the
+// V2 setup adds the same files to each request's system prompt: the user
+// instruction file and rules, then the nearest project's. It also adds that
+// project's team MCP servers, which teamai keeps out of the project's
+// opencode.json on V2.
+const USER_CONFIG_DIR = ${JSON.stringify(userConfigDir)};
+
+/**
+ * The \`.opencode\` directories from \`directory\` up that teamai delivers to:
+ * the nearest holding a teamai file. A team with only rules leaves no such
+ * file, so then each one with a \`rules\` directory, outermost first, as
+ * OpenCode V1 globs teamai's rules entry in each directory up: a member's own
+ * \`.opencode/rules\` in a nested package does not hide the team's above it.
+ */
+const teamaiProjects = async (directory) => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const exists = (file) => fs.stat(file).then(() => true, () => false);
+  const withRules = [];
+  for (let dir = directory; dir;) {
+    const project = path.join(dir, '.opencode');
+    for (const marker of ['teamai-context.md', ${JSON.stringify(OPENCODE_MCP_FILE)}]) {
+      if (await exists(path.join(project, marker))) return [project];
+    }
+    if (await exists(path.join(project, 'rules'))) withRules.unshift(project);
+    const parent = path.dirname(dir);
+    dir = parent === dir ? undefined : parent;
+  }
+  return withRules;
+};
+
+/** @param {string} directory */
+const teamaiContext = async (directory) => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const read = async (file) => {
+    try {
+      const text = await fs.readFile(file, 'utf8');
+      return text.trim() ? ['Instructions from: ' + file + '\\n' + text] : [];
+    } catch {
+      return [];
+    }
+  };
+  const rules = async (dir) => {
+    let names = [];
+    try {
+      names = await fs.readdir(dir, { recursive: true });
+    } catch {
+      return [];
+    }
+    const texts = [];
+    for (const file of names.filter((name) => name.endsWith('.md')).map((name) => path.join(dir, name)).sort()) {
+      texts.push(...await read(file));
+    }
+    return texts;
+  };
+  const texts = [...await read(path.join(USER_CONFIG_DIR, 'teamai-context.md')), ...await rules(path.join(USER_CONFIG_DIR, 'rules'))];
+  for (const project of await teamaiProjects(directory)) {
+    texts.push(...await read(path.join(project, 'teamai-context.md')), ...await rules(path.join(project, 'rules')));
+  }
+  return texts;
+};
+
+/**
+ * The nearest project's team MCP servers, written in the V1 form opencode.json
+ * takes (\`enabled\`), as V2 takes them (\`disabled\`).
+ * @param {string} directory
+ */
+const teamaiMcp = async (directory) => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const [project] = await teamaiProjects(directory);
+  if (!project) return {};
+  let servers;
+  try {
+    servers = JSON.parse(await fs.readFile(path.join(project, ${JSON.stringify(OPENCODE_MCP_FILE)}), 'utf8')).mcp;
+  } catch {
+    return {};
+  }
+  const v2 = {};
+  for (const [name, server] of Object.entries(servers && typeof servers === 'object' ? servers : {})) {
+    if (!server || typeof server !== 'object' || Array.isArray(server)) continue;
+    const { enabled, ...config } = server;
+    v2[name] = enabled === false ? { ...config, disabled: true } : config;
+  }
+  return v2;
+};
+
+${buildDualPluginDefinition('teamai.hooks', 'TeamaiHooks', 'teamaiContext', 'teamaiMcp')}
 
 `;
 }
 
-/** Both hosts load one definition, but call only their own entrypoint. */
-function buildDualPluginDefinition(id: string, factory: string): string {
+/**
+ * Both hosts load one definition, but call only their own entrypoint.
+ * `context` names a function of the session directory returning the texts the
+ * V2 setup adds to each request's system prompt, compaction included, and
+ * `mcp` one returning the MCP servers it adds to the location; only teamai's
+ * own plugin passes them, so an agent-hook plugin adds nothing.
+ */
+function buildDualPluginDefinition(id: string, factory: string, context?: string, mcp?: string): string {
+  const mcpTransform = mcp ? `
+    try {
+      const servers = await ${mcp}(ctx.location.directory);
+      if (Object.keys(servers).length > 0) {
+        registrations.push(await ctx.mcp.transform((editor) => {
+          for (const [name, config] of Object.entries(servers)) editor.set(name, config);
+        }));
+      }
+    } catch (error) {
+      console.error('[teamai] Could not add the team MCP servers', error);
+    }` : '';
+  const contextHooks = context ? `
+    const addContext = async (event) => {
+      try {
+        if (!Array.isArray(event.system)) return;
+        for (const text of await ${context}(ctx.location.directory)) event.system.push({ type: 'text', text });
+      } catch (error) {
+        console.error('[teamai] Could not add the team rules and instructions', error);
+      }
+    };
+    registrations.push(await ctx.session.hook('context', addContext));
+    registrations.push(await ctx.session.hook('compaction', addContext));` : '';
   return `export default {
   id: ${JSON.stringify(id)},
   server: ${factory},
   async setup(ctx) {
     const hooks = await ${factory}({ directory: ctx.location.directory });
-    const registrations = [];
+    const registrations = [];${contextHooks}${mcpTransform}
     if (hooks['chat.message']) {
       registrations.push(await ctx.session.hook('prompt', async (event) => {
         await hooks['chat.message']({ sessionID: event.sessionID }, { parts: [{ type: 'text', text: event.prompt.text }] });
@@ -258,18 +374,72 @@ function buildDualPluginDefinition(id: string, factory: string): string {
  * Idempotent — writes and reports the plugin file only when its content changes.
  */
 export async function injectOpencodeHooks(baseDir: string, scope: 'project' | 'user'): Promise<void> {
+  const entry = resolveCliEntry();
+  if (!entry) {
+    log.warn('OpenCode: cannot resolve the teamai CLI entry; run `teamai hooks inject` from the installed CLI.');
+    return;
+  }
   const file = path.join(resolveOpencodePluginDir(baseDir, scope), OPENCODE_HOOK_FILE);
-  if (await writeIfChanged(file, buildPluginSource())) {
+  if (await writeIfChanged(file, buildPluginSource(undefined, entry))) {
     log.success(`Injected teamai OpenCode hook into ${file}`);
   } else {
     log.debug(`teamai OpenCode hook already up-to-date in ${file}`);
   }
 }
 
+const majorVersions = new Map<string, Promise<number>>();
+
+/**
+ * OpenCode's major version, from `<binary> --version` (`opencode v2.0.24` on
+ * V2, `1.18.35` on V1), asked once per binary per run. 1 when the binary is
+ * absent or prints no version.
+ */
+export function opencodeMajorVersion(binary = 'opencode'): Promise<number> {
+  let version = majorVersions.get(binary);
+  if (!version) {
+    version = probeBinary(binary).then((output) => {
+      const match = /(\d+)\.\d+/.exec(output);
+      return match ? Number(match[1]) : 1;
+    });
+    majorVersions.set(binary, version);
+  }
+  return version;
+}
+
+/**
+ * The teamai plugin in HOME, and whether it is the one this build writes.
+ * This plugin supplies the team rules and instructions on the plugin channel.
+ */
+export async function opencodeContextPlugin(): Promise<{ file: string; ready: boolean }> {
+  const file = path.join(hookAdapterDir('opencode-plugin'), OPENCODE_HOOK_FILE);
+  const entry = resolveCliEntry();
+  return { file, ready: !!entry && await hookSourceMatches(await readFileSafe(file), buildPluginSource(undefined, entry)) };
+}
+
+/**
+ * Whether OpenCode gets this project's team content only through teamai's
+ * plugin (#915): OpenCode V2, `sharing.gitExclude` on, and the plugin
+ * installed as this build writes it. Then the team MCP servers go to
+ * `.opencode/teamai-mcp.json` for the plugin, and teamai takes the entries
+ * OpenCode V1 reads out of the project's opencode.json files it alone wrote.
+ * Otherwise (V1, the setting off, an HTTP-backed team, or no current plugin:
+ * removed, skipped, or not written) those entries stay, since without the
+ * plugin they are all V2 would get. A pull asks after it reconciled the plugin.
+ */
+export async function opencodeDeliversThroughPlugin(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<boolean> {
+  if (localConfig.scope !== 'project' || localConfig.repo.kind === 'http') return false;
+  if (!isGitExcludeEnabled(localConfig, teamConfig) || !(await opencodeContextPlugin()).ready) return false;
+  return await opencodeMajorVersion() >= 2;
+}
+
 /** Remove the teamai OpenCode plugin for a scope if present. */
 export async function removeOpencodeHooks(baseDir: string, scope: 'project' | 'user'): Promise<void> {
-  const dir = resolveOpencodePluginDir(baseDir, scope);
-  const file = path.join(dir, OPENCODE_HOOK_FILE);
+  await removeOpencodePlugin(resolveOpencodePluginDir(baseDir, scope));
+}
+
+/** Remove teamai's hook plugin from the OpenCode plugin directory `pluginDir`. */
+export async function removeOpencodePlugin(pluginDir: string): Promise<void> {
+  const file = path.join(pluginDir, OPENCODE_HOOK_FILE);
   if (await pathExists(file)) {
     await remove(file);
     log.success(`Removed teamai OpenCode hook from ${file}`);
@@ -373,8 +543,8 @@ ${buildDualPluginDefinition(`teamai.agent.${slug}`, factory)}
 }
 
 /**
- * Install a server-pushed agent hook as an OpenCode plugin file.
- * Events with no OpenCode equivalent are logged and skipped.
+ * Install a server-pushed agent hook as an OpenCode plugin file. Throws for
+ * an event with no OpenCode equivalent, so the install is reported failed.
  */
 export async function applyOpencodeAgentHook(def: {
   slug: string;
@@ -386,15 +556,15 @@ export async function applyOpencodeAgentHook(def: {
 }): Promise<void> {
   assertSafeSlug(def.slug);
   const ocEvent = CLAUDE_TO_OPENCODE_EVENTS[def.event];
-  if (!ocEvent) {
-    log.warn(`OpenCode does not support event "${def.event}" — skipping hook [${def.slug}]`);
-    return;
-  }
+  if (!ocEvent) throw new Error(`OpenCode has no hook event for ${def.event}`);
   const dir = resolveOpencodePluginDir(def.baseDir, def.scope);
   await ensureDir(dir);
   const file = path.join(dir, `teamai-agent-${def.slug}.ts`);
   await writeFile(file, buildAgentHookPluginSource(def.slug, ocEvent, def.command, def.matcher));
   log.success(`Installed OpenCode agent hook [${def.slug}] in ${file}`);
+  // OpenCode 1.x also loads the default home's plugins, where an earlier release wrote this one (#1221).
+  const earlier = def.scope === 'user' ? await earlierHookAdapterDir('opencode-plugin') : null;
+  if (earlier) await remove(path.join(earlier, `teamai-agent-${def.slug}.ts`));
 }
 
 /** Remove a server-pushed agent-hook plugin file for OpenCode. */
@@ -404,9 +574,11 @@ export async function removeOpencodeAgentHook(opts: {
   scope: 'project' | 'user';
 }): Promise<void> {
   assertSafeSlug(opts.slug);
-  const dir = resolveOpencodePluginDir(opts.baseDir, opts.scope);
-  const file = path.join(dir, `teamai-agent-${opts.slug}.ts`);
-  if (await pathExists(file)) {
+  // And the copy an earlier release left under the default home (#1221).
+  const dirs = [resolveOpencodePluginDir(opts.baseDir, opts.scope), opts.scope === 'user' ? await earlierHookAdapterDir('opencode-plugin') : null];
+  for (const dir of dirs) {
+    const file = dir === null ? null : path.join(dir, `teamai-agent-${opts.slug}.ts`);
+    if (file === null || !await pathExists(file)) continue;
     await remove(file);
     log.success(`Removed OpenCode agent hook [${opts.slug}] from ${file}`);
   }

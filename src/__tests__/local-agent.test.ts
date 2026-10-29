@@ -4,8 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { agentHookDescription } from '../hooks.js';
+import { keepCodexHookTrust, trustCodexHooks } from '../codex-trust.js';
 import { TEAMAI_CLAUDEMD_START } from '../types.js';
+import { installFakeCodex } from './helpers/fake-codex.js';
 
 vi.mock('../utils/logger.js', () => ({
   log: {
@@ -14,7 +17,14 @@ vi.mock('../utils/logger.js', () => ({
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
+    persist: vi.fn(),
   },
+}));
+
+vi.mock('../codex-trust.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../codex-trust.js')>(),
+  trustCodexHooks: vi.fn(),
+  keepCodexHookTrust: vi.fn(),
 }));
 
 let tmpDir: string;
@@ -32,6 +42,11 @@ beforeEach(async () => {
   origHome = process.env.HOME;
   origCopilotHome = process.env.COPILOT_HOME;
   process.env.HOME = tmpDir;
+  vi.mocked(trustCodexHooks).mockResolvedValue({ kind: 'trusted', hooks: 1 });
+  vi.mocked(keepCodexHookTrust).mockImplementation(async (_req, _retained, write) => {
+    await write();
+    return { kind: 'trusted', hooks: 0 };
+  });
   // Bind prompt is on by default — start each test from that baseline.
   delete process.env.TEAMAI_BIND_PROMPT_ENABLED;
   // Clean hint markers (both old ppid-based and new sessionId-based)
@@ -142,6 +157,27 @@ describe('local-agent: buildReportPayload disk scan', () => {
     expect(payload.user_level.skills?.map((s) => s.slug)).toEqual(['known-skill']);
     expect(payload.user_level.skills?.[0]?.source).toBe('enterprise');
     expect(payload.user_level.rules?.map((r) => r.slug)).toEqual(['my-rule']);
+  });
+
+  it('scans user-level skills where a moved home puts them: HERMES_HOME, not ~/.hermes', async () => {
+    await setupConfig();
+    const hermesHome = path.join(tmpDir, 'hermes-home');
+    vi.stubEnv('HERMES_HOME', hermesHome);
+    try {
+      await writeSkill(tmpDir, 'hermes', 'default-skill', 'default-skill');
+      const skillDir = path.join(hermesHome, 'skills', 'moved-skill');
+      await fse.ensureDir(skillDir);
+      await fse.writeFile(path.join(skillDir, 'SKILL.md'), ['---', 'name: moved-skill', '---', '', '# skill'].join('\n'));
+
+      const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+      const config = await loadLocalAgentConfig();
+      if (!config) throw new Error('expected the local-agent config setupConfig wrote');
+      const payload = await buildReportPayload(config, { tool: 'hermes' }) as { user_level: { skills?: Array<{ slug: string }> } };
+
+      expect(payload.user_level.skills?.map((s) => s.slug)).toEqual(['moved-skill']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -1094,6 +1130,50 @@ describe('local-agent: full-snapshot workspace reporting', () => {
     expect(wsAEntry?.project_id).toBe(5);
   });
 
+  it('does not report HOME as a workspace when the session runs there', async () => {
+    await setupConfig();
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'codebuddy', cwd: tmpDir }) as {
+      workspaces?: Array<Record<string, unknown>>;
+    };
+
+    expect(payload).not.toHaveProperty('workspaces');
+  });
+
+  it('reports the cwd, not HOME, under a dotfiles repo rooted at HOME', async () => {
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init'], { cwd: tmpDir, stdio: 'ignore' });
+    const notes = path.join(tmpDir, 'notes');
+    await fse.ensureDir(notes);
+    await setupConfig();
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'codebuddy', cwd: notes }) as {
+      workspaces?: Array<Record<string, unknown>>;
+    };
+
+    expect((payload.workspaces ?? []).map((w) => w.path)).toEqual([fse.realpathSync(notes)]);
+  });
+
+  it('prunes a binding recorded on HOME', async () => {
+    const wsLive = path.join(tmpDir, 'ws-live-home');
+    await fse.ensureDir(wsLive);
+    await setupConfig({
+      [tmpDir]: { projectId: 9, projectName: 'home', boundAt: 'x', ideType: 'codebuddy' },
+      [wsLive]: { projectId: 3, projectName: 'live', boundAt: 'x', ideType: 'codebuddy' },
+    });
+
+    const { pruneDeadWorkspaceBindings, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const pruned = await pruneDeadWorkspaceBindings(config!);
+
+    expect(pruned).toBe(true);
+    expect(Object.keys(config!.workspaceBindings)).toEqual([fse.realpathSync(wsLive)]);
+  });
+
   it('omits user_level skills/rules when none installed', async () => {
     // HOME is tmpDir (set in beforeEach); no codebuddy skills/rules written there.
     await setupConfig();
@@ -1689,6 +1769,22 @@ describe('local-agent: cmds[] migration', () => {
     expect(manifest.scopes.user.rules?.['doc-a']).toBeUndefined();
   });
 
+  it('writes an OpenCode prompt beside its Claude fallback for V2, without listing it for V1 (#993)', async () => {
+    const ocDir = path.join(tmpDir, '.config', 'opencode');
+    await fse.ensureDir(path.join(ocDir, 'skills'));
+    await fse.outputFile(path.join(tmpDir, '.claude', 'CLAUDE.md'), `${TEAMAI_CLAUDEMD_START}\nearlier prompt\n<!-- [teamai:claudemd:end] -->\n`);
+    const acks = await runResponse({
+      cmds: [{
+        id: 3, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-a',
+        version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-a.md', scope: 'user',
+      }],
+    }, undefined, 'opencode');
+
+    expect(acks.find((a) => a.id === 3), JSON.stringify(acks)).toMatchObject({ status: 'success' });
+    expect(await fse.readFile(path.join(ocDir, 'teamai-context.md'), 'utf8')).toContain('# content');
+    expect(await fse.pathExists(path.join(ocDir, 'opencode.json'))).toBe(false);
+  });
+
   it('creates AGENTS.md for an HTTP prompt in an existing OpenClaw workspace (#946)', async () => {
     const workspace = path.join(tmpDir, 'openclaw-workspace');
     const configFile = path.join(tmpDir, '.openclaw', 'openclaw.json');
@@ -1881,7 +1977,7 @@ describe('local-agent: cmds[] migration', () => {
       }],
     });
 
-    expect(acks.find((a) => a.id === 3)?.status).toBe('success');
+    expect(acks.find((a) => a.id === 3), JSON.stringify(acks)).toMatchObject({ status: 'success' });
     const manifest = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json'));
     expect(manifest.scopes.user.rules?.['rule-b']).toBeDefined();
     expect(manifest.scopes.user.claudemd?.['rule-b']).toBeUndefined();
@@ -1916,6 +2012,98 @@ describe('local-agent: cmds[] migration', () => {
     expect(mine.hooks[0].timeout).toBe(10);
     const manifest = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'));
     expect(manifest.hk1).toMatchObject({ tool: 'codebuddy', event: 'SessionStart', command: 'echo hi', timeout: 10 });
+  });
+
+  it('uninstall_hook_rule removes a hook installed for another tool while a tool that takes no agent hooks runs', async () => {
+    await runResponse({ cmds: [{
+      id: 25, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-cross', event: 'SessionStart', cmd: 'echo hi', scope: 'user',
+    }] });
+    const acks = await runResponse({ cmds: [{
+      id: 26, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'hk-cross', scope: 'user',
+    }] }, undefined, 'omp');
+
+    expect(acks.find((a) => a.id === 26)?.status).toBe('success');
+    const settings = await fse.readJson(path.join(tmpDir, '.codebuddy', 'settings.json'));
+    expect(JSON.stringify(settings)).not.toContain(agentHookDescription('hk-cross'));
+  });
+
+  it('remove-http reports failure and leaves the source intact when another operation keeps its lock', async () => {
+    await setupConfig();
+    const configPath = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    const before = await fse.readFile(configPath, 'utf8');
+    const lockPath = path.join(tmpDir, '.teamai', '.local-agent-sync-lock');
+    const { acquireLock, releaseLock } = await import('../update.js');
+    expect(await acquireLock(lockPath)).toBe(true);
+    const exitCode = process.exitCode;
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => { now += 30_001; return now; });
+    try {
+      const { removeLocalAgentHttp, reportAndSyncLocalAgent } = await import('../local-agent.js');
+      const fetch = vi.spyOn(globalThis, 'fetch');
+      expect(await reportAndSyncLocalAgent({ cwd: tmpDir, tool: 'codebuddy' })).toBe(false);
+      expect(fetch).not.toHaveBeenCalled();
+      await removeLocalAgentHttp();
+      expect(process.exitCode).toBe(1);
+      expect(await fse.readFile(configPath, 'utf8')).toBe(before);
+      const { log } = await import('../utils/logger.js');
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('nothing was removed'));
+    } finally {
+      process.exitCode = exitCode;
+      clock.mockRestore();
+      await releaseLock(lockPath);
+    }
+  });
+
+  it.each(['none', 'legacy config', 'environment'])('remove-http disables the source with %s fallback but keeps an unreadable hook\'s record (#993)', async (fallback) => {
+    await runResponse({ cmds: [{
+      id: 24, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-broken',
+      event: 'SessionStart', cmd: 'echo hi', scope: 'user',
+    }] });
+    const settingsPath = path.join(tmpDir, '.codebuddy', 'settings.json');
+    const repaired = await fse.readFile(settingsPath, 'utf8');
+    const broken = `${repaired.trimEnd()}, \n`;
+    await fse.writeFile(settingsPath, broken);
+    const { removeLocalAgentHttp, loadLocalAgentConfig, reportAndSyncFromHook, initLocalAgentHttp } = await import('../local-agent.js');
+    const home = path.join(tmpDir, '.teamai', 'local-agent');
+    if (fallback === 'legacy config') {
+      await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+        'username: tester', 'repo:', '  kind: http', '  url: https://test.example.com/api',
+        `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`, '  remote: https://test.example.com/api', '',
+      ].join('\n'));
+    }
+    const envEndpoint = process.env.TEAMAI_HTTP_ENDPOINT;
+    if (fallback === 'environment') process.env.TEAMAI_HTTP_ENDPOINT = 'https://test.example.com/api';
+
+    const exitCode = process.exitCode;
+    try {
+      await removeLocalAgentHttp();
+      expect(process.exitCode).toBe(1);
+      expect(await loadLocalAgentConfig()).toBeNull();
+      const fetch = vi.spyOn(globalThis, 'fetch');
+      await reportAndSyncFromHook({ cwd: tmpDir, hook_event_name: 'SessionStart' }, 'codebuddy');
+      expect(fetch).not.toHaveBeenCalled();
+      expect(await fse.readFile(settingsPath, 'utf8')).toBe(broken);
+      expect((await fse.readJson(path.join(home, 'agent-hooks.json')))['hk-broken']).toBeDefined();
+      expect((await fse.readdir(home)).sort()).toEqual(['agent-hooks.json', 'config.json']);
+
+      process.exitCode = exitCode;
+      await fse.writeFile(settingsPath, repaired);
+      await removeLocalAgentHttp();
+      expect(process.exitCode).toBe(exitCode);
+      const settings = await fse.readJson(settingsPath);
+      expect(JSON.stringify(settings)).not.toContain(agentHookDescription('hk-broken'));
+      expect(await loadLocalAgentConfig()).toBeNull();
+      expect(await fse.pathExists(path.join(home, 'agent-hooks.json'))).toBe(false);
+      expect(await fse.readdir(home)).toEqual(['config.json']);
+      await reportAndSyncFromHook({ cwd: tmpDir, hook_event_name: 'SessionStart' }, 'codebuddy');
+      expect(fetch).not.toHaveBeenCalled();
+      await initLocalAgentHttp({ endpoint: 'https://new.example.com/api', filterAgents: [] });
+      expect((await loadLocalAgentConfig())?.endpoint).toBe('https://new.example.com/api');
+    } finally {
+      process.exitCode = exitCode;
+      if (envEndpoint === undefined) delete process.env.TEAMAI_HTTP_ENDPOINT;
+      else process.env.TEAMAI_HTTP_ENDPOINT = envEndpoint;
+    }
   });
 
   it('honors explicit timeout and replaces on re-install (idempotent)', async () => {
@@ -1965,6 +2153,355 @@ describe('local-agent: cmds[] migration', () => {
     const hooksJson = await fse.readJson(path.join(tmpDir, '.codex', 'hooks.json'));
     const mine = hooksJson.hooks.PreToolUse.find((e: any) => e.hooks[0].command === 'echo cx');
     expect(mine).toBeDefined();
+  });
+
+  it('install_hook_rule trusts the Codex hook it wrote, and fails the ack when Codex will skip it (#1220)', async () => {
+    const trust = vi.mocked(trustCodexHooks);
+    await fse.ensureDir(path.join(tmpDir, '.codex'));
+    const acks = await runResponse({ cmds: [{
+      id: 50, type: 'install_hook_rule', handle_type: 'hook', slug: 'cx-trust',
+      event: 'Stop', cmd: 'echo trusted', scope: 'user',
+    }] }, undefined, 'codex');
+    expect(acks.find((a) => a.id === 50)?.status).toBe('success');
+    const file = path.join(tmpDir, '.codex', 'hooks.json');
+    expect(trust).toHaveBeenCalledWith(expect.objectContaining({
+      codexHome: path.join(tmpDir, '.codex'),
+      hooks: [{ file, command: 'echo trusted', key: `${file}:stop:0:0` }],
+    }));
+
+    trust.mockResolvedValueOnce({ kind: 'unavailable', reason: 'codex is not on PATH' });
+    const failed = await runResponse({ cmds: [{
+      id: 51, type: 'install_hook_rule', handle_type: 'hook', slug: 'cx-untrusted',
+      event: 'Stop', cmd: 'echo untrusted', scope: 'user',
+    }] }, undefined, 'codex');
+    expect(failed.find((a) => a.id === 51)).toMatchObject({ status: 'failed' });
+    expect(String(failed.find((a) => a.id === 51)?.error)).toContain('codex is not on PATH');
+    const manifest = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'));
+    expect(manifest['cx-untrusted']).toMatchObject({ tool: 'codex' });
+
+    trust.mockClear();
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+      'username: tester', 'codexTrustEnabled: false', 'repo:', '  remote: https://example.com/team.git',
+      `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`, '',
+    ].join('\n'));
+    const optedOut = await runResponse({ cmds: [{
+      id: 57, type: 'install_hook_rule', handle_type: 'hook', slug: 'cx-opted-out',
+      event: 'Stop', cmd: 'echo opted out', scope: 'user',
+    }] }, undefined, 'codex');
+    expect(optedOut.find((a) => a.id === 57)).toMatchObject({ status: 'failed' });
+    expect(String(optedOut.find((a) => a.id === 57)?.error)).toContain('codexTrustEnabled is false');
+    expect(trust).not.toHaveBeenCalled();
+  });
+
+  it('keeps the other Codex hooks trusted when an agent hook is reinstalled or removed (#1220)', async () => {
+    const actual = await vi.importActual<typeof import('../codex-trust.js')>('../codex-trust.js');
+    vi.mocked(trustCodexHooks).mockImplementation(actual.trustCodexHooks);
+    vi.mocked(keepCodexHookTrust).mockImplementation(actual.keepCodexHookTrust);
+    const fakeBin = installFakeCodex();
+    vi.stubEnv('PATH', `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`);
+    const file = path.join(tmpDir, '.codex', 'hooks.json');
+    const install = (id: number, slug: string) => ({
+      id, type: 'install_hook_rule', handle_type: 'hook', slug, event: 'Stop', cmd: `echo ${slug}`, scope: 'user',
+    });
+    const notTrusted = async () => {
+      const groups: Array<{ hooks: Array<{ command: string }> }> = (await fse.readJson(file)).hooks.Stop;
+      const report = await actual.readCodexHookTrust({
+        codexHome: path.dirname(file),
+        cwd: tmpDir,
+        hooks: groups.map((g, i) => ({ file, command: g.hooks[0].command, key: `${file}:stop:${i}:0` })),
+      });
+      return report.kind === 'listed' ? report.notTrusted.map((h) => h.command) : report;
+    };
+    const mine = { hooks: [{ type: 'command', command: 'echo mine' }] };
+    try {
+      // The member approved their hook at the top, and not the copy of it below the agent hook.
+      await fse.outputJson(file, { hooks: { Stop: [mine] } });
+      await actual.trustCodexHooks({
+        codexHome: path.dirname(file), cwd: tmpDir, hooks: [{ file, command: 'echo mine', key: `${file}:stop:0:0` }],
+      });
+      await runResponse({ cmds: [install(60, 'a')] }, undefined, 'codex');
+      const json = await fse.readJson(file);
+      json.hooks.Stop.push(mine);
+      await fse.writeJson(file, json);
+      await runResponse({ cmds: [install(61, 'b')] }, undefined, 'codex');
+      expect(await notTrusted()).toEqual(['echo mine']);
+
+      const reinstalled = await runResponse({ cmds: [install(62, 'a')] }, undefined, 'codex');
+      expect(reinstalled.find((a) => a.id === 62)?.status).toBe('success');
+      expect(await notTrusted()).toEqual(['echo mine']);
+
+      const removed = await runResponse({ cmds: [{
+        id: 63, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'b', scope: 'user',
+      }] }, undefined, 'codex');
+      expect(removed.find((a) => a.id === 63)?.status).toBe('success');
+      expect((await fse.readJson(file)).hooks.Stop.map((g: any) => g.hooks[0].command))
+        .toEqual(['echo mine', 'echo mine', 'echo a']);
+      expect(await notTrusted()).toEqual(['echo mine']);
+    } finally {
+      vi.unstubAllEnvs();
+      await fse.remove(fakeBin);
+    }
+  });
+
+  it('carries a member approval in the Codex home a project config relocates when an agent hook is removed (#1250)', async () => {
+    const actual = await vi.importActual<typeof import('../codex-trust.js')>('../codex-trust.js');
+    vi.mocked(trustCodexHooks).mockImplementation(actual.trustCodexHooks);
+    vi.mocked(keepCodexHookTrust).mockImplementation(actual.keepCodexHookTrust);
+    const fakeBin = installFakeCodex();
+    vi.stubEnv('PATH', `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`);
+    const work = path.join(tmpDir, 'work');
+    await fse.outputFile(path.join(work, '.teamai', 'config.yaml'), [
+      'username: tester', 'scope: project', 'toolRoots:', '  codex: ~/.codex-work', 'repo:',
+      '  remote: https://example.com/team.git', `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`, '',
+    ].join('\n'));
+    vi.spyOn(process, 'cwd').mockReturnValue(work);
+    const file = path.join(tmpDir, '.codex-work', 'hooks.json');
+    const mine = (index: number) => ({ file, command: 'echo mine', key: `${file}:stop:${index}:0` });
+    try {
+      await runResponse({ cmds: [{
+        id: 70, type: 'install_hook_rule', handle_type: 'hook', slug: 'a', event: 'Stop', cmd: 'echo a', scope: 'user',
+      }] }, undefined, 'codex');
+      const json = await fse.readJson(file);
+      json.hooks.Stop.push({ hooks: [{ type: 'command', command: 'echo mine' }] });
+      await fse.writeJson(file, json);
+      await actual.trustCodexHooks({ codexHome: path.dirname(file), cwd: tmpDir, hooks: [mine(1)] });
+
+      await runResponse({ cmds: [{
+        id: 71, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'a', scope: 'user',
+      }] }, undefined, 'codex');
+
+      expect((await fse.readJson(file)).hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'echo mine' }] }]);
+      expect(await actual.readCodexHookTrust({ codexHome: path.dirname(file), cwd: tmpDir, hooks: [mine(0)] }))
+        .toEqual({ kind: 'listed', notTrusted: [] });
+    } finally {
+      vi.unstubAllEnvs();
+      await fse.remove(fakeBin);
+    }
+  });
+
+  it('carries a member approval in the Codex home a project config relocates when an agent hook install collapses a duplicate (#1250)', async () => {
+    const actual = await vi.importActual<typeof import('../codex-trust.js')>('../codex-trust.js');
+    vi.mocked(trustCodexHooks).mockImplementation(actual.trustCodexHooks);
+    vi.mocked(keepCodexHookTrust).mockImplementation(actual.keepCodexHookTrust);
+    const fakeBin = installFakeCodex();
+    vi.stubEnv('PATH', `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`);
+    const work = path.join(tmpDir, 'work');
+    await fse.outputFile(path.join(work, '.teamai', 'config.yaml'), [
+      'username: tester', 'scope: project', 'toolRoots:', '  codex: ~/.codex-work', 'repo:',
+      '  remote: https://example.com/team.git', `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`, '',
+    ].join('\n'));
+    vi.spyOn(process, 'cwd').mockReturnValue(work);
+    const file = path.join(tmpDir, '.codex-work', 'hooks.json');
+    const mine = (index: number) => ({ file, command: 'echo mine', key: `${file}:stop:${index}:0` });
+    const agent = { hooks: [{ type: 'command', command: 'echo a' }] };
+    try {
+      await fse.outputJson(file, { hooks: { Stop: [agent, agent, { hooks: [{ type: 'command', command: 'echo mine' }] }] } });
+      await actual.trustCodexHooks({ codexHome: path.dirname(file), cwd: tmpDir, hooks: [mine(2)] });
+
+      const installed = await runResponse({ cmds: [{
+        id: 72, type: 'install_hook_rule', handle_type: 'hook', slug: 'a', event: 'Stop', cmd: 'echo a', scope: 'user',
+      }] }, undefined, 'codex');
+
+      expect(installed.find((a) => a.id === 72)?.status).toBe('success');
+      expect((await fse.readJson(file)).hooks.Stop.map((g: { hooks: Array<{ command: string }> }) => g.hooks[0].command))
+        .toEqual(['echo a', 'echo mine']);
+      expect(await actual.readCodexHookTrust({ codexHome: path.dirname(file), cwd: tmpDir, hooks: [mine(1)] }))
+        .toEqual({ kind: 'listed', notTrusted: [] });
+    } finally {
+      vi.unstubAllEnvs();
+      await fse.remove(fakeBin);
+    }
+  });
+
+  it.each(['uninstall', 'reinstall', 'teardown'])(
+    'keeps an unapproved duplicate untrusted after %s removes its approved sibling group (#1220)',
+    async (operation) => {
+      const actual = await vi.importActual<typeof import('../codex-trust.js')>('../codex-trust.js');
+      vi.mocked(trustCodexHooks).mockImplementation(actual.trustCodexHooks);
+      vi.mocked(keepCodexHookTrust).mockImplementation(actual.keepCodexHookTrust);
+      const fakeBin = installFakeCodex();
+      vi.stubEnv('PATH', `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`);
+      const file = path.join(tmpDir, '.codex', 'hooks.json');
+      const install = {
+        id: 65, type: 'install_hook_rule', handle_type: 'hook', slug: 'a',
+        event: 'Stop', cmd: 'echo agent a', scope: 'user',
+      };
+      const handler = (command: string) => ({ type: 'command', command });
+      const request = (hooks: Array<{ command: string; key: string }>) => ({
+        codexHome: path.dirname(file), cwd: tmpDir, hooks: hooks.map((h) => ({ file, ...h })),
+      });
+      try {
+        await runResponse({ cmds: [install] }, undefined, 'codex');
+        const json = await fse.readJson(file);
+        json.hooks.Stop[0].hooks.push(handler('echo personal'));
+        json.hooks.Stop.push(
+          { hooks: [handler('echo personal')] },
+          { hooks: [handler('echo approved first'), handler('echo approved second')] },
+        );
+        await fse.writeJson(file, json);
+        await actual.trustCodexHooks(request([
+          { command: 'echo agent a', key: `${file}:stop:0:0` },
+          { command: 'echo personal', key: `${file}:stop:0:1` },
+          { command: 'echo approved first', key: `${file}:stop:2:0` },
+          { command: 'echo approved second', key: `${file}:stop:2:1` },
+        ]));
+        const notTrusted = async () => {
+          const hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> } = (await fse.readJson(file)).hooks;
+          const report = await actual.readCodexHookTrust(request(hooks.Stop.flatMap((g, i) =>
+            g.hooks.map((h, j) => ({ command: h.command, key: `${file}:stop:${i}:${j}` })))));
+          expect(report.kind).toBe('listed');
+          return report.kind === 'listed' ? report.notTrusted.map((h) => h.command) : report;
+        };
+        expect(await notTrusted()).toEqual(['echo personal']);
+
+        if (operation === 'teardown') {
+          const { removeAllAgentHooks } = await import('../local-agent.js');
+          expect(await removeAllAgentHooks()).toEqual([]);
+        } else {
+          const command = operation === 'reinstall' ? install : {
+            id: 66, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'a', scope: 'user',
+          };
+          const acks = await runResponse({ cmds: [command] }, undefined, 'codex');
+          expect(acks.find((a) => a.id === command.id)?.status).toBe('success');
+        }
+
+        expect((await fse.readJson(file)).hooks.Stop[0].hooks).toEqual([handler('echo personal')]);
+        expect(await notTrusted()).toEqual(['echo personal']);
+      } finally {
+        vi.unstubAllEnvs();
+        await fse.remove(fakeBin);
+      }
+    },
+  );
+
+  it('clears inherited approval when an untrusted duplicate shifts onto a previously trusted key (#1220)', async () => {
+    const actual = await vi.importActual<typeof import('../codex-trust.js')>('../codex-trust.js');
+    vi.mocked(trustCodexHooks).mockImplementation(actual.trustCodexHooks);
+    vi.mocked(keepCodexHookTrust).mockImplementation(actual.keepCodexHookTrust);
+    const fakeBin = installFakeCodex();
+    vi.stubEnv('PATH', `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`);
+    const file = path.join(tmpDir, '.codex', 'hooks.json');
+    const install = {
+      id: 67, type: 'install_hook_rule', handle_type: 'hook', slug: 'a',
+      event: 'Stop', cmd: 'echo agent a', scope: 'user',
+    };
+    const handler = (command: string) => ({ type: 'command', command });
+    const request = (hooks: Array<{ command: string; key: string }>) => ({
+      codexHome: path.dirname(file), cwd: tmpDir, hooks: hooks.map((h) => ({ file, ...h })),
+    });
+    try {
+      await runResponse({ cmds: [install] }, undefined, 'codex');
+      const json = await fse.readJson(file);
+      json.hooks.Stop.push(
+        { hooks: [handler('echo personal')] },
+        { hooks: [handler('echo personal')] },
+      );
+      await fse.writeJson(file, json);
+      await actual.trustCodexHooks(request([
+        { command: 'echo agent a', key: `${file}:stop:0:0` },
+        { command: 'echo personal', key: `${file}:stop:1:0` },
+      ]));
+
+      const notTrusted = async () => {
+        const hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> } = (await fse.readJson(file)).hooks;
+        const report = await actual.readCodexHookTrust(request(hooks.Stop.flatMap((g, i) =>
+          g.hooks.map((h, j) => ({ command: h.command, key: `${file}:stop:${i}:${j}` })))));
+        expect(report.kind).toBe('listed');
+        return report.kind === 'listed' ? report.notTrusted.map((h) => h.command) : report;
+      };
+      expect(await notTrusted()).toEqual(['echo personal']);
+
+      const { removeAllAgentHooks } = await import('../local-agent.js');
+      expect(await removeAllAgentHooks()).toEqual([]);
+
+      expect(await notTrusted()).toEqual(['echo personal']);
+    } finally {
+      vi.unstubAllEnvs();
+      await fse.remove(fakeBin);
+    }
+  });
+
+  it('install_hook_rule writes the schema version Muse requires to a new settings file (#1220)', async () => {
+    const acks = await runResponse({ cmds: [{
+      id: 64, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-muse-new',
+      event: 'SessionStart', cmd: 'echo muse', scope: 'user',
+    }] }, undefined, 'muse');
+    expect(acks.find((a) => a.id === 64)?.status).toBe('success');
+    expect((await fse.readJson(path.join(tmpDir, '.config', 'muse', 'settings.json'))).schema_version).toBe(1);
+  });
+
+  it.each([
+    ['muse', ['.config', 'muse', 'settings.json'], ['.muse', 'hooks.json']],
+    ['qoder-cn', ['.qoder-cn', 'settings.json'], ['.qoder', 'settings.json']],
+  ])('install_hook_rule writes the %s hook to the user file the tool reads (#1220)', async (tool, read, unread) => {
+    const acks = await runResponse({ cmds: [{
+      id: 52, type: 'install_hook_rule', handle_type: 'hook', slug: `hk-${tool}`,
+      event: 'SessionStart', cmd: `echo ${tool}`, scope: 'user',
+    }] }, undefined, tool);
+    expect(acks.find((a) => a.id === 52)?.status).toBe('success');
+    const settings = await fse.readJson(path.join(tmpDir, ...read));
+    expect(JSON.stringify(settings.hooks.SessionStart)).toContain(`echo ${tool}`);
+    expect(await fse.pathExists(path.join(tmpDir, ...unread))).toBe(false);
+  });
+
+  it('uninstall_hook_rule also removes a hook an older version wrote to the unread project path (#1220)', async () => {
+    const legacy = path.join(tmpDir, '.muse', 'hooks.json');
+    await fse.outputJson(legacy, { hooks: { SessionStart: [
+      { hooks: [{ type: 'command', command: 'echo old' }] },
+      { hooks: [{ type: 'command', command: 'echo mine' }] },
+    ] } });
+    await fse.outputJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'), {
+      'hk-old': { tool: 'muse', event: 'SessionStart', command: 'echo old' },
+    });
+    const acks = await runResponse({ cmds: [{
+      id: 53, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'hk-old', scope: 'user',
+    }] }, undefined, 'muse');
+    expect(acks.find((a) => a.id === 53)?.status).toBe('success');
+    expect((await fse.readJson(legacy)).hooks.SessionStart).toEqual([
+      { hooks: [{ type: 'command', command: 'echo mine' }] },
+    ]);
+  });
+
+  it('install_hook_rule refuses ZCode and leaves its config valid (#1220)', async () => {
+    const configPath = path.join(tmpDir, '.zcode', 'cli', 'config.json');
+    const config = { hooks: { events: {} }, mcpServers: { mine: { command: 'mine' } } };
+    await fse.outputJson(configPath, config);
+    const acks = await runResponse({ cmds: [{
+      id: 54, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-zcode',
+      event: 'SessionStart', cmd: 'echo zcode', scope: 'user',
+    }] }, undefined, 'zcode');
+    expect(acks.find((a) => a.id === 54)?.status).toBe('failed');
+    expect(String(acks.find((a) => a.id === 54)?.error)).toMatch(/zcode/i);
+    expect(await fse.readJson(configPath)).toEqual(config);
+  });
+
+  it.each([
+    ['SessionStart', 'on_session_start'],
+    ['UserPromptSubmit', 'pre_llm_call'],
+    ['PreToolUse', 'pre_tool_call'],
+    ['PostToolUse', 'post_tool_call'],
+    ['Stop', 'on_session_end'],
+  ])('install_hook_rule registers a Hermes %s hook under %s (#1220)', async (event, hermesEvent) => {
+    const acks = await runResponse({ cmds: [{
+      id: 55, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-hermes',
+      event, cmd: 'echo hermes', scope: 'user',
+    }] }, undefined, 'hermes');
+    expect(acks.find((a) => a.id === 55)?.status).toBe('success');
+    const { default: YAML } = await import('yaml');
+    const config = YAML.parse(await fse.readFile(path.join(tmpDir, '.hermes', 'config.yaml'), 'utf8'));
+    expect(Object.keys(config.hooks)).toEqual([hermesEvent]);
+    expect(config.hooks[hermesEvent]).toEqual([expect.objectContaining({ command: 'echo hermes' })]);
+  });
+
+  it('install_hook_rule fails the ack for an event OpenCode has no equivalent for (#1220)', async () => {
+    const acks = await runResponse({ cmds: [{
+      id: 56, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-oc',
+      event: 'PreToolUse', cmd: 'echo oc', scope: 'user',
+    }] }, undefined, 'opencode');
+    expect(acks.find((a) => a.id === 56)?.status).toBe('failed');
+    expect(String(acks.find((a) => a.id === 56)?.error)).toMatch(/PreToolUse/);
+    const manifestPath = path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json');
+    expect((await fse.pathExists(manifestPath)) ? (await fse.readJson(manifestPath))['hk-oc'] : undefined).toBeUndefined();
   });
 
   it('re-install same codex slug with a new command leaves no stale entry', async () => {
@@ -2131,6 +2668,8 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
       repo: { localPath: path.join(partition, 'team-repo'), remote: 'https://example.com/x.git', kind: 'git' },
       username: 'u', scope: 'project', projectRoot: repo, additionalRoles: [],
     }));
+    // Its team's setting is readable (#915).
+    await fse.outputFile(path.join(partition, 'team-repo', 'teamai.yaml'), 'team: x\nrepo: https://example.com/x.git\n');
 
     await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
     await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
@@ -2341,6 +2880,17 @@ describe('local-agent: project prompts reach every installed tool (#945)', () =>
     expect(output).toContain('PROJECT-PROMPT');
   });
 
+  it('gives ZCode a project prompt through its SessionStart hook and writes it no file (#1221)', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.zcode', 'skills'));
+    const { reconcileHooks } = await import('../hooks.js');
+    await reconcileHooks(path.join(tmpDir, '.zcode', 'cli', 'config.json'), 'zcode', []);
+    const { repo, ack, output } = await installProjectPrompt('zcode', [], { sessionStart: true });
+
+    expect(ack?.status).toBe('success');
+    expect(output).toContain('PROJECT-PROMPT');
+    expect(await fse.readdir(repo)).toEqual(expect.not.arrayContaining(['AGENTS.md', '.zcode']));
+  });
+
   it('records the OpenCode entry it adds in the project\'s data home, where uninstall reads it', async () => {
     // A partitioned project: its data home is under ~/.teamai/projects.
     const { projectSlug } = await import('../utils/partition.js');
@@ -2348,6 +2898,8 @@ describe('local-agent: project prompts reach every installed tool (#945)', () =>
     const partition = path.join(tmpDir, '.teamai', 'projects', projectSlug(fs.realpathSync(tmpDir) + '/project'));
     await fse.outputFile(path.join(partition, 'config.yaml'),
       `repo:\n  localPath: ${partition}/team-repo\n  remote: https://example.com/t.git\nusername: u\nscope: project\nprojectRoot: ${project}\n`);
+    // Its team's setting is readable (#915).
+    await fse.outputFile(path.join(partition, 'team-repo', 'teamai.yaml'), 'team: t\nrepo: https://example.com/t.git\n');
     const { repo, ack } = await installProjectPrompt('opencode', ['.opencode/skills']);
 
     expect(ack?.status).toBe('success');
@@ -2453,5 +3005,406 @@ describe('local-agent: loadLocalAgentConfig({ dryRun: true }) writes nothing (#8
     // Positive control: the same load without the flag persists the backfill.
     await loadLocalAgentConfig();
     expect(await fse.pathExists(configPath())).toBe(true);
+  });
+});
+
+describe('local-agent: project installs stay out of git, and a member\'s file stays theirs (#915)', () => {
+  const RULE = '# HTTP rule\n\nFrom the backend.\n';
+  const skillMdOf = (name: string): string => `---\nname: ${name}\ndescription: test skill\n---\n# ${name}\nbody\n`;
+
+  async function skillZip(name: string): Promise<Uint8Array> {
+    const { zipSync, strToU8 } = await import('fflate');
+    return zipSync({ [`${name}/SKILL.md`]: strToU8(skillMdOf(name)) });
+  }
+
+  const gitEnv = (): NodeJS.ProcessEnv => ({ ...process.env, HOME: tmpDir, GIT_CONFIG_NOSYSTEM: '1' });
+  const git = (args: string[], cwd: string): string => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv() });
+  const ignored = (cwd: string, rel: string): boolean =>
+    spawnSync('git', ['check-ignore', '-q', rel], { cwd, env: gitEnv() }).status === 0;
+
+  async function repo(name: string): Promise<string> {
+    const dir = path.join(tmpDir, name);
+    await fse.ensureDir(dir);
+    git(['init', '-q', '-b', 'main'], dir);
+    return fs.realpathSync.native(dir);
+  }
+
+  /** The member's user-scope config, holding the git exclude override. */
+  async function flag(on: boolean): Promise<void> {
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+      'repo:', `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`, '  remote: https://test.example.com/api',
+      '  kind: http', '  url: https://test.example.com/api', 'username: tester', 'scope: user', `gitExcludeEnabled: ${on}`, '',
+    ].join('\n'));
+  }
+
+  const skill = (id: number, slug: string, workspace: string, version = '1.0.0') => ({
+    id, type: 'install_skill', skill_slug: slug, skill_version: version,
+    download_url: `http://127.0.0.1:42100/skill.zip?slug=${slug}`, scope: 'workspace', workspace_path: workspace,
+  });
+  const rule = (id: number, slug: string, workspace: string, version = '1.0.0') => ({
+    id, type: 'install_rule', rule_slug: slug, rule_version: version,
+    download_url: `http://127.0.0.1:42100/${slug}.md?v=${version}`, scope: 'workspace', workspace_path: workspace,
+  });
+
+  async function run(commands: Record<string, unknown>[], cwd: string, tool = 'claude', event?: 'prompt_submit') {
+    if (!await fse.pathExists(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'))) await setupConfig();
+    const zips = new Map<string, Uint8Array>();
+    for (const command of commands) {
+      if (command.type === 'install_skill') zips.set(String(command.skill_slug), await skillZip(String(command.skill_slug)));
+    }
+    const acks: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: { body?: string }) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/skill.zip') return new Response(Buffer.from(zips.get(url.searchParams.get('slug') ?? '')!));
+      if (url.pathname.endsWith('.md')) return new Response(url.searchParams.get('v') === '1.0.0' ? RULE : `${RULE}\nVersion ${url.searchParams.get('v')}.\n`);
+      if (url.pathname.includes('/local-agent/sync')) return new Response(JSON.stringify({ ok: true, commands }));
+      if (url.pathname.includes('/commands/ack')) acks.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ ok: true }));
+    }));
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    await reportAndSyncLocalAgent({
+      cwd, tool, status: 'running',
+      event: event && { type: event, timestamp: new Date().toISOString(), sessionId: 's', tool, cwd },
+    });
+    return acks;
+  }
+
+  const blockOf = (app: string): string[] | null => {
+    const file = path.join(app, '.git', 'info', 'exclude');
+    const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    const match = /# \[teamai:local-agent:start\]\n([\s\S]*?)# \[teamai:local-agent:end\]\n/.exec(content);
+    return match ? match[1].split('\n').filter(Boolean) : null;
+  };
+
+  it('lists the skills and rules it installs in a project in its own block while the flag is on, and an uninstall drops the line', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await fse.outputFile(path.join(app, '.claude', 'rules', 'mine.md'), '# Mine\n');
+
+    const acks = await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+
+    expect(acks.map((ack) => ack.status)).toEqual(['success', 'success']);
+    expect(ignored(app, '.claude/skills/http-skill/SKILL.md')).toBe(true);
+    expect(ignored(app, '.claude/rules/http-rule.md')).toBe(true);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+    expect(git(['status', '--porcelain', '-uall', '--', '.claude'], app)).toBe('?? .claude/rules/mine.md\n');
+    expect(await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'git-exclude.json')))
+      .toEqual({ 'local-agent': [path.join(app, '.git', 'info', 'exclude')] });
+
+    const removed = await run([{ id: 3, type: 'uninstall_skill', skill_slug: 'http-skill', scope: 'workspace', workspace_path: app }], app);
+
+    expect(removed[0]?.status).toBe('success');
+    expect(fs.existsSync(path.join(app, '.claude', 'skills', 'http-skill'))).toBe(false);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.teamai/.gitignore']);
+
+    const ruleRemoved = await run([{ id: 4, type: 'uninstall_rule', rule_slug: 'http-rule', scope: 'workspace', workspace_path: app }], app);
+
+    expect(ruleRemoved[0]?.status).toBe('success');
+    expect(blockOf(app)).toEqual(['/.teamai/.gitignore']);
+  });
+
+  it('writes no block while the flag is off', async () => {
+    await flag(false);
+    const app = await repo('app');
+
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+
+    expect(blockOf(app)).toBeNull();
+    expect(git(['status', '--porcelain', '-uall', '--', '.claude'], app))
+      .toBe('?? .claude/rules/http-rule.md\n?? .claude/skills/http-skill/SKILL.md\n');
+  });
+
+  it('keeps a member\'s skill and rule at the paths it would install to, and adopts a copy equal to the download', async () => {
+    await flag(true);
+    const app = await repo('app');
+    const memberSkill = path.join(app, '.claude', 'skills', 'http-skill');
+    const memberRule = path.join(app, '.claude', 'rules', 'http-rule.md');
+    await fse.outputFile(path.join(memberSkill, 'SKILL.md'), '# my own skill\n');
+    await fse.outputFile(memberRule, '# my own rule\n');
+    await fse.outputFile(path.join(app, '.claude', 'rules', 'same-rule.md'), RULE);
+
+    const acks = await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app), rule(3, 'same-rule', app)], app);
+
+    expect(acks.map(({ id, status, error }) => ({ id, status, error }))).toEqual([
+      { id: 1, status: 'failed', error: `Kept ${memberSkill}: it is not teamai's (not in the local agent's records). Rename or delete it; the local agent installs http-skill on its next sync.` },
+      { id: 2, status: 'failed', error: `Kept ${memberRule}: it is not teamai's (not in the local agent's records). Rename or delete it; the local agent installs http-rule on its next sync.` },
+      { id: 3, status: 'success', error: '' },
+    ]);
+    expect(fs.readFileSync(path.join(memberSkill, 'SKILL.md'), 'utf8')).toBe('# my own skill\n');
+    expect(fs.readFileSync(memberRule, 'utf8')).toBe('# my own rule\n');
+    expect(blockOf(app)).toEqual(['/.claude/rules/same-rule.md', '/.teamai/.gitignore']);
+    expect(git(['status', '--porcelain', '-uall', '--', '.claude'], app))
+      .toBe('?? .claude/rules/http-rule.md\n?? .claude/skills/http-skill/SKILL.md\n');
+  });
+
+  it('counts an older CLI\'s entry as recorded where the copy is the installed version, lists it once it records its tools, and keeps an edited copy', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+    // What an older CLI left: the same entries, without the tools they went to.
+    const manifestPath = path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json');
+    const manifest = await fse.readJson(manifestPath);
+    for (const kind of ['skills', 'rules']) {
+      for (const entry of Object.values(manifest.scopes[`project:${app}`][kind]) as Array<Record<string, unknown>>) delete entry.tools;
+    }
+    await fse.writeJson(manifestPath, manifest);
+    await fse.writeFile(path.join(app, '.claude', 'skills', 'http-skill', 'SKILL.md'), '# edited by the member\n');
+
+    const acks = await run([skill(3, 'http-skill', app, '2.0.0'), rule(4, 'http-rule', app, '2.0.0')], app);
+
+    expect(acks.map(({ id, status }) => ({ id, status }))).toEqual([{ id: 3, status: 'failed' }, { id: 4, status: 'success' }]);
+    expect(fs.readFileSync(path.join(app, '.claude', 'skills', 'http-skill', 'SKILL.md'), 'utf8')).toBe('# edited by the member\n');
+    expect(fs.readFileSync(path.join(app, '.claude', 'rules', 'http-rule.md'), 'utf8')).toContain('Version 2.0.0.');
+    expect((await fse.readJson(manifestPath)).scopes[`project:${app}`].rules['http-rule'].tools).toEqual(['claude']);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.teamai/.gitignore']);
+  });
+
+  it('lists a main checkout\'s and a linked worktree\'s installs in their shared file, another repository\'s in its own, and none of a worktree that is gone', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await fse.outputFile(path.join(app, 'README.md'), '# app\n');
+    git(['add', '-A'], app);
+    git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'app'], app);
+    // Inside the main checkout, so a leftover directory is still in a repository.
+    git(['worktree', 'add', '-q', path.join(app, 'wt')], app);
+    const worktree = fs.realpathSync.native(path.join(app, 'wt'));
+    const other = await repo('other');
+
+    await run([skill(1, 'main-skill', app), rule(2, 'wt-rule', worktree), rule(3, 'other-rule', other)], app);
+
+    expect(blockOf(app)).toEqual(['/.claude/rules/wt-rule.md', '/.claude/skills/main-skill/SKILL.md', '/.teamai/.gitignore']);
+    expect(ignored(worktree, '.claude/rules/wt-rule.md')).toBe(true);
+    expect(blockOf(other)).toEqual(['/.claude/rules/other-rule.md', '/.teamai/.gitignore']);
+
+    // The directory stays, with the copies in it, but it is no checkout any more.
+    fs.rmSync(path.join(worktree, '.git'));
+    git(['worktree', 'prune'], app);
+    await run([rule(4, 'other-rule', other, '2.0.0')], other);
+
+    expect(blockOf(app)).toEqual(['/.claude/skills/main-skill/SKILL.md', '/.teamai/.gitignore']);
+    expect(blockOf(other)).toEqual(['/.claude/rules/other-rule.md', '/.teamai/.gitignore']);
+  });
+
+  it.skipIf(process.getuid?.() === 0)('removing the local agent drops its block after the per-entry loop, but the line of a copy it could not delete, and the retry removes the copy', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+    // The skill's copy cannot be deleted, so its uninstall fails, and its cache stays to prove the copy teamai's.
+    const copy = path.join(app, '.claude', 'skills', 'http-skill');
+    fs.chmodSync(copy, 0o555);
+    process.exitCode = undefined;
+    try {
+      const { removeLocalAgentHttp } = await import('../local-agent.js');
+      await removeLocalAgentHttp();
+    } finally {
+      fs.chmodSync(copy, 0o755);
+    }
+
+    expect(fs.existsSync(path.join(copy, 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(app, '.claude', 'rules', 'http-rule.md'))).toBe(false);
+    // The copy left on disk stays out of git until it is gone, and its record stays for the retry.
+    expect(blockOf(app)).toEqual(['/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+    expect(process.exitCode).toBe(1);
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json'))).toBe(true);
+
+    process.exitCode = undefined;
+    const { removeLocalAgentHttp } = await import('../local-agent.js');
+    await removeLocalAgentHttp();
+
+    expect(process.exitCode).toBeUndefined();
+    expect(fs.existsSync(copy)).toBe(false);
+    expect(blockOf(app)).toBeNull();
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json'))).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0)('keeps a rule copy it could not delete, with its line and its cached source, and the retry removes the copy', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([rule(1, 'http-rule', app)], app);
+    const rules = path.join(app, '.claude', 'rules');
+    const copy = path.join(rules, 'http-rule.md');
+    fs.chmodSync(rules, 0o555);
+    process.exitCode = undefined;
+    const { removeLocalAgentHttp } = await import('../local-agent.js');
+    const { log } = await import('../utils/logger.js');
+    (log.warn as ReturnType<typeof vi.fn>).mockClear();
+    try {
+      await removeLocalAgentHttp();
+    } finally {
+      fs.chmodSync(rules, 0o755);
+    }
+
+    expect(process.exitCode).toBe(1);
+    expect(fs.existsSync(copy)).toBe(true);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.teamai/.gitignore']);
+    // The warning names the file and why, so the member knows what to fix.
+    expect((log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0])).join('\n')).toContain(copy);
+
+    process.exitCode = undefined;
+    await removeLocalAgentHttp();
+
+    expect(process.exitCode).toBeUndefined();
+    expect(fs.existsSync(copy)).toBe(false);
+    expect(blockOf(app)).toBeNull();
+  });
+
+  it.skipIf(process.getuid?.() === 0)('keeps the record of a workspace cache removal could not delete, and deletes it on the retry', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([rule(1, 'http-rule', app)], app);
+    const workspaces = path.join(app, '.teamai', 'workspaces');
+    const [id] = fs.readdirSync(workspaces);
+    const manifest = path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json');
+    const { removeLocalAgentHttp } = await import('../local-agent.js');
+    fs.chmodSync(path.join(workspaces, id), 0o555);
+    process.exitCode = undefined;
+    try {
+      await removeLocalAgentHttp();
+    } finally {
+      fs.chmodSync(path.join(workspaces, id), 0o755);
+    }
+
+    expect(process.exitCode).toBe(1);
+    expect(fs.existsSync(path.join(workspaces, id, 'local-agent'))).toBe(true);
+    expect(fs.existsSync(manifest)).toBe(true);
+
+    process.exitCode = undefined;
+    await removeLocalAgentHttp();
+
+    expect(process.exitCode).toBeUndefined();
+    expect(fs.existsSync(path.join(app, '.teamai'))).toBe(false);
+    expect(fs.existsSync(manifest)).toBe(false);
+  });
+
+  it('keeps the cache .gitignore and its record while git cannot say whether it is tracked, and the retry removes it', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([rule(1, 'http-rule', app)], app);
+    const gitignore = path.join(app, '.teamai', '.gitignore');
+    expect(fs.existsSync(gitignore)).toBe(true);
+    const head = fs.readFileSync(path.join(app, '.git', 'HEAD'), 'utf8');
+    fs.writeFileSync(path.join(app, '.git', 'HEAD'), 'not a ref\n');
+    const { removeLocalAgentHttp } = await import('../local-agent.js');
+    process.exitCode = undefined;
+    try {
+      await removeLocalAgentHttp();
+    } finally {
+      fs.writeFileSync(path.join(app, '.git', 'HEAD'), head);
+    }
+
+    expect(process.exitCode).toBe(1);
+    expect(fs.existsSync(gitignore)).toBe(true);
+
+    process.exitCode = undefined;
+    await removeLocalAgentHttp();
+
+    expect(process.exitCode).toBeUndefined();
+    expect(fs.existsSync(path.join(app, '.teamai'))).toBe(false);
+    expect(blockOf(app)).toBeNull();
+  });
+
+  it('keeps a git exclude record it cannot read, with the blocks it may name', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([rule(1, 'http-rule', app)], app);
+    const record = path.join(tmpDir, '.teamai', 'local-agent', 'git-exclude.json');
+    const intact = fs.readFileSync(record, 'utf8');
+    fs.writeFileSync(record, '{ not json\n');
+    const { removeLocalAgentHttp } = await import('../local-agent.js');
+    process.exitCode = undefined;
+
+    await removeLocalAgentHttp();
+
+    expect(process.exitCode).toBe(1);
+    expect(fs.readFileSync(record, 'utf8')).toBe('{ not json\n');
+
+    // The retry finds it still unreadable: still incomplete, not "nothing to remove".
+    process.exitCode = undefined;
+    await removeLocalAgentHttp();
+    expect(process.exitCode).toBe(1);
+
+    fs.writeFileSync(record, intact);
+    process.exitCode = undefined;
+    await removeLocalAgentHttp();
+    expect(process.exitCode).toBeUndefined();
+    expect(blockOf(app)).toBeNull();
+    expect(fs.existsSync(record)).toBe(false);
+  });
+
+  it('follows a flag change at a run that brings no command, and leaves the block alone while nothing it is built from changed', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+
+    await flag(false);
+    await run([], app, 'claude', 'prompt_submit');
+    expect(blockOf(app)).toBeNull();
+
+    await flag(true);
+    await run([], app, 'claude', 'prompt_submit');
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+
+    // Nothing changed since: the run does not look at the exclude file.
+    const exclude = path.join(app, '.git', 'info', 'exclude');
+    const edited = fs.readFileSync(exclude, 'utf8').replace(/# \[teamai:local-agent:start\][\s\S]*# \[teamai:local-agent:end\]\n/, '');
+    fs.writeFileSync(exclude, edited);
+    await run([], app, 'claude', 'prompt_submit');
+    expect(fs.readFileSync(exclude, 'utf8')).toBe(edited);
+  });
+
+  it('keeps a workspace\'s lines while its git-mode team\'s teamai.yaml cannot be read, and says why', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+    // The workspace now follows a git-mode config with no override, whose team clone has no teamai.yaml.
+    const clone = path.join(tmpDir, '.teamai', 'team-repo');
+    await fse.ensureDir(clone);
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+      'repo:', `  localPath: ${clone}`, '  remote: https://example.com/team.git', '  kind: git', '  url: https://example.com/team.git',
+      'username: tester', 'scope: user', '',
+    ].join('\n'));
+
+    await run([], app, 'claude', 'prompt_submit');
+
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+    const { localAgentGitExcludeNotices, readGitExcludeNotices } = await import('../git-exclude-notices.js');
+    expect((await readGitExcludeNotices(localAgentGitExcludeNotices())).lastFailure?.message).toBe(
+      `teamai could not read sharing.gitExclude from the team's teamai.yaml (${path.join(clone, 'teamai.yaml')}), `
+      + `so it left the local agent's git exclude lines for ${app} as they were. Fix or restore teamai.yaml in the team repository, `
+      + `or set \`gitExcludeEnabled\` in ${path.join(tmpDir, '.teamai', 'config.yaml')}, then start a new session.`,
+    );
+
+    // Nor does it install there meanwhile: either value could place a file where the other would not.
+    const acks = await run([rule(3, 'other-rule', app)], app);
+    expect(acks[0]?.status).toBe('failed');
+    expect(acks[0]?.error).toBe(
+      `teamai could not read sharing.gitExclude from the team's teamai.yaml (${path.join(clone, 'teamai.yaml')}), `
+      + `so the local agent did not install other-rule in ${app}: it wrote nothing there. `
+      + `Fix or restore teamai.yaml in the team repository, or set \`gitExcludeEnabled\` in ${path.join(tmpDir, '.teamai', 'config.yaml')}.`,
+    );
+    expect(fs.existsSync(path.join(app, '.claude', 'rules', 'other-rule.md'))).toBe(false);
+    expect(blockOf(app)).toEqual(['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore']);
+  });
+
+  it('keeps those lines when git also cannot place the workspace\'s paths', async () => {
+    await flag(true);
+    const app = await repo('app');
+    await run([skill(1, 'http-skill', app), rule(2, 'http-rule', app)], app);
+    const before = ['/.claude/rules/http-rule.md', '/.claude/skills/http-skill/SKILL.md', '/.teamai/.gitignore'];
+    expect(blockOf(app)).toEqual(before);
+    const clone = path.join(tmpDir, '.teamai', 'team-repo');
+    await fse.ensureDir(clone);
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+      'repo:', `  localPath: ${clone}`, '  remote: https://example.com/team.git', '  kind: git', '  url: https://example.com/team.git',
+      'username: tester', 'scope: user', '',
+    ].join('\n'));
+    await fse.writeFile(path.join(app, '.git', 'HEAD'), 'not a ref\n');
+
+    await run([], app, 'claude', 'prompt_submit');
+
+    expect(blockOf(app)).toEqual(before);
   });
 });

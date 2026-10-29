@@ -16,7 +16,6 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import {
-  resolveOmpExtensionsDir,
   injectOmpHooks,
   removeOmpHooks,
   buildOmpExtensionSource,
@@ -25,10 +24,11 @@ import {
 import { reconcileHooksToAllTools } from '../hooks.js';
 import { log } from '../utils/logger.js';
 import { loadOmpExtension, type ExtensionDispatch } from './helpers/pi-extensions.js';
+import { hookAdapterDir } from '../locate.js';
 
-describe('resolveOmpExtensionsDir', () => {
+describe('the OMP extension directory', () => {
   it('always targets the user agent dir (single-copy policy)', () => {
-    expect(resolveOmpExtensionsDir()).toBe(
+    expect(hookAdapterDir('omp-extension')).toBe(
       path.join(os.homedir(), '.omp', 'agent', 'extensions'),
     );
   });
@@ -186,6 +186,16 @@ describe('reconcileHooksToAllTools routes omp to the extension adapter', () => {
     await reconcileHooksToAllTools(toolPaths, projectRoot, [], manifest());
     expect(await fse.pathExists(extFile())).toBe(true);
     expect(await fse.pathExists(path.join(projectRoot, '.omp', 'extensions', OMP_HOOK_FILE))).toBe(false);
+  });
+
+  it('preserves a project extension beside the global TeamAI extension', async () => {
+    await fse.ensureDir(path.join(home, '.omp', 'agent'));
+    const projectExtension = path.join(projectRoot, '.omp/extensions/member.ts');
+    await fse.outputFile(projectExtension, 'export default function member() {}');
+    await reconcileHooksToAllTools(toolPaths, projectRoot, [], manifest());
+    expect(await fse.pathExists(extFile())).toBe(true);
+    await reconcileHooksToAllTools(toolPaths, projectRoot, [], manifest(), { removeAll: true });
+    expect(await fse.readFile(projectExtension, 'utf8')).toBe('export default function member() {}');
   });
 
   it('removeAll deletes the extension', async () => {
