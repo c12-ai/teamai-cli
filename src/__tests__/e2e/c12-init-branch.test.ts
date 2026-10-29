@@ -154,13 +154,16 @@ describe.skipIf(process.platform === 'win32')('teamai init --branch (C12 fork)',
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it('init --branch checks the branch out, saves it, and delivers its resources', async () => {
+  it('init --branch checks the branch out and saves it, and the first pull delivers its resources', async () => {
     const result = await runCLI(['init', TEAM_URL, '--branch', BRANCH, '--scope', 'user', '--role', 'dev', '--agent', 'claude', '--force']);
     expect(result.code, result.output).toBe(0);
+    // init copies no team resources (0.28): the first pull does.
+    const first = await runCLI(['pull']);
+    expect(first.code, first.output).toBe(0);
     expect(configYaml()).toMatch(new RegExp(`branch: ${BRANCH}`));
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], teamRepo())).toBe(BRANCH);
     expect(git(['rev-parse', '--abbrev-ref', 'origin/HEAD'], teamRepo())).toBe(`origin/${BRANCH}`);
-    expect(delivered('branch-skill'), result.output).toBe(true);
+    expect(delivered('branch-skill'), first.output).toBe(true);
 
     const status = await runCLI(['status']);
     expect(status.output).toMatch(new RegExp(`branch: ${BRANCH}`));
@@ -193,8 +196,10 @@ describe.skipIf(process.platform === 'win32')('teamai init --branch (C12 fork)',
     expect(init.code, init.output).toBe(0);
     expect(configYaml()).not.toMatch(/branch:/);
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], teamRepo())).toBe('main');
-    expect(delivered('main-skill'), init.output).toBe(true);
-    expect(delivered('branch-skill'), init.output).toBe(false);
+    const first = await runCLI(['pull']);
+    expect(first.code, first.output).toBe(0);
+    expect(delivered('main-skill'), first.output).toBe(true);
+    expect(delivered('branch-skill'), first.output).toBe(false);
     const log = await pushNewSkill('my-main-skill');
     expect(log).toMatch(/-B main( |$)/m);
   }, 120_000);
@@ -233,9 +238,9 @@ describe.skipIf(process.platform === 'win32')('teamai init --branch (C12 fork)',
     const follow = await runCLI(['init', TEAM_URL, '--branch', `${BRANCH}-renamed`, '--scope', 'user', '--role', 'dev', '--agent', 'claude', '--force']);
     expect(follow.code, follow.output).toBe(0);
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], teamRepo())).toBe(`${BRANCH}-renamed`);
-    expect(delivered('after-rename'), follow.output).toBe(true);
     const after = await runCLI(['pull']);
     expect(after.code, after.output).toBe(0);
+    expect(delivered('after-rename'), after.output).toBe(true);
   }, 120_000);
 
   it('init --branch fails loudly when the branch does not exist', async () => {

@@ -539,7 +539,8 @@ describe('a workspace delivers what the repos inside it select (#913)', () => {
     expect(list.output).toContain('team:child-model');
   });
 
-  it('pushes an edit only to the namespaces that delivered it, not to an equal root skill', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('pushes an edit only to the namespaces that delivered it, not to an equal root skill', async () => {
     publish('an equal skill at the root and in both services', (seed) => {
       for (const namespace of ['', 'svc-a', 'svc-b']) {
         fs.mkdirSync(path.join(seed, 'skills', namespace, 'catalog-twin'), { recursive: true });

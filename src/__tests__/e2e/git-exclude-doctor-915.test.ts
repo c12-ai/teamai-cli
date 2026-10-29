@@ -493,7 +493,8 @@ describe.skipIf(process.platform === 'win32')('doctor, pull --dry-run and backgr
     expect(after).toContain('✔ Delivered team resources are kept out of git');
   }, 120_000);
 
-  it('keeps a background pull\'s notice of another checkout\'s file for doctor and the next interactive pull, which says it once', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a background pull\'s notice of another checkout\'s file for doctor and the next interactive pull, which says it once', async () => {
     const m = member('notice');
     const root = caseDir('notice');
     const main = m.project(path.join(root, 'main'));

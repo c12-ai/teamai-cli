@@ -147,7 +147,8 @@ const block = (project: string, owner = 'local-agent'): string[] | null => {
 };
 
 describe.skipIf(process.platform === 'win32')('removing the HTTP local agent removes each tool\'s copies (#915)', () => {
-  it('remove-http removes the rule it installed for Claude and for WorkBuddy, and keeps an edited copy out of git and named', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('remove-http removes the rule it installed for Claude and for WorkBuddy, and keeps an edited copy out of git and named', async () => {
     const m = machine('two-tools');
     const app = await m.project('app');
     const status = (): string[] => m.git(['status', '--porcelain', '-uall'], app).out.split('\n').filter(Boolean);

@@ -224,7 +224,8 @@ describe.skipIf(process.platform === 'win32')('live checkouts are probed, not in
 
       expect(tracked(partition, main)).toEqual(KEPT);
       expect(tracked(partition, worktree)).toEqual(KEPT);
-      expectEditKept(main);
+      // c12 fork: the team version wins (docs/c12-fork.md item 1), so the edit does not survive; the records above do.
+      // expectEditKept(main);
     });
 
     it('still drops the directory and record of a removed worktree, and of one deleted without git', async () => {
@@ -254,7 +255,8 @@ describe.skipIf(process.platform === 'win32')('live checkouts are probed, not in
       expect(tracked(partition, main)).toEqual(KEPT);
     });
 
-    it('keeps a record and directory an older teamai left without a root until their own checkout writes one', async () => {
+    // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+    it.skip('keeps a record and directory an older teamai left without a root until their own checkout writes one', async () => {
       // As teamai 0.22 left them: no `root` in the main checkout's record or
       // directory, and a directory of a checkout long gone.
       const state = JSON.parse(fs.readFileSync(statePath(partition), 'utf8'));
@@ -308,7 +310,8 @@ describe.skipIf(process.platform === 'win32')('live checkouts are probed, not in
     expect(tracked(partition, main)).toEqual(KEPT);
   });
 
-  it('keeps a submodule\'s main checkout when its linked worktree pulls', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a submodule\'s main checkout when its linked worktree pulls', async () => {
     const libSeed = path.join(sandbox, 'lib-seed');
     commitApp(libSeed);
     const libRemote = path.join(sandbox, 'lib.git');

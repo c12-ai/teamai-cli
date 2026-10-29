@@ -182,7 +182,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it('after .git gets a new inode, keeps edited still-delivered copies and updates an unedited older one', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('after .git gets a new inode, keeps edited still-delivered copies and updates an unedited older one', () => {
     const t = team('restored', {
       'rules/team-rule.md': TEAM_RULE,
       'rules/other-rule.md': '# Other rule v1\n',
@@ -213,7 +214,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(pulled.output).not.toContain(`Kept ${other}`);
   });
 
-  it('after .git gets a new inode and a role switch, keeps an edited rule of the old role', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('after .git gets a new inode and a role switch, keeps an edited rule of the old role', () => {
     const t = team('restored-role', {
       'manifest/roles.yaml': ROLES_YAML,
       'rules/team-rule.md': TEAM_RULE,
@@ -238,7 +240,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(read(beRule)).toBe(BE_RULE);
   });
 
-  it('keeps a member\'s own rule and agent at a team resource\'s path, names them, and doctor lists them', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s own rule and agent at a team resource\'s path, names them, and doctor lists them', () => {
     const t = team('own-files', {
       'rules/team-rule.md': TEAM_RULE,
       'agents/team-agent.yaml': agentYaml('team-agent', 'Team version.'),
@@ -281,7 +284,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(read(path.join(dir, '.claude', 'rules', 'my-rule.md'))).toBe('MY RULE\n');
   });
 
-  it('keeps a member\'s link at a team rule\'s path and never writes through it, even when its target holds an older team version', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s link at a team rule\'s path and never writes through it, even when its target holds an older team version', () => {
     const t = team('rule-link', { 'rules/team-rule.md': 'Old team rule.\n' });
     t.publish({ 'rules/team-rule.md': TEAM_RULE }, 'v2');
     const external = path.join(sandbox, 'rule-link-mine.md');
@@ -329,7 +333,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(read(claudeTarget)).toBe(TEAM_RULE);
   });
 
-  it('delivers once the member\'s file is gone, even when the pull that kept it found the checkout at the team revision', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('delivers once the member\'s file is gone, even when the pull that kept it found the checkout at the team revision', () => {
     const t = team('kept-at-rev', { 'rules/team-rule.md': TEAM_RULE });
     const dir = business('kept-at-rev-biz');
     init(t, dir);
@@ -371,7 +376,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(read(copy)).toContain('# Team skill, v2');
   });
 
-  it('keeps a member\'s entry of the other type at a delivered path, and delivers once it is gone', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s entry of the other type at a delivered path, and delivers once it is gone', () => {
     const t = team('type-conflict', { 'rules/team-rule.md': TEAM_RULE, 'skills/team-skill/SKILL.md': '# Team skill\n' });
     const dir = business('type-conflict-biz', {
       '.claude/rules/team-rule.md/mine.md': 'MINE\n',
@@ -481,7 +487,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(read(rules('keeper.md'))).toBe('MY KEEPER\n');
   });
 
-  it('keeps a member\'s own rules through teamai remove, the removed rule\'s name included', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s own rules through teamai remove, the removed rule\'s name included', () => {
     const t = team('own-remove', { 'rules/doomed.md': '# Doomed\n', 'rules/keeper.md': '# Keeper\n' });
     const dir = business('own-remove-biz', {
       '.claude/rules/doomed.md': 'MY DOOMED\n',
@@ -499,7 +506,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(removed.output).toContain(`Kept ${keeper}: it is not teamai's`);
   });
 
-  it('keeps a member\'s own agent through teamai remove agents, and removes teamai\'s recorded and history copies', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s own agent through teamai remove agents, and removes teamai\'s recorded and history copies', () => {
     const t = team('own-agent-remove', {
       'agents/doomed-agent.yaml': agentYaml('doomed-agent', 'Doomed.'),
       'agents/gone-agent.yaml': agentYaml('gone-agent', 'Gone.'),
@@ -522,7 +530,8 @@ describe('ownership of unrecorded rule and agent files (#993 bugs 2 and 12)', ()
     expect(fs.existsSync(agents('old-agent.md'))).toBe(false);
   });
 
-  it('keeps a member\'s own rule and agent through uninstall, and removes teamai\'s recorded and history copies', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s own rule and agent through uninstall, and removes teamai\'s recorded and history copies', () => {
     const t = team('own-uninstall', {
       'rules/team-rule.md': TEAM_RULE,
       'rules/edited-rule.md': '# Edited rule\n',
