@@ -138,7 +138,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it('keeps a member\'s own skill and doc at a team resource\'s path, names them, and doctor lists them', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s own skill and doc at a team resource\'s path, names them, and doctor lists them', () => {
     const t = team('own', {
       'skills/team-skill/SKILL.md': skillMd('team-skill', 'Team skill.'),
       'skills/team-skill/scripts/run.sh': 'echo team\n',
@@ -183,7 +184,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     expect(plain.output).not.toContain('it is not teamai\'s');
   });
 
-  it('updates an older team version of a skill and a doc that has no record, and keeps a skill holding a file of the member\'s', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('updates an older team version of a skill and a doc that has no record, and keeps a skill holding a file of the member\'s', () => {
     // SKILL.md without frontmatter: pull delivers it repaired, and that render is a team version too.
     const t = team('older', {
       'skills/team-skill/SKILL.md': '# Team skill\n\nVersion one.\n',
@@ -324,7 +326,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     expect(read(mine)).toBe('MY NOTES\n');
   });
 
-  it('keeps a member\'s skill directory holding a link at a team skill\'s path, and never writes through the link', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s skill directory holding a link at a team skill\'s path, and never writes through the link', () => {
     const t = team('skill-link', { 'skills/team-skill/SKILL.md': skillMd('team-skill', 'Team.') });
     const external = path.join(sandbox, 'skill-link-mine.md');
     writeFile(external, skillMd('team-skill', 'Team.'));
@@ -357,7 +360,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     expect(uninstalled.output).toContain(`Kept ${path.join(docs, '.draft')}`);
   });
 
-  it('keeps a member\'s link in place of a team skill directory through pull, remove and uninstall, and names it', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s link in place of a team skill directory through pull, remove and uninstall, and names it', () => {
     const t = team('skill-leaf-link', { 'skills/team-skill/SKILL.md': skillMd('team-skill', 'Team.') });
     const mine = path.join(sandbox, 'skill-leaf-link-mine');
     writeFile(path.join(mine, 'SKILL.md'), skillMd('team-skill', 'Team.'));
@@ -377,7 +381,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     expect(read(path.join(mine, 'SKILL.md'))).toBe(skillMd('team-skill', 'Team.'));
   });
 
-  it('keeps a delivered skill directory holding a file the member added, through remove, uninstall and a team removal', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a delivered skill directory holding a file the member added, through remove, uninstall and a team removal', () => {
     const files = { 'skills/team-skill/SKILL.md': skillMd('team-skill', 'Team.'), 'skills/gone-skill/SKILL.md': skillMd('gone-skill', 'Gone.') };
     const t = team('skill-extra-file', files);
     const dir = business('skill-extra-file-biz', { '.claude/skills/.keep': '' });
@@ -432,7 +437,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     expect(fs.existsSync(path.join(otherSkill, 'SKILL.md'))).toBe(false);
   });
 
-  it('keeps a file the member added to a delivered skill when the team later adds one at that path', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a file the member added to a delivered skill when the team later adds one at that path', () => {
     const t = team('skill-new-path', { 'skills/team-skill/SKILL.md': skillMd('team-skill', 'Team.') });
     const dir = business('skill-new-path-biz', { '.claude/skills/.keep': '' });
     init(t, dir);
@@ -556,7 +562,8 @@ describe('ownership of unrecorded skills and docs (#993 bug 12)', () => {
     }
   });
 
-  it('keeps a recorded skill the member edited whole, as before', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a recorded skill the member edited whole, as before', () => {
     const t = team('edited', {
       'skills/team-skill/SKILL.md': skillMd('team-skill', 'Version one.'),
       'skills/team-skill/scripts/run.sh': 'echo one\n',

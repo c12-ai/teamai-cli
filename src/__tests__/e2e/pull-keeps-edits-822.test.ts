@@ -171,7 +171,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(read(cursorAgent())).toContain('Version two.');
   });
 
-  it('keeps an edited copy on a forced full sync of an unchanged team repo, and restores one the member deleted', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited copy on a forced full sync of an unchanged team repo, and restores one the member deleted', async () => {
     await pull();
     editClaudeCopies();
     const agentEdit = read(claudeAgent());
@@ -196,7 +197,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(restored).toContain(`Kept ${claudeAgent()}`);
   });
 
-  it('keeps an edited copy the team changed since and warns, while the other tools\' copies update', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited copy the team changed since and warns, while the other tools\' copies update', async () => {
     await pull();
     editClaudeCopies();
     const agentEdit = read(claudeAgent());
@@ -225,7 +227,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     `The version teamai would deploy at ${dest} (${relPath}) has changed since it delivered that copy; pushing replaces that change unless you merged it.`
   );
 
-  it('warns at push about a kept copy the team changed since, after a silent pull kept it', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('warns at push about a kept copy the team changed since, after a silent pull kept it', async () => {
     await pull();
     editClaudeCopies();
     teamCommit(teamUpdatesAll);
@@ -240,7 +243,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(output).not.toContain(`delivered ${cursorRule()}`);
   });
 
-  it('warns at push once the team amends a pushed copy, and not while the team is unchanged', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('warns at push once the team amends a pushed copy, and not while the team is unchanged', async () => {
     await pull();
     fs.writeFileSync(claudeRule(), '# Team rule\n\nMy version.\n');
     expect(await pushDryRun()).not.toContain('would deploy at');
@@ -252,7 +256,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(await pushDryRun()).toContain(teamChangedWarning('rules/team-rule.md', claudeRule()));
   });
 
-  it('names the copies --dry-run would keep and writes nothing', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('names the copies --dry-run would keep and writes nothing', async () => {
     await pull();
     editClaudeCopies();
     teamCommit(teamUpdatesAll);
@@ -270,7 +275,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(read(claudeScript())).toBe('echo mine\n');
   });
 
-  it('keeps an edited copy of a resource the team removed, and removes the untouched copies', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited copy of a resource the team removed, and removes the untouched copies', async () => {
     await pull();
     fs.writeFileSync(claudeScript(), 'echo mine\n');
     fs.writeFileSync(claudeRule(), '# Team rule\n\nMy version.\n');
@@ -297,7 +303,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(fs.existsSync(cursorAgent())).toBe(false);
   });
 
-  it('keeps an edited copy of a rule the team deleted without a tombstone, and removes the untouched one', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited copy of a rule the team deleted without a tombstone, and removes the untouched one', async () => {
     await pull();
     fs.writeFileSync(claudeRule(), '# Team rule\n\nMy version.\n');
     teamCommit((repo) => {
@@ -312,7 +319,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(fs.existsSync(cursorRule())).toBe(false);
   });
 
-  it('keeps another worktree\'s record of what it delivered through a forced full sync', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps another worktree\'s record of what it delivered through a forced full sync', async () => {
     await pull();
     const worktree = path.join(sandbox, 'wt');
     git(['worktree', 'add', '-q', worktree, '-b', 'wt'], projectRoot);
@@ -339,7 +347,8 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(output).toContain(`Kept ${worktreeRule}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
   });
 
-  it('keeps an edited copy teamai has no record of as the member\'s, and updates the unedited ones (#993)', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited copy teamai has no record of as the member\'s, and updates the unedited ones (#993)', async () => {
     await pull();
     // The state an older CLI leaves: a checkout record without `delivered`.
     const state = JSON.parse(read(statePath())) as { lastPullByWorkspace: Record<string, { delivered?: unknown }> };

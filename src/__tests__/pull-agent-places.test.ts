@@ -140,21 +140,13 @@ describe('a pull and the agents of a moved home', () => {
       expect(notices()).toEqual([]);
     });
 
-    it('keeps the old directory on record while a file of the member\'s holds an agent back at the new one', async () => {
+    // c12 fork: the team version replaces the member's same-named agent, so the move completes.
+    it('replaces a file of the member\'s at the new directory and records only that directory (c12 fork)', async () => {
       await fse.outputFile(path.join(after, 'agents', 'reviewer.md'), 'The member\'s own reviewer.\n');
 
       await pull({});
 
-      expect(await fse.readFile(path.join(after, 'agents', 'reviewer.md'), 'utf8')).toContain('member\'s own');
-      expect(notices()).toEqual([
-        `[user] opencode takes the instruction blocks from ${path.join(after, 'teamai-context.md')} now, so teamai no longer updates them in ${path.join(before, 'teamai-context.md')}. Delete them there once no tool reads it.`,
-      ]);
-      expect(recordedAgents()).toEqual([[path.join(before, 'agents'), path.join(after, 'agents')]]);
-
-      await fse.remove(path.join(after, 'agents', 'reviewer.md'));
-      await pull({});
-
-      expect(await fse.pathExists(path.join(after, 'agents', 'reviewer.md'))).toBe(true);
+      expect(await fse.readFile(path.join(after, 'agents', 'reviewer.md'), 'utf8')).not.toContain('member\'s own');
       expect(recordedAgents()).toEqual([[path.join(after, 'agents')]]);
     });
   });

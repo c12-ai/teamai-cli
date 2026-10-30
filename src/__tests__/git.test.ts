@@ -743,6 +743,37 @@ describe('redactGitCredentials', () => {
   });
 });
 
+// C12 fork: the clone's branch is fetched alone by explicit refspec and
+// origin/<branch> is merged by name, never `git pull`: a pull merges what
+// FETCH_HEAD lists, which two concurrent fetches turn into "Cannot
+// fast-forward to multiple branches".
+const REFSPEC = '+refs/heads/main:refs/remotes/origin/main';
+const MERGE = ['merge', '--ff-only', 'refs/remotes/origin/main'];
+
+/** HEAD before and after the merge, and the merge's outcome. */
+function mockClone({ heads = ['a1', 'a1'], merge }: { heads?: string[]; merge?: Error } = {}): void {
+  const shas = [...heads];
+  mockGit.revparse.mockImplementation(async (args: any) => {
+    const a = Array.isArray(args) ? args : [args];
+    if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+    if (a[0] === '--show-toplevel') return '/tmp/x';
+    if (a[0] === 'HEAD') return shas.shift() ?? heads[heads.length - 1];
+    return '';
+  });
+  mockGit.raw.mockImplementation(async (args: string[]) => {
+    if (args[0] === 'merge') {
+      if (merge) throw merge;
+      return '';
+    }
+    if (args[0] === 'diff') return 'skills/a/SKILL.md\nrules/b.md\n';
+    if (args[0] === 'rev-list') return '0\n';
+    // On a branch: upstream's detached-HEAD guard (assertAttachedTeamRepo) lets the pull run.
+    if (args[0] === 'symbolic-ref') return 'refs/heads/main\n';
+    // No upstream configured: origin/<branch>.
+    return '';
+  });
+}
+
 describe('pullRepo', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -755,85 +786,88 @@ describe('pullRepo', () => {
       staged: [],
       files: [],
     });
-    mockGit.revparse.mockImplementation(async (args: any) => {
-      const a = Array.isArray(args) ? args : [args];
-      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
-      if (a[0] === '--show-toplevel') return '/tmp/x';
-      return '';
-    });
-    mockGit.raw.mockResolvedValue('0\n');
+    mockClone();
     mockGit.fetch.mockResolvedValue(undefined);
     mockGit.reset.mockResolvedValue(undefined);
   });
 
-  it('returns "already up to date" when pull reports no changes', async () => {
-    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+  it('returns "already up to date" when the merge moves nothing', async () => {
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('already up to date');
-    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', REFSPEC]);
+    expect(mockGit.raw).toHaveBeenCalledWith(MERGE);
+    expect(mockGit.pull).not.toHaveBeenCalled();
     expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
   });
 
   it('returns changed file count on fast-forward success', async () => {
-    mockGit.pull.mockResolvedValue({ summary: { changes: 2, insertions: 5, deletions: 1 } });
+    mockClone({ heads: ['a1', 'b2'] });
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('2 file(s) changed');
+    expect(mockGit.raw).toHaveBeenCalledWith(['diff', '--name-only', 'a1', 'b2']);
   });
 
-  it('falls back to hard reset when pull rejects (diverged)', async () => {
-    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+  it('falls back to hard reset when the fast-forward fails (diverged)', async () => {
+    mockClone({ merge: new Error('Not possible to fast-forward, aborting.') });
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('reset to origin (diverged)');
-    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', 'main']);
+    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', REFSPEC]);
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'origin/main']);
   });
 
+  it('follows the branch\'s configured upstream, as git pull does', async () => {
+    const clone = mockGit.raw.getMockImplementation()!;
+    mockGit.raw.mockImplementation(async (args: string[]) => {
+      if (args.join(' ') === 'config --get branch.main.remote') return 'upstream\n';
+      if (args.join(' ') === 'config --get-all branch.main.merge') return 'refs/heads/trunk\n';
+      if (args[0] === 'rev-parse' && args[2] === 'main@{upstream}') return 'refs/remotes/upstream/trunk\n';
+      return clone(args);
+    });
+    await expect(pullRepo('/tmp/x')).resolves.toBe('already up to date');
+    expect(mockGit.fetch).toHaveBeenCalledWith(['upstream', '+refs/heads/trunk:refs/remotes/upstream/trunk']);
+    expect(mockGit.raw).toHaveBeenCalledWith(['merge', '--ff-only', 'refs/remotes/upstream/trunk']);
+  });
+
+  it('fetches once more when a concurrent fetch moved origin/<branch> first', async () => {
+    mockGit.fetch.mockRejectedValueOnce(new Error('error: fetching ref refs/remotes/origin/main failed: incorrect old value provided'));
+    await expect(pullRepo('/tmp/x')).resolves.toBe('already up to date');
+    expect(mockGit.fetch).toHaveBeenCalledTimes(2);
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
+  it('names the fix when origin no longer has the branch (renamed or deleted)', async () => {
+    mockGit.fetch.mockRejectedValue(new Error("fatal: couldn't find remote ref refs/heads/main"));
+    await expect(pullRepo('/tmp/x')).rejects.toThrow(/no branch main: it was renamed or deleted.*--branch/);
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
   it('re-throws when fetch fails after diverged pull', async () => {
-    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
     mockGit.fetch.mockRejectedValue(new Error('could not read from remote'));
     await expect(pullRepo('/tmp/x')).rejects.toThrow('could not read from remote');
     expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
   });
 
   it('surfaces the real auth/network error when fetch also fails', async () => {
-    vi.clearAllMocks();
-    mockGit.status.mockResolvedValue({
-      conflicted: [],
-      modified: [],
-      not_added: [],
-      created: [],
-      staged: [],
-      files: [],
-    });
-    mockGit.revparse.mockImplementation(async (args: any) => {
-      const a = Array.isArray(args) ? args : [args];
-      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
-      if (a[0] === '--show-toplevel') return '/tmp/x';
-      return '';
-    });
-    mockGit.raw.mockResolvedValue('0\n');
-    mockGit.pull.mockRejectedValue(new Error('Authentication failed for origin'));
     mockGit.fetch.mockRejectedValue(new Error('Authentication failed for origin'));
     await expect(pullRepo('/tmp/x')).rejects.toThrow('Authentication failed');
     expect(mockGit.reset).not.toHaveBeenCalled();
   });
 
   it('re-throws without hard reset when repo is not a dedicated clone', async () => {
+    mockClone({ merge: new Error('Not possible to fast-forward, aborting.') });
+    const clone = mockGit.revparse.getMockImplementation()!;
     mockGit.revparse.mockImplementation(async (args: any) => {
       const a = Array.isArray(args) ? args : [args];
-      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
-      if (a[0] === '--show-toplevel') return '/tmp';
-      return '';
+      return a[0] === '--show-toplevel' ? '/tmp' : clone(args);
     });
-    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
     await expect(pullRepo('/tmp/x')).rejects.toThrow('fast-forward');
-    expect(mockGit.fetch).not.toHaveBeenCalled();
     expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
   });
 
   it('warns when the realign discards local commits', async () => {
-    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
-    mockGit.raw.mockResolvedValue('2\n');
+    mockClone({ merge: new Error('Not possible to fast-forward, aborting.') });
+    const clone = mockGit.raw.getMockImplementation()!;
+    mockGit.raw.mockImplementation(async (args: string[]) => (args[0] === 'rev-list' ? '2\n' : clone(args)));
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('reset to origin (diverged)');
     const { log: testLog } = await import('../utils/logger.js');
@@ -844,20 +878,21 @@ describe('pullRepo', () => {
 describe('pullRepoFastForward', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockClone();
+    mockGit.fetch.mockResolvedValue(undefined);
   });
 
-  it('returns already up to date on empty ff-only pull', async () => {
-    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+  it('returns already up to date when the merge moves nothing', async () => {
     await expect(pullRepoFastForward('/tmp/x')).resolves.toBe('already up to date');
-    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', REFSPEC]);
+    expect(mockGit.raw).toHaveBeenCalledWith(MERGE);
+    expect(mockGit.pull).not.toHaveBeenCalled();
     expect(mockGit.reset).not.toHaveBeenCalled();
-    expect(mockGit.fetch).not.toHaveBeenCalled();
   });
 
   it('never hard-resets when ff-only fails', async () => {
-    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    mockClone({ merge: new Error('Not possible to fast-forward, aborting.') });
     await expect(pullRepoFastForward('/tmp/x')).rejects.toThrow('fast-forward');
-    expect(mockGit.fetch).not.toHaveBeenCalled();
     expect(mockGit.reset).not.toHaveBeenCalled();
   });
 });

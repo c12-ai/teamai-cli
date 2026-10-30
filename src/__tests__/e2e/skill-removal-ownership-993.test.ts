@@ -140,7 +140,8 @@ describe('teamai deletes only its own skill directories (#993)', () => {
     expect(read(path.join(m.dir, '.claude', 'skills', 'my-ns', 'fe-skill', 'SKILL.md'))).toBe(MY_SKILL);
   });
 
-  it('teamai remove deletes teamai\'s copies of the skill and keeps the member\'s own, naming it', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('teamai remove deletes teamai\'s copies of the skill and keeps the member\'s own, naming it', () => {
     const m = machine('remove', TEAM, { '.claude/skills/fe-skill/SKILL.md': MY_SKILL });
     const mine = path.join(m.dir, '.claude', 'skills', 'fe-skill');
     const codex = path.join(m.dir, '.codex', 'skills', 'fe-skill');
@@ -152,7 +153,8 @@ describe('teamai deletes only its own skill directories (#993)', () => {
     expect(removed.output).toContain(notTeamais(mine, 'remove'));
   });
 
-  it('keeps a member\'s link inside a delivered skill through pull, remove and uninstall, and a link at a built-in\'s name', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps a member\'s link inside a delivered skill through pull, remove and uninstall, and a link at a built-in\'s name', () => {
     // A team skill with a CLI built-in's name, which teamai remove reaches.
     const m = machine('links', { ...TEAM, 'skills/team-wiki-codebase/SKILL.md': skillMd('team-wiki-codebase', 'Team wiki.') }, {});
     const codex = path.join(m.dir, '.codex', 'skills', 'fe-skill');
@@ -220,7 +222,8 @@ describe('teamai deletes only its own skill directories (#993)', () => {
     expect(removed.output).toContain(`Kept ${builtin}`);
   });
 
-  it('teamai uninstall deletes teamai\'s copies of team skills and keeps the member\'s own, naming it', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('teamai uninstall deletes teamai\'s copies of team skills and keeps the member\'s own, naming it', () => {
     const m = machine('uninstall', TEAM, { '.claude/skills/fe-skill/SKILL.md': MY_SKILL });
     const mine = path.join(m.dir, '.claude', 'skills', 'fe-skill');
     const codex = path.join(m.dir, '.codex', 'skills', 'fe-skill');

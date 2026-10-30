@@ -264,7 +264,8 @@ describe('local-agent rules (#993)', () => {
     }
   });
 
-  it('uninstall_rule removes the copy the local agent installed and keeps a member\'s file at that path', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('uninstall_rule removes the copy the local agent installed and keeps a member\'s file at that path', async () => {
     const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-993-local-agent-rules-')));
     sandboxes.push(sandbox);
     const home = path.join(sandbox, 'home');

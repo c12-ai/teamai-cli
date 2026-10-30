@@ -10,7 +10,7 @@ import { resolveEffectiveUpdatePolicy } from './update-policy.js';
 import { resolveTeamaiEntryScript } from './builtin-hooks.js';
 import { log } from './utils/logger.js';
 import { expandHome, ensureDir } from './utils/fs.js';
-import { getTeamaiHomeDir, getUpdateLockPath } from './types.js';
+import { getTeamaiHomeDir, getUpdateLockPath, projectOnlyRequested } from './types.js';
 import { askConfirmation, isInteractive } from './utils/prompt.js';
 
 // `getCurrentVersion` and `getCurrentPackageName` live in `./package-info.ts`
@@ -678,6 +678,13 @@ export async function checkForUpdate(options?: { force?: boolean; dryRun?: boole
  * Perform the actual update (check + install based on policy)
  */
 export async function doUpdate(): Promise<void> {
+  // Project-only mode (c12 fork): the project pins teamai (a launcher installs
+  // one release into the project), so nothing here replaces it: not the stop
+  // hook, not `teamai update`. The project's own installer upgrades it.
+  if (projectOnlyRequested()) {
+    log.info(`teamai v${getCurrentVersion()} is pinned by this project (TEAMAI_PROJECT_ONLY); update it through the project's pin.`);
+    return;
+  }
   const result = await checkForUpdate();
   if (!result.available) {
     log.info(`Already up to date (v${result.current})`);

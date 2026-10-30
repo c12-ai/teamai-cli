@@ -66,6 +66,7 @@ vi.mock('../utils/fs.js', () => ({
 vi.mock('../types.js', () => ({
   getUpdateLockPath: () => '/tmp/test-update-lock',
   getTeamaiHomeDir: () => '/home/test/.teamai',
+  projectOnlyRequested: () => process.env.TEAMAI_PROJECT_ONLY === '1',
 }));
 
 vi.mock('../builtin-hooks.js', () => ({
@@ -386,6 +387,22 @@ describe('doUpdate', () => {
     expect(mockedLog.success).toHaveBeenCalledWith(
       expect.stringContaining('Updated teamai to v99.0.0'),
     );
+  });
+
+  // C12 fork: a project-only install is pinned by its project. The stop hook
+  // runs doUpdate in the background, and a global config is absent there, so
+  // the policy would read 'auto' and replace the pinned release.
+  it('never queries the registry or installs in project-only mode', async () => {
+    vi.stubEnv('TEAMAI_PROJECT_ONLY', '1');
+    try {
+      mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
+      await doUpdate();
+      expect(mockedExecSync).not.toHaveBeenCalled();
+      expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('pinned by this project'));
+    } finally {
+      vi.unstubAllEnvs();
+      mockedExecSync.mockReset();
+    }
   });
 
   // ─── Test #8: Policy=prompt + non-TTY (hook context) ───

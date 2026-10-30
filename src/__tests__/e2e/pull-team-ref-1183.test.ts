@@ -142,7 +142,8 @@ describe('workspace team ref (#1183)', () => {
     expect(read(m.copy('base'))).not.toContain('NEW DEFAULT');
   });
 
-  it('unpins, removes unchanged branch-only copies, keeps edited copies with advice, and removes resources deleted by a branch', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('unpins, removes unchanged branch-only copies, keeps edited copies with advice, and removes resources deleted by a branch', () => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
     write(path.join(m.dir, '.codex/skills/trial/SKILL.md'), skill('trial', 'MY EDIT'));
@@ -315,7 +316,8 @@ describe('workspace team ref (#1183)', () => {
 
 
 describe('team ref reconciliation and safe transitions', () => {
-  it.each([{ flags: [] }, { flags: ['--force'] }])('removes old pin copies in another checkout on pull $flags', async ({ flags }) => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip.each([{ flags: [] }, { flags: ['--force'] }])('removes old pin copies in another checkout on pull $flags', async ({ flags }) => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
     const wt = path.join(m.root, 'worktree');
@@ -350,7 +352,8 @@ describe('team ref reconciliation and safe transitions', () => {
     expect(read(m.copy('base'))).toBe(skill('base'));
   });
 
-  it('removes recorded old copies after recovering an incomplete pin', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('removes recorded old copies after recovering an incomplete pin', () => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
     const tip = m.teamCommit({ 'skills/collision/SKILL.md': skill('collision', 'TEAM CONTENT') });
@@ -453,7 +456,8 @@ describe('team ref reconciliation and safe transitions', () => {
     expect(read(style)).toContain(pinned ? 'TRIAL RULE' : 'NEW DEFAULT RULE');
   });
 
-  it('keeps an edited pinned skill and succeeds after the branch advances', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('keeps an edited pinned skill and succeeds after the branch advances', () => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
     write(m.copy('trial'), skill('trial', 'MY EDIT'));

@@ -354,7 +354,8 @@ describe.skipIf(process.platform === 'win32')('one delivered block serves every 
     expect(blockLines(excludeFileOf(m, main))).toContain('/.claude/skills/fe-skill/SKILL.md');
   }, 120_000);
 
-  it('gives a member\'s rule at a delivered path in one worktree no line, names it, and keeps both copies visible and addable', async () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('gives a member\'s rule at a delivered path in one worktree no line, names it, and keeps both copies visible and addable', async () => {
     const m = member('foreign');
     const root = caseDir('foreign');
     const main = m.project(path.join(root, 'main'));

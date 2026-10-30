@@ -244,7 +244,8 @@ export function getRecallSharing(config: { sharing?: { recall?: { enabled?: bool
 /**
  * Resolve whether pull keeps what it delivers into a project out of git
  * (#915): the member's `gitExcludeEnabled` in the partition config > the
- * team's `sharing.gitExclude.enabled` > default (false). A checkout still on
+ * team's `sharing.gitExclude.enabled` > default (false; on in project-only
+ * mode, c12 fork). A checkout still on
  * the un-migrated layout reads its own config from `<projectRoot>/.teamai/`,
  * and its worktrees each have one: that member value is not read, so no single
  * checkout decides for the exclude file they share.
@@ -254,7 +255,9 @@ export function isGitExcludeEnabled(
   teamConfig: { sharing?: { gitExclude?: { enabled?: boolean } } },
 ): boolean {
   const member = isUnmigratedDataHome(localConfig) ? undefined : localConfig.gitExcludeEnabled;
-  return member ?? teamConfig.sharing?.gitExclude?.enabled ?? false;
+  // Project-only mode (c12 fork) promises that what teamai delivers stays
+  // untracked, so there the default is on.
+  return member ?? teamConfig.sharing?.gitExclude?.enabled ?? (localConfig.scope === 'project' && projectOnlyRequested());
 }
 
 /**
@@ -815,6 +818,12 @@ export const LocalConfigSchema = z.object({
     remote: z.string(),
     /** Ref this workspace follows, exactly as passed to pull --team-ref. */
     ref: z.string().optional(),
+    /**
+     * Team repo branch this member tracks, set by `init --branch` (git clones
+     * only). Absent = the remote's default branch. Pull, PR bases and every
+     * other "team main" lookup follow it via the clone's origin/HEAD.
+     */
+    branch: z.string().min(1).optional(),
     /**
      * Team repo backend. Defaults to 'git' for backward compatibility.
      * - 'git':  a standalone team repo cloned to <home>/team-repo.
@@ -3008,6 +3017,7 @@ export function scopedToolPaths(
   at?: HomePaths,
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
   const generationAdjusted = applyWorkBuddyGeneration(teamConfig.toolPaths, localConfig);
+  if (isProjectOnly(localConfig)) return projectOnlyToolPaths(generationAdjusted);
   if (localConfig.scope !== 'user') return generationAdjusted;
   const rooted = applyToolRoots(generationAdjusted, localConfig.toolRoots, at);
   const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
@@ -3037,6 +3047,42 @@ export function scopedToolPaths(
   // `userScope.skills` carrying the default `.workbuddy/skills` restores the
   // unread old path over the adjusted one (#1290).
   return applyWorkBuddyGeneration(out, localConfig);
+}
+
+/**
+ * Project-only mode (c12 fork): `TEAMAI_PROJECT_ONLY=1` with a project-scope
+ * config. Everything teamai writes for the agents stays in the project's
+ * untracked files: hooks go to the project's own hook file instead of HOME,
+ * no git hook is installed, and no git-tracked file is written. For a checkout
+ * whose agent config is shared through a container while HOME belongs to the
+ * host user.
+ */
+export function isProjectOnly(localConfig: { scope?: Scope }): boolean {
+  return localConfig.scope === 'project' && projectOnlyRequested();
+}
+
+/** `TEAMAI_PROJECT_ONLY` is set, for code that runs before a config exists (the init clone). */
+export function projectOnlyRequested(): boolean {
+  return process.env.TEAMAI_PROJECT_ONLY === '1' || process.env.TEAMAI_PROJECT_ONLY === 'true';
+}
+
+/**
+ * Tool paths in project-only mode. Claude Code reads the untracked
+ * `.claude/settings.local.json` next to the shared settings file, so its hooks
+ * go there. Every other tool's project hook file is one the project commits
+ * (Codex: `.codex/hooks.json`), so those tools get no hook file at all.
+ */
+function projectOnlyToolPaths(
+  toolPaths: Record<string, z.infer<typeof ToolPathsSchema>>,
+): Record<string, z.infer<typeof ToolPathsSchema>> {
+  const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    const { settings, hooks: _hooks, ...rest } = paths;
+    out[tool] = tool === CLAUDE_TOOL_ID && settings
+      ? { ...rest, settings: path.join(path.dirname(settings), 'settings.local.json') }
+      : rest;
+  }
+  return out;
 }
 
 /** True when the local config is single-repo mode (the business repo is the team repo). */
@@ -3310,7 +3356,8 @@ export function resolveHookScope(
   localConfig: LocalConfig,
 ): { baseDir: string; manifestPath: string; scope: Scope } {
   const selfWithRoot = isSelfMode(localConfig) && !!localConfig.projectRoot;
-  if (localConfig.scope === 'project' && !selfWithRoot) {
+  const projectOnly = isProjectOnly(localConfig) && !!localConfig.projectRoot;
+  if (localConfig.scope === 'project' && !selfWithRoot && !projectOnly) {
     // Hooks resolve to HOME here, so the tool paths must be resolved at *user*
     // scope too: a tool whose user-scope prefix differs from its project-scope
     // one (OpenCode, Qoder CN) would otherwise be written under the project
@@ -3383,7 +3430,7 @@ export function resolveLegacyProjectHookScope(
   localConfig: LocalConfig,
 ): { baseDir: string; manifestPath: string; scope: Scope } | null {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return null;
-  if (isSelfMode(localConfig)) return null;
+  if (isSelfMode(localConfig) || isProjectOnly(localConfig)) return null;
   if (path.resolve(localConfig.projectRoot) === path.resolve(getUserHome())) return null;
   return {
     baseDir: localConfig.projectRoot,

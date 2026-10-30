@@ -19,7 +19,7 @@ import { getFileContentAtRev, isPastVersionOf, listFilesAtRev } from '../utils/g
 import { historicalVersions } from '../utils/team-history.js';
 import {
   adoptRecord, contentHash, describeMembersDirLeft, describeMembersLink, forgetDelivered, holdsNonRegular, isLink, isTeamaiCopy, keepsEditedCopy, openLedger, recordDelivered, recordedUnchanged,
-  judgeRemoval, keepsTrackedCopy, reportKept,
+  judgeRemoval, keepsTrackedCopy, removesEditedCopy, reportKept,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
 import {
@@ -535,12 +535,14 @@ export class RulesHandler extends ResourceHandler {
           const source = await readFileSafe(item.sourcePath);
           if (source === null || disk !== contentHash(source)) continue;
         } else if (disk !== recorded) {
-          // Named by the caller's reportKept; a render unchanged since
-          // delivery is the member's plain edit, which needs no word.
-          if (contentHash(content) !== recorded && await keepsEditedCopy(ledger, item, target)) {
+          // A render unchanged since delivery is the member's plain edit, which
+          // this pass leaves to the full sync. Otherwise the team version
+          // replaces the edit (c12 fork), and the caller's reportKept names it.
+          if (contentHash(content) === recorded) continue;
+          if (await keepsEditedCopy(ledger, item, target)) {
             await warnIfKeptCopyIsInert(target);
+            continue;
           }
-          continue;
         }
         await writeFile(dest, content);
         await recordDelivered(ledger.hashes, dest);
@@ -917,12 +919,8 @@ export class RulesHandler extends ResourceHandler {
           // rule, which needs no word.
           const teamFile = `rules/${ruleName}.md`;
           const removal = await judgeRemoval(ledger?.previous, fullPath, ruleOrigin(tool, localConfig.repo.localPath, teamFile), ledger?.otherRecords);
-          if (removal === 'edited') {
-            if (!tombstones.has(ruleName)) {
-              log.warn(`Kept ${fullPath}: teamai no longer delivers ${ruleName} here, but you changed this copy. Delete it when you no longer need it.`);
-            }
-            continue;
-          }
+          // A copy the member changed goes too (c12 fork).
+          if (removal === 'edited') removesEditedCopy(fullPath);
           if (removal === 'notTeamais') {
             const wasTeamRule = ((await historicalVersions(localConfig.repo.localPath, teamFile))?.length ?? 0) > 0;
             if (wasTeamRule && !tombstones.has(ruleName)) log.warn(describeMembersDirLeft(fullPath, teamFile, 'pull'));

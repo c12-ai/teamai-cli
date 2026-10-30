@@ -26,6 +26,7 @@ import {
   DEFAULT_CODEX_ROOT,
   MUSE_TOOL_ID,
   getDataHome,
+  isProjectOnly,
   isGitExcludeEnabled,
   getTeamaiHome,
   isAgentExcluded,
@@ -980,6 +981,8 @@ export async function resolveMainCheckoutHooks(
   toolPaths: Record<string, { settings?: string }>,
 ): Promise<MainCheckoutHooks | null> {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot || isSelfMode(localConfig)) return null;
+  // Project-only mode writes every hook into this checkout's own files.
+  if (isProjectOnly(localConfig)) return null;
   const { root, worktreeScoped } = await mainCheckoutOf(localConfig.projectRoot);
   if (root === canonicalProjectRoot(getUserHome())) return null;
   const files = Object.fromEntries(MAIN_CHECKOUT_TEAM_HOOK_TOOLS.flatMap((tool) => {
@@ -3994,7 +3997,7 @@ export async function reconcileTeamHooksForConfig(
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,
-    teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
+    teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig) && !isProjectOnly(localConfig)
       ? localConfig.projectRoot
       : undefined,
     ...(localConfig.children ? { teamHookChildRoots: localConfig.children.roots } : {}),
@@ -4127,6 +4130,14 @@ async function projectHookFiles(
   if (selfLocal && ((await readManifest(selfManifest)).claude?.length ?? 0) > 0) {
     files.push({ file: selfLocal, tool: 'claude', manifestPath: selfManifest });
   }
+  // Project-only mode (c12 fork): every hook teamai writes is in the project's
+  // own settings file (Claude's `.claude/settings.local.json`).
+  if (isProjectOnly(localConfig)) {
+    const { baseDir } = resolveHookScope(localConfig);
+    for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (paths.settings) files.push({ file: path.join(baseDir, paths.settings), tool, manifestPath: getManagedHooksPath(localConfig) });
+    }
+  }
   const copilotHooks = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks;
   if (copilotHooks) {
     files.push({
@@ -4196,6 +4207,14 @@ export async function judgeTeamaiOnlyCodexHooks(
  */
 async function installProjectGitHook(localConfig: LocalConfig, opts: { dryRun?: boolean } = {}): Promise<void> {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return;
+  if (isProjectOnly(localConfig)) {
+    // Project-only mode installs no git hook, and drops one an earlier run left.
+    if (!opts.dryRun) {
+      const { removeGitHook } = await import('./git-hook.js');
+      await removeGitHook(localConfig.projectRoot);
+    }
+    return;
+  }
   const { installGitHook } = await import('./git-hook.js');
   let result: Awaited<ReturnType<typeof installGitHook>>;
   try {

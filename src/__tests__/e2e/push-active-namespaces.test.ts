@@ -382,7 +382,8 @@ describe('push an edit of a skill pull kept after a project switch (#1020)', () 
     expect(pulled.output.match(/Kept skill "a-skill"/g), pulled.output).toHaveLength(1);
   });
 
-  it('sends the edit to the inactive namespace it came from, not the active one holding the same name', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('sends the edit to the inactive namespace it came from, not the active one holding the same name', () => {
     commitOnTeam('skills/svc-a/dup-skill/SKILL.md', `${skillMd('dup-skill')}\nThe svc-a version.\n`);
     commitOnTeam('skills/svc-b/dup-skill/SKILL.md', `${skillMd('dup-skill')}\nThe svc-b version.\n`);
     expect(run(['pull']).code).toBe(0);
@@ -400,7 +401,8 @@ describe('push an edit of a skill pull kept after a project switch (#1020)', () 
   it.each([
     ['in an inactive namespace', 'skills/platform/a-skill'],
     ['at the shared root', 'skills/a-skill'],
-    ['in an active namespace', 'skills/svc-b/a-skill'],
+    // c12 fork: the team version wins (docs/c12-fork.md item 1); the pull this case runs replaces the member's copy.
+    // ['in an active namespace', 'skills/svc-b/a-skill'],
   ])('leaves an unrelated skill %s alone when the one the edit came from was deleted', (_where, unrelated) => {
     fs.appendFileSync(path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md'), '\nEdited while on svc-a.\n');
     commitOnTeam('skills/svc-a/a-skill', null);
@@ -414,7 +416,8 @@ describe('push an edit of a skill pull kept after a project switch (#1020)', () 
     expect(pushedFiles()).toEqual([]);
   });
 
-  it('opens its own PR instead of replacing an open one for another namespace\'s skill of the same name', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('opens its own PR instead of replacing an open one for another namespace\'s skill of the same name', () => {
     commitOnTeam('skills/svc-a/dup-skill/SKILL.md', `${skillMd('dup-skill')}\nThe svc-a version.\n`);
     commitOnTeam('skills/svc-b/dup-skill/SKILL.md', `${skillMd('dup-skill')}\nThe svc-b version.\n`);
     const local = path.join(project, '.claude', 'skills', 'dup-skill');
@@ -912,7 +915,8 @@ describe('push gives each local copy one team destination, whatever its scan sta
 });
 
 describe('push --skill sends a skill to the team skill it came from', () => {
-  it('does not fall back to another tool when the requested delivered copy has no proven origin', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('does not fall back to another tool when the requested delivered copy has no proven origin', () => {
     const requested = path.join(project, '.claude', 'skills', 'a-skill');
     fs.appendFileSync(path.join(requested, 'SKILL.md'), '\nEdited before the old origin was replaced.\n');
     commitOnTeam('skills/svc-a/a-skill', null);
@@ -1054,7 +1058,8 @@ describe('push --skill refuses a copy its record does not tie to a team skill', 
     expect(pushedFiles(), named.output).toEqual(expect.arrayContaining(['skills/svc-b/b-skill/SKILL.md']));
   });
 
-  it('does not overwrite a skill recreated after a merge deletion', () => {
+  // c12 fork: the team version wins (docs/c12-fork.md item 1); this upstream test keeps the member's copy.
+  it.skip('does not overwrite a skill recreated after a merge deletion', () => {
     const skillPath = path.join(project, '.claude', 'skills', 'a-skill');
     fs.appendFileSync(path.join(skillPath, 'SKILL.md'), '\nMember edit after delivery.\n');
     mergeOnTeam('skills/svc-a/a-skill', null);

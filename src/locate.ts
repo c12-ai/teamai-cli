@@ -17,7 +17,7 @@ import {
   type RunTimeVia,
 } from './tools.js';
 import {
-  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, recordedToolRootDir, resolveBaseDir, scopedToolPaths, toolGateRoot,
+  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, projectOnlyRequested, recordedToolRootDir, resolveBaseDir, scopedToolPaths, toolGateRoot,
   WORKBUDDY_NEW_GENERATION_ROOT, WORKBUDDY_TOOL_ID, WORKBUDDY_TOOL_ROOT,
   type HomePaths, type LocalConfig, type Scope, type TeamaiConfig, type ToolId,
 } from './types.js';
@@ -551,8 +551,14 @@ async function readGatesOf(kinds: readonly ReadGateKind[] | undefined, install: 
   const user = await userViewOf(install, host);
   return kinds.map((kind): ReadGate => {
     switch (kind) {
-      case 'codex-project-trust':
-        return { kind, config: rootsOf('codex', user, host).declared('home', '.codex/config.toml'), checkout: install.projectRoot };
+      case 'codex-project-trust': {
+        // Project-only mode (c12 fork): teamai's own CODEX_HOME is private to
+        // it, so the launcher names the Codex home the member's Codex reads.
+        // Only doctor reads this file, never writes it.
+        const memberHome = projectOnlyRequested() ? process.env.TEAMAI_MEMBER_CODEX_HOME : undefined;
+        const config = memberHome ? host.path.join(memberHome, 'config.toml') : rootsOf('codex', user, host).declared('home', '.codex/config.toml');
+        return { kind, config, checkout: install.projectRoot };
+      }
       default: {
         const unhandled: never = kind;
         return unhandled;
@@ -825,6 +831,10 @@ async function localScopeOf(
   const projectKey = scope.key === 'git-common-root' ? await claudeProjectKey(install.projectRoot, host) : await host.realpath(install.projectRoot);
   const place: EntryPlace = { kind: 'entry', path: file, key: tree.key, projectKey };
   if (!(install.gitExclude || install.workspaceChildren) || (scope.key === 'git-common-root' && install.repo === 'self')) return { place, inUse: false };
+  // Project-only mode (c12 fork): teamai's HOME is private to it, and the
+  // member's tools never read its user MCP file. The servers stay in the
+  // project's file, which pull lists in the `delivered` exclude block.
+  if (projectOnlyRequested()) return { place, inUse: false };
   return { place, inUse: !await readByAnotherTool(tool, install, host, tree) };
 }
 

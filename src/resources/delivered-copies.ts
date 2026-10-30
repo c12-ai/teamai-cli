@@ -67,6 +67,8 @@ export interface DeliveryLedger {
   readonly kept: { dest: string; teamRelPath: string; teamChanged: boolean }[];
   /** Files with no record that pull left as the member's, and the team resource each holds back (#993). */
   readonly members: { dest: string; teamRelPath: string; link?: true }[];
+  /** Copies the team version replaced (c12 fork: the team always wins), named once each by reportKept. */
+  readonly replaced: { dest: string; teamRelPath: string; replaces: ReplacedEntry }[];
   /**
    * What the state's other checkout records say teamai wrote at each path. A
    * record lost to a new key (a restored or copied `.git`, #993) still names
@@ -110,6 +112,7 @@ export function openLedger(
     hashes: { ...previous },
     kept: [],
     members: [],
+    replaced: [],
     otherRecords,
     held: [],
     failed: [],
@@ -560,30 +563,51 @@ async function overwritesMembersFile(previous: DeliveredHashes, item: ResourceIt
   return false;
 }
 
+/** What the team version replaced at a delivered path (c12 fork). */
+export type ReplacedEntry = 'symlink' | 'tracked' | 'foreign' | 'edited';
+
 /**
- * Whether pull leaves `target`'s copy alone: the member changed it, or it is
- * not teamai's. reportKept names it: as an edit when another checkout record
- * shows teamai wrote that path (a record lost to a new key), else as the
- * member's own file.
+ * Prepare `target` for pull to write the team version, and say whether pull
+ * leaves the copy alone: never (c12 fork). The team version replaces a
+ * same-named entry in every case: a copy the member edited, a link (removed
+ * first, so its target is never written through), a git-tracked file, or a
+ * file teamai did not deliver. Entries of the member's that would block the
+ * delivery (a link or an entry of the other type inside a skill) are removed
+ * too. reportKept names each replacement once. Upstream (#993) keeps all of
+ * these; the fork keeps that judgement (`judgeCopy`) and only acts on it here.
  */
 export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   const verdict = await judgeCopy(ledger.previous, item, target);
   if (verdict.kind === 'write') return false;
-  if (verdict.kind === 'keep') {
-    ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged });
-    return true;
+  const replaces: ReplacedEntry = await membersLinkAt(target.dest) !== null ? 'symlink'
+    : verdict.kind === 'keep' || recordedUnder(ledger.otherRecords, target.dest).length > 0 ? 'edited'
+      : (await gitTracks(target.dest)).kind === 'tracked' ? 'tracked' : 'foreign';
+  await clearForTeamVersion(item, target.dest);
+  ledger.replaced.push({ dest: target.dest, teamRelPath: item.relativePath, replaces });
+  return false;
+}
+
+/** Remove what would stop the team version landing at `dest` as written: links, and entries of the other type. */
+async function clearForTeamVersion(item: ResourceItem, dest: string): Promise<void> {
+  const existing = await fse.lstat(dest).catch(() => null);
+  if (existing === null) return;
+  if (existing.isSymbolicLink() || existing.isDirectory() !== (item.type === 'skills')) {
+    await fse.remove(dest);
+    return;
   }
-  // Named by the link itself: the one at the path, or the first inside the skill.
-  const link = await membersLinkAt(target.dest);
-  if (link !== null) {
-    ledger.members.push({ dest: link, teamRelPath: item.relativePath, link: true });
-  } else if (recordedUnder(ledger.otherRecords, target.dest).length > 0) {
-    const next = await nextHashes(ledger.otherRecords, item, target);
-    const teamChanged = [...next].some(([file, hash]) => hash !== (ledger.otherRecords[file] ?? null));
-    ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged });
-  } else {
-    ledger.members.push({ dest: target.dest, teamRelPath: item.relativePath });
-  }
+  if (item.type !== 'skills') return;
+  for (let link = await firstNonRegular(dest); link !== null; link = await firstNonRegular(dest)) await fse.remove(link);
+  for (const rel of await blockingEntries(dest, item.sourcePath)) await fse.remove(path.join(dest, ...rel.split('/')));
+}
+
+/**
+ * Whether a removal of the copy at `dest` goes ahead though the member changed
+ * it (c12 fork): a resource the team removed, or no longer delivers there, is
+ * removed even when edited, with one warning. `judgeRemoval`'s `edited` stays
+ * the judgement; the callers that sweep what the team no longer delivers ask this.
+ */
+export function removesEditedCopy(dest: string, scopeLabel?: string): true {
+  warnOnce(`${scopeLabel ? `[${scopeLabel}] ` : ''}Removed ${dest}: no longer in the team repo (local edits discarded)`);
   return true;
 }
 
@@ -701,6 +725,16 @@ export function reportKept(ledger: DeliveryLedger, scopeLabel: string): number {
     log.warn(`[${scopeLabel}] ${link ? describeMembersLink(dest, teamRelPath) : describeMembersFile(dest, teamRelPath)}`);
   }
   const named = new Set<string>();
+  for (const { dest, teamRelPath, replaces } of ledger.replaced.splice(0)) {
+    if (named.has(dest)) continue;
+    named.add(dest);
+    if (replaces === 'edited') {
+      log.warn(`[${scopeLabel}] Overwrote local edits in ${dest} with the team version`);
+      continue;
+    }
+    const what = { symlink: 'a symlink', tracked: 'tracked by git', foreign: 'not delivered by teamai' }[replaces];
+    log.warn(`[${scopeLabel}] Replaced ${dest} (${what}) with the team version ${teamRelPath}. Rename your own entry if it should not be overwritten.`);
+  }
   for (const { dest, teamRelPath, teamChanged } of ledger.kept.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);

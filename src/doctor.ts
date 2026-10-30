@@ -7,6 +7,7 @@ import { readWorkspaceChildren } from './workspace-children.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
 import { getUserHome } from './utils/home.js';
 import { log, setStderrOnly } from './utils/logger.js';
+import { tracksTeamBranch } from './utils/git.js';
 import type { GlobalOptions } from './types.js';
 import {
   COPILOT_TOOL_ID,
@@ -19,6 +20,7 @@ import {
   legacyManagedHooksPath,
   resolveToolBaseDir,
   isAgentExcluded,
+  isProjectOnly,
   scopedToolPaths,
   toolGateRoot,
   getDataHome,
@@ -699,6 +701,12 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       },
       fix: 'Check teamai.yaml in team repo for syntax errors',
     },
+    ...(localConfig.repo.branch ? [{
+      name: `Team repo tracks branch ${localConfig.repo.branch}`,
+      source: 'local' as const,
+      check: async () => tracksTeamBranch(localConfig.repo.localPath, localConfig.repo.branch!),
+      fix: 'Run `teamai pull` to switch the team repo back to it',
+    }] : []),
     {
       // A contribution is kept locally when it cannot be published. Without
       // this check a member whose pushes are rejected queues notes forever and
@@ -800,7 +808,8 @@ function buildWorkspaceChildrenChecks(localConfig: LocalConfig): Check[] {
  * mentions itself. A project root outside git has no hook to report.
  */
 async function buildGitHookChecks(localConfig: LocalConfig, stage: CheckStage): Promise<Check[]> {
-  if (localConfig.scope !== 'project' || !localConfig.projectRoot) return [];
+  // Project-only mode installs no git hook (pull removes one).
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot || isProjectOnly(localConfig)) return [];
   const { gitHookStatus, describeMissingGitHook, readGitHookFailure, describeGitHookFailure } = await import('./git-hook.js');
   // A project root that no longer exists cannot be asked (git refuses the cwd).
   const status = stage === 'doctor' ? await gitHookStatus(localConfig.projectRoot).catch(() => null) : null;

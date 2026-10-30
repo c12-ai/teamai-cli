@@ -94,19 +94,13 @@ describe('a pull and the rules and instruction blocks of a moved home', () => {
     expect(notices()).toEqual([]);
   });
 
-  it('keeps the old rules directory on record while an edited copy holds a rule back at the new one', async () => {
+  // c12 fork: the team version replaces the member's same-named rule, so the move completes.
+  it('replaces a file of the member\'s at the new rules directory and records only that directory (c12 fork)', async () => {
     await fse.outputFile(path.join(after, 'rules', 'style.md'), 'The member\'s own style.\n');
 
     await pull({});
 
-    expect(await fse.readFile(path.join(after, 'rules', 'style.md'), 'utf8')).toContain('member\'s own');
-    expect(notices().filter((line) => line.includes('team rules'))).toEqual([]);
-    expect(recorded('rules')).toEqual([[path.join(before, 'rules'), path.join(after, 'rules')]]);
-
-    await fse.remove(path.join(after, 'rules', 'style.md'));
-    await pull({});
-
-    expect(await fse.pathExists(path.join(after, 'rules', 'style.md'))).toBe(true);
+    expect(await fse.readFile(path.join(after, 'rules', 'style.md'), 'utf8')).not.toContain('member\'s own');
     expect(recorded('rules')).toEqual([[path.join(after, 'rules')]]);
   });
 });

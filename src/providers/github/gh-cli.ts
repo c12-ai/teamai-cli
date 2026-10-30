@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { log } from '../../utils/logger.js';
 import { resolveCliPath } from '../../utils/cli-path.js';
 import { isInteractive } from '../../utils/prompt.js';
+import { projectOnlyRequested } from '../../types.js';
 import type { PullRequestRef } from '../types.js';
 
 // ─── Constants ───────────────────────────────────────────
@@ -391,13 +392,26 @@ export function ghRepoClone(repo: string, localPath: string): void {
 
   // `-c <key>=<val>` is a git-level option, so it must precede `clone`.
   const args: string[] = [];
-  if (token) {
+  let env = process.env;
+  if (token && projectOnlyRequested()) {
+    // Project-only mode (c12 fork): the header goes in the child's
+    // environment, never its argv, which other users of a shared host can
+    // read. Appended to any GIT_CONFIG_* entries the caller already passes.
+    const n = Number(process.env.GIT_CONFIG_COUNT ?? 0) || 0;
+    env = {
+      ...process.env,
+      GIT_CONFIG_COUNT: String(n + 1),
+      [`GIT_CONFIG_KEY_${n}`]: 'http.https://github.com/.extraHeader',
+      [`GIT_CONFIG_VALUE_${n}`]: ghAuthHeader(token),
+    };
+  } else if (token) {
     args.push('-c', `http.extraHeader=${ghAuthHeader(token)}`);
   }
   args.push('clone', cloneUrl, localPath);
 
   const result = spawnSync('git', args, {
     encoding: 'utf-8',
+    env,
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 120_000,
     windowsHide: true,

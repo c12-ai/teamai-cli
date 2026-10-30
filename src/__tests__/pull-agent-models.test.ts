@@ -263,7 +263,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
     expect((await homeRecord())?.agentModels?.['implementer']?.['claude']).toEqual({ step: 'team', model: 'fable', source: 'models/aliases.yaml', alias: 'strong' });
   });
 
-  it('keeps a copy the member changed, and its record', async () => {
+  // c12 fork: the team version wins, so an edited copy takes the new model too.
+  it('overwrites a copy the member changed with the team version and its new model (c12 fork)', async () => {
     await writeAliases(STRONG);
     await writeAgent(IMPLEMENTER);
     await pullOnce();
@@ -274,11 +275,12 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
     await pull({ silent: true });
 
     expect(alreadySynced()).toBe(true);
-    expect(await fse.readFile(claudeFile(), 'utf-8')).toBe(edited);
-    expect(logged('warn', /Kept .*implementer\.md: you changed it/)).toBe(true);
+    expect(await fse.readFile(claudeFile(), 'utf-8')).not.toContain('My own note.');
+    expect(await claudeModel()).toMatchObject({ model: 'fable' });
+    expect(logged('warn', /Overwrote local edits in .*implementer\.md with the team version/)).toBe(true);
     expect(await codexModel()).toMatchObject({ model: 'gpt-6-luna' });
     const recorded = (await homeRecord())?.agentModels?.['implementer'];
-    expect(recorded?.['claude']).toEqual({ step: 'team', model: 'opus', effort: 'high', source: 'models/aliases.yaml', alias: 'strong' });
+    expect(recorded?.['claude']).toMatchObject({ model: 'fable' });
     expect(recorded?.['codex']).toEqual({ step: 'team', model: 'gpt-6-luna', source: 'models/aliases.yaml', alias: 'strong' });
   });
 
@@ -310,19 +312,19 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       expect((await homeRecord())?.agentModels?.['implementer']?.['codex']).toEqual({ step: 'local', source: path.join(homeDir, '.teamai/models/aliases.yaml'), alias: 'strong' });
     });
 
-    it('says a kept copy\'s deployed version changed without blaming the team', async () => {
+    // c12 fork: nothing is kept; the edited copy takes the override's model.
+    it('overwrites an edited copy when the override changes its model (c12 fork)', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
       await fse.writeFile(claudeFile(), `${await fse.readFile(claudeFile(), 'utf-8')}\nMy own note.\n`);
-      // Codex's change is what makes the ordinary pull redeploy the agent;
-      // an edited copy alone is left to the full sync.
       await writeLocal('aliases:\n  strong:\n    claude: sonnet\n    codex: gpt-6-luna\n');
 
       await pull({ silent: true });
 
-      expect(logged('warn', /Kept .*implementer\.md: you changed it, and the version teamai would deploy there \(agents\/implementer\.yaml\) has changed since/)).toBe(true);
-      expect(logged('warn', /team version/)).toBe(false);
+      expect(await claudeModel()).toMatchObject({ model: 'sonnet' });
+      expect(await fse.readFile(claudeFile(), 'utf-8')).not.toContain('My own note.');
+      expect(logged('warn', /Overwrote local edits in .*implementer\.md/)).toBe(true);
     });
 
     it('applies in a project checkout too', async () => {
@@ -733,7 +735,8 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
   describe('what the fast path says it did', () => {
     const writeLocal = (text: string): Promise<void> => fse.outputFile(path.join(homeDir, '.teamai/models/aliases.yaml'), text);
 
-    it('keeps a copy the member changed on the fast path, and names it with the step that takes the new model', async () => {
+    // c12 fork: the fast path replaces the edited copy as the full sync would.
+    it('overwrites a copy the member changed on the fast path when its model changes (c12 fork)', async () => {
       await writeAliases(STRONG);
       await writeAgent(IMPLEMENTER);
       await pullOnce();
@@ -741,21 +744,12 @@ describe('pull: recorded agent models on an unchanged team revision', () => {
       await fse.writeFile(claudeFile(), edited);
       await writeLocal('aliases:\n  strong:\n    claude: sonnet\n');
 
-      // Said on every pull while the copy stays edited, as nothing else would tell the member.
-      for (let i = 0; i < 2; i += 1) {
-        vi.clearAllMocks();
-        await pull({ silent: true });
-        expect(alreadySynced()).toBe(true);
-        expect(logged('success', /Updated the model/)).toBe(false);
-        expect(logged('warn', /Kept .*implementer\.md: you changed it, .*`teamai pull --force`/)).toBe(true);
-      }
-      expect(await fse.readFile(claudeFile(), 'utf-8')).toBe(edited);
-
-      // The full sync still names it.
       vi.clearAllMocks();
-      vi.mocked(getHeadRev).mockResolvedValue('def5678');
       await pull({ silent: true });
-      expect(logged('warn', /Kept .*implementer\.md: you changed it/)).toBe(true);
+      expect(alreadySynced()).toBe(true);
+      expect(logged('warn', /Overwrote local edits in .*implementer\.md with the team version/)).toBe(true);
+      expect(await fse.readFile(claudeFile(), 'utf-8')).not.toContain('My own note.');
+      expect(await claudeModel()).toMatchObject({ model: 'sonnet' });
     });
 
     it('says it delivered an agent that had no copy, not that it updated its model', async () => {

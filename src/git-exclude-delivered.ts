@@ -32,6 +32,8 @@ import { log } from './utils/logger.js';
 export const WRITER_IDS = [
   'skills', 'rules', 'agents', 'docs', 'builtin', 'sources', 'instructions', 'hooks', 'coauthor', 'teamai-only',
   'workflow-skills',
+  // c12 fork: a project MCP file teamai writes in project-only mode (`.mcp.json`).
+  'mcp',
 ] as const;
 export type WriterId = (typeof WRITER_IDS)[number];
 

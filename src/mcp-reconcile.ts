@@ -13,6 +13,7 @@ import {
   DEFAULT_TOOL_PATHS,
   getMcpSharing,
   isAgentExcluded,
+  isProjectOnly,
   getDataHome,
   isGitExcludeEnabled,
   isSelfMode,
@@ -589,6 +590,12 @@ export async function resolveMcpTargets(
     // undetected view: it lists the files in the project, for the git exclusion of what an earlier pull wrote there.
     const tree = own.projectKey === undefined ? own : where.retired.find((retired) => retired.was === 'other-scope')?.place ?? own;
     const place = options.includeUndetected ? tree : own;
+    // Project-only mode never writes a file the project commits (Codex's
+    // `.codex/config.toml`); git failing to answer counts as committed (c12 fork).
+    if (isProjectOnly(localConfig) && (await gitTracks(place.path)).kind !== 'untracked') {
+      log.debug(`Skipping MCP sync for ${tool}: ${place.path} is tracked by git (project-only mode)`);
+      continue;
+    }
     // Muse Code reads the <root>/.mcp.json the claude target writes, so the
     // target stays while Muse runs here, in a project with no <root>/.claude
     // too, and takes Muse's transports while no Claude Code reads the file.

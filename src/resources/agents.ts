@@ -19,7 +19,7 @@ import { recordedNamespace } from '../utils/pending-push.js';
 import { itemCandidate, resolveNamespacedItems, type NamespaceResolution } from '../namespace-resolver.js';
 import { getFileContentAtRev, getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
 import {
-  describeMembersDirLeft, forgetDelivered, isLink, isTeamaiCopy, judgeRemoval, keepsEditedCopy, keepsTrackedCopy, recordDelivered, recordedUnchanged,
+  describeMembersDirLeft, forgetDelivered, isLink, isTeamaiCopy, judgeRemoval, keepsEditedCopy, keepsTrackedCopy, removesEditedCopy, recordDelivered, recordedUnchanged,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
 import { debugOnce, warnOnce } from '../utils/warn-once.js';
@@ -1796,10 +1796,8 @@ async function removeStaleAgentSiblings(
     if (agentStemFromFilename(file) !== stem || file === `${stem}${targetExt}`) continue;
     const sibling = path.join(agentsDir, file);
     const removal = await judgeRemoval(ledger?.previous, sibling, origin, ledger?.otherRecords);
-    if (removal === 'edited') {
-      warnOnce(`Kept ${sibling}: teamai no longer writes ${stem} in this format, but you changed this copy. Delete it when you no longer need it.`);
-      continue;
-    }
+    // A copy the member changed goes too (c12 fork).
+    if (removal === 'edited') removesEditedCopy(sibling);
     if (removal === 'notTeamais') {
       warnOnce(describeMembersDirLeft(sibling, `agents/${stem}`, 'pull'));
       continue;

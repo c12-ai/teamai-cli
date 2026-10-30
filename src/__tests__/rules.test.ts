@@ -661,7 +661,8 @@ scope: 'user',
       expect(await fse.readFile(personal, 'utf-8')).toBe('# Mine\n');
     });
 
-    it('drops a reclaimed copy from the delivered record and keeps the record of an edited one (#822)', async () => {
+    // c12 fork: a copy the team no longer delivers goes even when edited, record and all.
+    it('drops a reclaimed copy and an edited one, and their records (#822, c12 fork)', async () => {
       const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
       await fse.ensureDir(path.join(teamRulesDir, 'alpha'));
       await fse.writeFile(path.join(teamRulesDir, 'alpha/alpha-rule.md'), '# Alpha rule\n');
@@ -680,7 +681,8 @@ scope: 'user',
       await handler.pullAllRules(teamConfig, localConfig, [], [], ledger);
 
       expect(await fse.pathExists(reclaimed)).toBe(false);
-      expect(Object.keys(ledger.hashes)).toEqual([edited]);
+      expect(await fse.pathExists(edited)).toBe(false);
+      expect(Object.keys(ledger.hashes)).toEqual([]);
     });
 
     it('removes a namespace directory it empties', async () => {
@@ -1808,7 +1810,8 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     expect(Object.keys(ledger.hashes).filter((file) => file.endsWith('former.md'))).toEqual([]);
   });
 
-  it('re-renders a verbatim copy an older teamai delivered, and keeps one the member edited (#822)', async () => {
+  // c12 fork: the edited copy takes the team version too, and is named as replaced.
+  it('re-renders a verbatim copy an older teamai delivered, and the one the member edited (#822, c12 fork)', async () => {
     const kiroCopy = path.join(homeDir, '.kiro/steering/scoped.md');
     const qoderCopy = path.join(homeDir, '.qoder/rules/scoped.md');
     await fse.writeFile(kiroCopy, SCOPED);
@@ -1823,8 +1826,8 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
     await handler.pullAllRules(teamConfig, localConfig, undefined, [], ledger);
 
     expect(await fse.readFile(kiroCopy, 'utf-8')).toBe(KIRO);
-    expect(await fse.readFile(qoderCopy, 'utf-8')).toBe(edited);
-    expect(ledger.kept.map((kept) => kept.dest)).toEqual([qoderCopy]);
+    expect(await fse.readFile(qoderCopy, 'utf-8')).not.toContain('My own wording.');
+    expect(ledger.replaced.map((entry) => [entry.dest, entry.replaces])).toEqual([[qoderCopy, 'edited']]);
   });
 });
 

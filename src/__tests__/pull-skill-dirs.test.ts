@@ -225,19 +225,14 @@ describe('a pull and the homes the env moves', () => {
       expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.places?.skills?.hermes)).toEqual([[path.join(before, 'skills'), path.join(after, 'skills')]]);
     });
 
-    it('keeps the old copies and the old record while a file of the member\'s holds a skill back at the new directory', async () => {
+    // c12 fork: the team version replaces the member's same-named skill, so nothing holds the move back.
+    it('replaces a file of the member\'s at the new directory and completes the move in one pull (c12 fork)', async () => {
       await fse.outputFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'This is a member skill, unrelated to team deploy.\n');
 
       await pull({});
 
-      expect(await fse.readFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'utf8')).toContain('member skill');
-      expect(await fse.pathExists(path.join(before, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
-      expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.places?.skills?.hermes)).toEqual([[path.join(before, 'skills'), path.join(after, 'skills')]]);
-
-      await fse.remove(path.join(after, 'skills', 'deploy'));
-      await pull({});
-
-      expect(await fse.pathExists(path.join(after, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
+      expect(await fse.readFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'utf8')).not.toContain('member skill');
+      expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringMatching(/Replaced .*deploy \(not delivered by teamai\)/));
       expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.places?.skills?.hermes)).toEqual([[path.join(after, 'skills')]]);
     });
 
@@ -298,30 +293,14 @@ describe('a pull and the homes the env moves', () => {
       expect(await fse.pathExists(path.join(before, 'skills', 'deploy', 'SKILL.md'))).toBe(true);
     });
 
-    it('keeps on record the copies a held move wrote to the new directory, and names both directories when the tool moves on', async () => {
+    // c12 fork: with the member's file replaced, no move is held, so the record names one directory.
+    it('records only the new directory after replacing a file of the member\'s there (c12 fork)', async () => {
       await fse.outputFile(path.join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: r\n---\nReview.\n');
       await fse.outputFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'This is a member skill, unrelated to team deploy.\n');
       await pull({});
       expect(await fse.pathExists(path.join(after, 'skills', 'review', 'SKILL.md'))).toBe(true);
-      expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.places?.skills?.hermes)).toEqual([[path.join(before, 'skills'), path.join(after, 'skills')]]);
-      const third = path.join(tmp, 'hermes-c');
-      await fse.ensureDir(third);
-      await saveToolHomes({ ...recordedHomes(realHost()), hermes: third });
-      vi.stubEnv('HERMES_HOME', third);
-
-      await pull({});
-
-      expect(await fse.pathExists(path.join(third, 'skills', 'review', 'SKILL.md'))).toBe(true);
-      const leftFile = (noun: 'team rules' | 'instruction blocks', now: string, old: string): string =>
-        `[user] hermes takes the ${noun} from ${path.join(now, 'SOUL.md')} now, so teamai no longer updates them in ${path.join(old, 'SOUL.md')}. Delete them there once no tool reads it.`;
-      expect(notices()).toEqual([
-        leftFile('team rules', after, before),
-        leftFile('instruction blocks', after, before),
-        ...[before, after].map((dir) => `[user] hermes takes skills from ${path.join(third, 'skills')} now, so teamai no longer updates its copies in ${path.join(dir, 'skills')}. Delete them once no tool reads that directory.`),
-        leftFile('team rules', third, after),
-        leftFile('instruction blocks', third, after),
-      ]);
-      expect(await fse.readFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'utf8')).toContain('member skill');
+      expect(await fse.readFile(path.join(after, 'skills', 'deploy', 'SKILL.md'), 'utf8')).not.toContain('member skill');
+      expect(Object.values(saved.lastPullByWorkspace ?? {}).map((record) => record.places?.skills?.hermes)).toEqual([[path.join(after, 'skills')]]);
     });
 
     it('moves the record of a tool that took every skill while a file of the member\'s holds one back in another tool', async () => {
@@ -368,7 +347,8 @@ describe('a pull and the homes the env moves', () => {
         await fse.outputFile(deployIn(hermes), 'Member instructions\n');
       });
 
-      it('keeps the shared copies when the other tool moves in the same pull', async () => {
+      // c12 fork: the member's file in the moved tool's directory takes the team version.
+      it('replaces the member\'s file when the other tool moves in the same pull (c12 fork)', async () => {
         await saveToolHomes({ hermes, pi });
         vi.stubEnv('HERMES_HOME', hermes);
         vi.stubEnv('PI_CODING_AGENT_DIR', pi);
@@ -376,11 +356,10 @@ describe('a pull and the homes the env moves', () => {
         await pull({});
 
         expect(await fse.pathExists(deployIn(pi))).toBe(true);
-        expect(await fse.readFile(deployIn(hermes), 'utf8')).toBe('Member instructions\n');
-        expect(await fse.pathExists(deployIn(shared))).toBe(true);
+        expect(await fse.readFile(deployIn(hermes), 'utf8')).not.toBe('Member instructions\n');
       });
 
-      it('keeps the shared copies when the other tool moves in a later pull', async () => {
+      it('replaces the member\'s file when the other tool moves in a later pull (c12 fork)', async () => {
         await saveToolHomes({ hermes, pi: shared });
         vi.stubEnv('HERMES_HOME', hermes);
         await pull({});
@@ -390,8 +369,7 @@ describe('a pull and the homes the env moves', () => {
         await pull({});
 
         expect(await fse.pathExists(deployIn(pi))).toBe(true);
-        expect(await fse.readFile(deployIn(hermes), 'utf8')).toBe('Member instructions\n');
-        expect(await fse.pathExists(deployIn(shared))).toBe(true);
+        expect(await fse.readFile(deployIn(hermes), 'utf8')).not.toBe('Member instructions\n');
       });
     });
   });

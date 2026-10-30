@@ -532,7 +532,8 @@ describe('pull: an active namespace item replaces the root item of the same name
     // A path another team version has is not enough to call a file a leftover:
     // the member may have added a file of that name, in a namespace they never had.
     // With no record, that file is no team version, so the directory is the member's (#993).
-    it('keeps a skill directory with a file the member added at a path another version has, and names it', async () => {
+    // c12 fork: the team version replaces the skill; the member's added file is left beside it.
+    it('updates a skill directory with a file the member added at a path another version has, and names it (c12 fork)', async () => {
       commitTeamRepo(repoPath);
       // No record: every pull reads a state of its own.
       vi.mocked(loadStateForScope).mockImplementation(async () => StateSchema.parse({ lastPull: null }));
@@ -544,9 +545,9 @@ describe('pull: an active namespace item replaces the root item of the same name
       await pull({ force: true });
 
       expect(await read('.claude/skills/review/front-only.md')).toBe('my own notes\n');
-      expect(await read('.claude/skills/review/checklist.md')).toBe('root-only checklist\n');
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
-        `Kept ${path.join(homeDir, '.claude/skills/review')}: it is not teamai's`,
+      expect(await read('.claude/skills/review/checklist.md')).toBe('root checklist v2\n');
+      expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(
+        new RegExp(`Replaced ${path.join(homeDir, '.claude/skills/review').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(not delivered by teamai\\)`),
       ));
     });
 

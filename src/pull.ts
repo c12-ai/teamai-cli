@@ -9,7 +9,7 @@ import {
 } from './resources/desired.js';
 import type { IndexedSkills, UnreadableFile } from './utils/search-index.js';
 import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, refreshRoleAssignment, saveStateForScope, saveLocalConfigForScope } from './config.js';
-import { getHeadRev, getHeadCommit, createGit, getDefaultBranch, completeWorktreeList, gitCommonDir, isLiveCheckout, isLiveProjectCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
+import { getHeadRev, getHeadCommit, createGit, getDefaultBranch, completeWorktreeList, gitCommonDir, isLiveCheckout, isLiveProjectCheckout, listWorktrees, resolveAnchors, trackTeamBranch, tracksTeamBranch } from './utils/git.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { pendingLearningsDir } from './utils/pending-learnings.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
@@ -37,7 +37,7 @@ import { placesOf, placesRecordOf, placesUnmoved, recordPlaces, type PlacesRecor
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
-  blockingEntries, deliveredSkillFiles, describeMembersDirLeft, forgetDelivered, holdsNonRegular, judgeCopy, judgeRemoval, keepsTrackedCopy, notTeamaisReason, openLedger, recordedUnder, reportKept,
+  deliveredSkillFiles, describeMembersDirLeft, forgetDelivered, holdsNonRegular, judgeCopy, judgeRemoval, keepsTrackedCopy, removesEditedCopy, notTeamaisReason, openLedger, recordedUnder, reportKept,
   type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
@@ -59,6 +59,8 @@ import {
   isUsageReportEnabled,
   resolveGitExclude,
   isAgentExcluded,
+  isProjectOnly,
+  managedMcpManifestKey,
   scopedToolPaths,
   SYNC_LOCK_FILENAME,
   usesBranchWorktree,
@@ -214,6 +216,13 @@ async function refreshTeamRepo(
   }
   // The git-pull hook caps the fetch: git pull is waiting on it.
   const cap = options.fetchTimeoutMs === undefined ? undefined : AbortSignal.timeout(options.fetchTimeoutMs);
+  // `init --branch` (c12 fork): put the clone back on the tracked branch if
+  // anything moved it, unless a team ref pins this workspace.
+  const teamBranch = localConfig.repo.branch;
+  if (teamBranch && !options.dryRun && options.teamRef === undefined && localConfig.repo.ref === undefined
+    && !await tracksTeamBranch(localConfig.repo.localPath, teamBranch)) {
+    await trackTeamBranch(localConfig.repo.localPath, teamBranch);
+  }
   const transition = await transitionTeamRepo(localConfig, options, cap).catch((e: unknown) => {
     if (cap?.aborted) {
       const cause = new Error(`team repo fetch exceeded ${options.fetchTimeoutMs} ms, left to the detached pull`);
@@ -427,10 +436,8 @@ async function sweepSharedSkillCopies(
     if (BUILTIN_SKILL_NAMES.has(name) || !swept(name)) continue;
     const dir = path.join(sharedDir, name);
     const removal = await judgeRemoval(ledger?.previous, dir, skillOrigin(localConfig.repo.localPath, name), ledger?.otherRecords);
-    if (removal === 'edited') {
-      warnOnce(`[${scopeLabel}] Kept ${dir}: teamai no longer delivers ${name} here, but you changed this copy. Delete it when you no longer need it.`);
-      continue;
-    }
+    // A copy the member changed goes too (c12 fork).
+    if (removal === 'edited') removesEditedCopy(dir, scopeLabel);
     if (removal === 'notTeamais') {
       warnOnce(`[${scopeLabel}] ${describeMembersDirLeft(dir, `skills/${name}`, 'pull')}`);
       continue;
@@ -474,8 +481,8 @@ async function getExistingLocalNames(
 }
 
 /**
- * `--dry-run`: name each copy the sync would keep because the member changed
- * it (#822), and report each copy it would write to the ledger's recorder
+ * `--dry-run`: name each copy the sync would replace though the member changed
+ * it or teamai did not deliver it (c12 fork; upstream keeps those, #822), and report each copy it would write to the ledger's recorder
  * (#915), for the preview of the `delivered` block.
  */
 async function reportWouldKeep(
@@ -491,14 +498,15 @@ async function reportWouldKeep(
   for (const item of items) {
     for (const target of await handler.deliveryTargets(freshConfig, localConfig, item, received)) {
       const verdict = await judgeCopy(ledger.previous, item, target);
+      // The team version replaces both (c12 fork).
       if (verdict.kind === 'keep') {
-        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: you changed it since teamai delivered it.`);
+        log.info(`[${scopeLabel}] [dry-run] Would overwrite local edits in ${target.dest} with the team version.`);
       } else if (verdict.kind === 'member') {
-        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: ${notTeamaisReason(item.relativePath)}.`);
-      } else if (writer === 'skills') {
-        // As the write would list it: never an entry of the member's it delivers around.
-        const blocked = await blockingEntries(target.dest, item.sourcePath);
-        for (const file of await deliveredSkillFiles(item.sourcePath, target.dest, blocked)) ledger.recorder?.report(writer, file);
+        log.info(`[${scopeLabel}] [dry-run] Would replace ${target.dest} (${notTeamaisReason(item.relativePath)}) with the team version.`);
+      }
+      if (writer === 'skills') {
+        // As the write would list it: every file, the member's blocking entries being replaced too.
+        for (const file of await deliveredSkillFiles(item.sourcePath, target.dest)) ledger.recorder?.report(writer, file);
       } else if (writer) {
         ledger.recorder?.report(writer, target.dest);
       }
@@ -604,7 +612,8 @@ function tombstoneExtensions(type: ResourceType, tool: string): readonly string[
  * Called from the full sync and from the "already synced" fast path: a CLI
  * upgrade that widens the extensions above must still reach a machine whose
  * team repo HEAD has not moved since it pulled the tombstone (issue #576).
- * A copy the member changed since teamai delivered it is kept (#822).
+ * A copy the member changed since teamai delivered it is removed too, with a
+ * warning (c12 fork; upstream keeps it, #822).
  */
 async function cleanupTombstonedResources(
   freshConfig: TeamaiConfig,
@@ -612,11 +621,7 @@ async function cleanupTombstonedResources(
   scopeLabel: string,
   ledger: DeliveryLedger,
   extraNames?: RemovedTeamResources,
-  unpinnedRef?: string,
 ): Promise<void> {
-  const sayUnpinnedCopy = (localPath: string) => {
-    if (unpinnedRef) log.warn(`[${scopeLabel}] Kept ${localPath}: it holds "${unpinnedRef}"'s content, which teamai push would send to the default branch.`);
-  };
   // Each entry maps a resource type to the field on toolPath that names the
   // tool-side directory; `tombstoneExtensions` supplies the filename suffixes.
   const tombstoneTypes: { type: keyof RemovedTeamResources; toolPathField: 'rules' | 'skills' | 'agents' }[] = [
@@ -675,11 +680,8 @@ async function cleanupTombstonedResources(
       for (const stem of flatStems) {
         const localPath = path.join(typeDir, `${stem}${ruleFileExtensionForTool(tool)}`);
         if (ledger.previous?.[localPath] === undefined || !await pathExists(localPath)) continue;
-        if (await judgeRemoval(ledger.previous, localPath) !== 'remove') {
-          log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed the rule it is a copy of, but you changed this copy. Delete it when you no longer need it.`);
-          sayUnpinnedCopy(localPath);
-          continue;
-        }
+        // A copy the member changed goes too (c12 fork).
+        if (await judgeRemoval(ledger.previous, localPath) !== 'remove') removesEditedCopy(localPath, scopeLabel);
         if (await keepsTrackedCopy(localPath)) continue;
         await remove(localPath);
         forgetDelivered(ledger.hashes, localPath);
@@ -709,11 +711,8 @@ async function cleanupTombstonedResources(
               : type === 'skills' ? skillOrigin(localConfig.repo.localPath, name)
                 : undefined;
           const removal = await judgeRemoval(ledger.previous, localPath, origin, ledger.otherRecords);
-          if (removal === 'edited') {
-            log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed ${name}, but you changed this copy. Delete it when you no longer need it.`);
-            sayUnpinnedCopy(localPath);
-            continue;
-          }
+          // A copy the member changed goes too (c12 fork).
+          if (removal === 'edited') removesEditedCopy(localPath, scopeLabel);
           if (removal === 'notTeamais') {
             log.warn(`[${scopeLabel}] ${describeMembersDirLeft(localPath, type === 'rules' ? `rules/${name}.md` : `${type}/${name}`, 'pull')}`);
             continue;
@@ -1087,6 +1086,17 @@ export async function teamDelivery(localConfig: LocalConfig, tool: string, optio
  */
 export async function deliveredHashes(localConfig: LocalConfig, state?: State): Promise<DeliveredHashes | undefined> {
   return (await deliveringCheckoutRecord(localConfig, state))?.delivered;
+}
+
+/**
+ * How many files of the delivery record `delivered` are gone from disk (c12
+ * fork). Agent copies (in an `agents` directory) are left out: the fast path
+ * delivers a missing one itself (#830).
+ */
+async function countMissingDelivered(delivered: DeliveredHashes | undefined): Promise<number> {
+  const files = Object.keys(delivered ?? {}).filter((file) => !file.split(path.sep).includes('agents'));
+  const present = await Promise.all(files.map((file) => pathExists(file)));
+  return present.filter((exists) => !exists).length;
 }
 
 /**
@@ -1801,7 +1811,12 @@ async function pullForScope(
         const recordedPlaces = placesRecordOf(checkout);
         if (targetSetMatches && recordedPlaces === undefined) log.debug(`[${scopeLabel}] No record of the skills directories yet, syncing`);
 
-        if (targetSetMatches && recordedPlaces !== undefined
+        // A delivered copy deleted since (say by the project's own `git pull`)
+        // is not "synced": the full sync below puts the team version back (c12 fork).
+        const missing = targetSetMatches ? await countMissingDelivered(await deliveredHashes(localConfig, state)) : 0;
+        if (missing > 0) log.info(`[${scopeLabel}] ${missing} delivered file(s) missing; syncing`);
+
+        if (targetSetMatches && missing === 0 && recordedPlaces !== undefined
           && await placesUnmoved({ places: recordedPlaces, sessionToolHomes: checkout?.sessionToolHomes }, currentPlaces)) {
           if (await checkoutRemoved()) return;
           log.success(`[${scopeLabel}] Already synced at ${currentRev}, skipping`);
@@ -2226,7 +2241,7 @@ async function pullForScope(
   if (await checkoutRemoved()) return;
   // Step 3: Clean up tombstoned resources
   if (!options.dryRun) {
-    await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, ledger, revisionRemovals, unpinnedRef);
+    await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, ledger, revisionRemovals);
 
     if (roleContext) {
       if (!skillsHeld) {
@@ -2462,6 +2477,15 @@ async function pullForScope(
       state[targetsField] = syncedTargets;
     }
     const complete = !docsSyncFailed && !submodulesFailed && !agentModelsHeld && !membersFilesKept;
+    // Everything this pull delivers is on disk now: a recorded file still
+    // absent is a destination teamai no longer writes (say a tracked
+    // `.agents/skills` the project removed), and would send every later pull
+    // down the full sync (c12 fork).
+    if (complete) {
+      for (const file of Object.keys(ledger.hashes)) {
+        if (!await pathExists(file)) delete ledger.hashes[file];
+      }
+    }
     if (recordKey && deliveredRev && (!complete || revisionField === 'lastInheritedPullRev')) {
       // An inherited pull moves HOME's skills, rules and agents, not the rest,
       // and an incomplete one keeps its marker for a retry, yet both delivered
@@ -3319,7 +3343,7 @@ export async function pull(
   if (await checkoutRemoved()) return;
   // 3.6. Reconcile team MCP servers. Outside pullForScope for the same reason as
   // hooks. User-scope MCP remains isolated in project mode.
-  startupErrors.push(...await reconcileMcpAllScopes(reconcileUser, reconcileProject, options, teamEnvs));
+  startupErrors.push(...await reconcileMcpAllScopes(reconcileUser, reconcileProject, options, teamEnvs, deliveryRecorder));
 
   if (await checkoutRemoved()) return;
   // 3.6a. Trust in Codex what the two stages above wrote for it: its hooks and,
@@ -3973,11 +3997,39 @@ async function trustCodexAllScopes(
  * session start, so a change applied here takes effect in the user's next
  * session — which is exactly when the SessionStart pull hook runs.
  */
+/**
+ * Project-only mode (c12 fork): list each project MCP file that holds
+ * teamai's servers and that git does not track (`.mcp.json`), so the
+ * `delivered` block keeps it out of git. Upstream moves these servers to the
+ * user's MCP file instead (#915), which a project-only HOME hides from the
+ * member's tools.
+ */
+async function recordProjectMcpFiles(teamConfig: TeamaiConfig, localConfig: LocalConfig, recorder: DeliveryRecorder): Promise<void> {
+  if (!localConfig.projectRoot) return;
+  const { resolveMcpTargets, installedMcpEntries } = await import('./mcp-reconcile.js');
+  const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+  const { gitTracks } = await import('./git-exclude.js');
+  const { manifest } = await loadProjectMcpManifest(getDataHome(localConfig), localConfig.projectRoot, { dryRun: true });
+  try {
+    for (const target of await resolveMcpTargets(teamConfig, localConfig)) {
+      if (!target.projectScope || !await pathExists(target.file)) continue;
+      const installed = await installedMcpEntries(target);
+      const managed = (manifest[managedMcpManifestKey(target.tool, true)] ?? []).some((record) => installed?.has(record.name));
+      if (managed && (await gitTracks(target.file)).kind === 'untracked') recorder.report('mcp', target.file);
+    }
+    recorder.succeeded('mcp');
+  } catch (e) {
+    recorder.failed('mcp');
+    log.debug(`Could not list the project MCP files for the delivered block: ${(e as Error).message}`);
+  }
+}
+
 async function reconcileMcpAllScopes(
   userConfig: LocalConfig | null,
   projectConfig: LocalConfig | null,
   options: GlobalOptions,
   teamEnvs: Map<LocalConfig, TeamEnv>,
+  recorder?: DeliveryRecorder,
 ): Promise<string[]> {
   const errors: string[] = [];
   // Same contract as the hooks stage: resolve and report the entry warnings on
@@ -3998,6 +4050,9 @@ async function reconcileMcpAllScopes(
         dryRun: options.dryRun, teamEnv: await scopeEnv(localConfig, teamEnvs),
       });
       if (unresolved) errors.push(`[${installScopeName(localConfig.scope)}] Team MCP configuration could not be resolved`);
+      if (localConfig === projectConfig && recorder && isProjectOnly(localConfig) && !options.dryRun) {
+        await recordProjectMcpFiles(teamConfig, localConfig, recorder);
+      }
 
       const applied = changes.filter((c) => c.action !== 'skipped');
       const named = new Set<string>();
