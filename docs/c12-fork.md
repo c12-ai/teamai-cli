@@ -91,6 +91,8 @@ upstream minor gets its own working branch `c12/v<major.minor>`.
    complete full sync drops recorded files still absent afterwards (a
    destination teamai no longer writes), so they do not force a full sync on
    every pull. (`countMissingDelivered` in `src/pull.ts`.)
+7. **CI runs on the fork's working branches.** `.github/workflows/ci.yml` adds
+   `'c12/v*'` to its push and pull_request branch filters (upstream: main/master only).
 
 ### Dropped at 0.28.1
 

@@ -5,10 +5,12 @@ on:
     branches:
       - master
       - main
+      - 'c12/v*'
   pull_request:
     branches:
       - master
       - main
+      - 'c12/v*'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
