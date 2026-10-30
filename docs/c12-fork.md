@@ -61,6 +61,10 @@ upstream minor gets its own working branch `c12/v<major.minor>`.
      only from a global config, which a project-only HOME does not have, so a
      team's `autoUpdate: false` never applied there (`doUpdate` in
      `src/update.ts`).
+   - The hook index a pre-0.28 project-only install kept in the project
+     (`.teamai/managed-hooks.json`) moves whole into the data home and the
+     file is deleted; upstream moves only its Copilot records
+     (`migrateLegacyManagedHooks` in `src/hooks.ts`).
    - doctor's Codex project-trust check reads the `config.toml` in
      `TEAMAI_MEMBER_CODEX_HOME` (read only), the Codex home the member's Codex
      reads, when a launcher points `CODEX_HOME` somewhere private to teamai.

@@ -638,8 +638,9 @@ export async function unregisterCheckoutFromSharedManifest(
 /**
  * Move what a release before #993 recorded in `<root>/.teamai/managed-hooks.json`
  * into this checkout's manifest in the data home: the Copilot records in a
- * project scope, every record in self mode. The other records stay there for
- * the pre-#370 Codex import and the legacy hook sweep. The file is deleted
+ * project scope, every record in self mode and in project-only mode (c12
+ * fork). The other records stay there for the pre-#370 Codex import and the
+ * legacy hook sweep. The file is deleted
  * once empty, unless git tracks it: doctor names a tracked one. Idempotent;
  * an unreadable file is left alone.
  */
@@ -648,7 +649,9 @@ export async function migrateLegacyManagedHooks(localConfig: LocalConfig): Promi
   const legacyPath = legacyManagedHooksPath(localConfig.projectRoot);
   const legacy = await readJson<ManagedHooksManifest>(legacyPath);
   if (!legacy || typeof legacy !== 'object' || Array.isArray(legacy)) return;
-  const moving = Object.keys(legacy).filter((tool) => isSelfMode(localConfig) || tool === COPILOT_TOOL_ID);
+  // Project-only mode (c12 fork) kept its own hook index there before 0.28; the
+  // data home's manifest takes all of it, so the project keeps no teamai file.
+  const moving = Object.keys(legacy).filter((tool) => isSelfMode(localConfig) || isProjectOnly(localConfig) || tool === COPILOT_TOOL_ID);
   if (moving.length > 0) {
     const manifestPath = getManagedHooksPath(localConfig);
     const manifest = await readManifest(manifestPath);
