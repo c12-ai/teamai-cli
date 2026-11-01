@@ -45,6 +45,14 @@ upstream minor gets its own working branch `c12/v<major.minor>`.
      HOME; tools whose only project hook file is committed (Codex:
      `.codex/hooks.json`) get no hooks. No git hook is installed, and pull
      removes one an earlier run left.
+   - The instruction-channel check (pull, doctor) for such a tool reads the
+     project's committed hook file (Codex: `.codex/hooks.json`, read only) and
+     passes when a SessionStart command there runs `hook-dispatch session-start
+     --tool <tool>`; the project commits that entry through its own launcher.
+     Without one the fix names the file and that command, not `teamai hooks
+     inject`, which writes nothing in this mode. Upstream checks the hook file
+     teamai writes, so every pull warned that Codex gets no team instructions
+     (`committedSessionHookReadiness` in `src/instruction-targets.ts`).
    - MCP sync skips a project file git tracks (Codex: `.codex/config.toml`).
      Claude's servers stay in the project's `.mcp.json`: upstream moves them
      to `~/.claude.json` while `sharing.gitExclude` is on or the workspace has
