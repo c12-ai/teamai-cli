@@ -13,6 +13,7 @@ import { gitUntracked } from './git-exclude.js';
 import { TEAMAI_CONTEXT_RULE_NAME } from './builtin-rules.js';
 import {
   isAgentExcluded,
+  isProjectOnly,
   resolveToolBaseDir,
   resolveHookScope,
   scopedToolPaths,
@@ -228,6 +229,7 @@ export async function channelReadiness(
       };
     }
     case 'codex-hooks': {
+      if (context !== undefined && isProjectOnly(context.localConfig)) return committedSessionHookReadiness(tool, context);
       const file = hooksFileOf(tool, context);
       return {
         ready: file !== undefined && await hooksInstalled(file, tool),
@@ -285,6 +287,36 @@ function hooksFileOf(tool: string, context: { teamConfig: TeamaiConfig; localCon
   const hookScope = resolveHookScope(context.localConfig);
   const settings = scopedToolPaths(context.teamConfig, { ...context.localConfig, scope: hookScope.scope })[tool]?.settings;
   return settings === undefined ? undefined : path.resolve(hookScope.baseDir, settings);
+}
+
+/**
+ * C12 fork, project-only mode: teamai writes no hook file for a tool whose
+ * project hook file the project commits (Codex: `.codex/hooks.json`,
+ * `projectOnlyToolPaths`), so the channel is ready when that committed file
+ * registers a SessionStart command that dispatches teamai's session-start for
+ * `tool`. The file is only read.
+ */
+async function committedSessionHookReadiness(
+  tool: string,
+  context: { teamConfig: TeamaiConfig; localConfig: LocalConfig },
+): Promise<{ ready: boolean; fix: string }> {
+  const settings = context.teamConfig.toolPaths[tool]?.settings;
+  const file = settings === undefined ? undefined : path.resolve(resolveHookScope(context.localConfig).baseDir, settings);
+  const read = file === undefined ? undefined : await readJsonObject(file);
+  const hooks = read?.kind === 'ok' ? read.value.hooks : undefined;
+  const groups = typeof hooks === 'object' && hooks !== null ? (hooks as { SessionStart?: unknown }).SessionStart : undefined;
+  const dispatch = new RegExp(`\\bhook-dispatch session-start\\b.*--tool[= ]${tool}(?![\\w-])`);
+  const ready = Array.isArray(groups) && groups.some((group: unknown) => {
+    const entries = typeof group === 'object' && group !== null ? (group as { hooks?: unknown }).hooks : undefined;
+    return Array.isArray(entries) && entries.some((entry: unknown) =>
+      dispatch.test(typeof entry === 'object' && entry !== null ? String((entry as { command?: unknown }).command ?? '') : ''));
+  });
+  return {
+    ready,
+    fix: `${file ?? `${tool}'s project hooks file`} registers no teamai SessionStart hook for ${tool}, so ${tool} sessions get no team `
+      + 'instructions. In project-only mode teamai does not write this file, which the project commits: commit a SessionStart hook '
+      + `in it that runs \`teamai hook-dispatch session-start --tool ${tool}\` through the project's teamai launcher.`,
+  };
 }
 
 async function hooksInstalled(file: string, tool: string): Promise<boolean> {
