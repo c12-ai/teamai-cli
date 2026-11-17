@@ -651,11 +651,11 @@ const packagePendingHintHandler: HookHandler = {
 
 const votesSyncHandler: HookHandler = {
   name: 'votes-sync',
-  async execute(stdin, tool, localConfig) {
+  async execute(stdin, tool, localConfig, afterOutputWritten) {
     if (process.env.TEAMAI_RECALL_DISABLED === '1' || !localConfig) return null;
 
     try {
-      const { creditAdoptedDocs } = await import('./recall-adoption.js');
+      const { creditAdoptedDocs, pendingAdoptedSummary } = await import('./recall-adoption.js');
       const { syncVotesToTeam, pruneUpvoteLedger } = await import('./votes.js');
       const { getVotesDir } = await import('./types.js');
       const votesDir = getVotesDir(localConfig);
@@ -762,19 +762,17 @@ const votesSyncHandler: HookHandler = {
       // to the user, so they observe the recall database's effect. Deterministic:
       // built from tool-use evidence, not from the model self-declaring anything.
       //
-      // This is a user-facing note, not a model instruction, so we only emit it
-      // on tools that print the Stop payload to the terminal. Tools whose Stop
-      // stdout is ignored deliver stashed content back through the model's
-      // context (additionalContext); routing an FYI summary there would pollute
-      // the next turn, so we simply skip it for those tools rather than misuse
-      // the model channel.
+      // Codex receives this notice through its user-facing systemMessage,
+      // never additionalContext or a pending hint. Other tools retain their
+      // existing Stop output policy.
       // The summary is for Stop alone.
-      if (adoptedDocIds.length > 0 && !subagentStop && !sessionEnd) {
-        const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
-        if (!stopStdoutUnsupported(tool)) {
-          const { formatStopHookOutput } = await import('./utils/hook-output.js');
-          return formatStopHookOutput(buildAdoptedSummary(adoptedDocIds), tool ?? 'claude');
-        }
+      if (!subagentStop && !sessionEnd) {
+        const pending = await pendingAdoptedSummary(localConfig, sessionId);
+        if (!pending) return null;
+        const { formatAdoptedSummaryOutput } = await import('./utils/hook-output.js');
+        const output = formatAdoptedSummaryOutput(buildAdoptedSummary(pending.docIds), tool ?? 'claude');
+        if (output !== null) afterOutputWritten?.(pending.acknowledge);
+        return output;
       }
     } catch (error) {
       // Non-critical for the session (votes retry on next pull), but the failure

@@ -48,6 +48,12 @@ teamai recall --check "API 超时"
 
 ### Recall 采纳与 upvote
 
+会话中存在已计入但尚未输出提示的文档时，主 Stop 列出这些文档的 ID，Claude 和 Codex 使用相同文案。Codex 系工具通过面向界面／事件流的 `systemMessage` 接收提示，不会把提示放进 `additionalContext`，也不会暂存到下一次提问。实际展示取决于客户端的 hook 支持。
+
+新计入的 ID 放在本地会话记录的 `pendingSummaryDocIds` 列表中，SubagentStop 计入的条目也会保留。主 Stop 输出待提示列表，stdout 成功后只移除本次输出的条目。输出失败、被丢弃或工具不支持时，条目保留到后续 Stop，不在下一次提问时补发。该列表不随团队投票上传，并随现有会话记录过期。
+
+并发的主 Stop，或 stdout 输出后发生崩溃、确认失败，都可能重复提示，但不会增加采用计数。stdout 成功不代表客户端已经展示。
+
 设置 `TEAMAI_UPVOTE_JUDGE=1` 后，可选 judge 也能为通过摘要采纳的指导计分。Claude 系工具使用 transcript；Codex、Muse 和 ZCode 使用 Stop 事件的最终回复与本会话已确认的 recall 日志。只有本作用域允许计分的已召回文档能获得 upvote，每个会话至多一次。
 
 这次会话打开了 recall 返回的文档，就计一次 upvote。也可以手动记：

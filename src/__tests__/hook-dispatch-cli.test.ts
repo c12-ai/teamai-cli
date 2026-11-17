@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import type { LocalConfig } from '../types.js';
 
 const { mockSpawn, mockDispatcher } = vi.hoisted(() => ({
@@ -22,12 +22,35 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawn: mockSpawn,
 }));
 
-const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost } =
+const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost, writeDispatchOutput } =
   await import('../hook-dispatch-cli.js');
 const { claudeHookOtherHostSkip } = await import('../claude-hook-host.js');
 const { reconcileHooks } = await import('../hooks.js');
 const { log } = await import('../utils/logger.js');
 const { commitFile, initRepo, recordDelivery } = await import('./helpers/delivered-checkout.js');
+
+describe('output acknowledgement', () => {
+  it('acknowledges only after stdout accepts the payload', async () => {
+    const steps: string[] = [];
+    const stdout = new Writable({ write(_chunk, _encoding, done) { steps.push('write'); done(); } });
+    const acknowledgeOutput = vi.fn(async () => { steps.push('ack'); });
+    await writeDispatchOutput({ output: '{"systemMessage":"notice"}', errors: [], acknowledgeOutput }, stdout);
+    expect(steps).toEqual(['write', 'ack']);
+  });
+
+  it('keeps notices pending on stdout error', async () => {
+    const acknowledgeOutput = vi.fn(async () => {});
+    const stdout = new Writable({ write(_chunk, _encoding, done) { done(new Error('EPIPE')); } });
+    await expect(writeDispatchOutput({ output: '{"systemMessage":"notice"}', errors: [], acknowledgeOutput }, stdout)).rejects.toThrow('EPIPE');
+    expect(acknowledgeOutput).not.toHaveBeenCalled();
+  });
+
+  it('does not acknowledge when no payload is emitted', async () => {
+    const acknowledgeOutput = vi.fn(async () => {});
+    await writeDispatchOutput({ output: null, errors: [], acknowledgeOutput }, new PassThrough());
+    expect(acknowledgeOutput).not.toHaveBeenCalled();
+  });
+});
 
 describe('readStdin', () => {
   it('closes a pipe after the EOF timeout so the hook process can exit', async () => {

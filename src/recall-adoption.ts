@@ -355,6 +355,15 @@ async function creditRoot(config: LocalConfig, index: LogIndex, sessionId: strin
   return { credited, recalled };
 }
 
+/** Pending notices use exactly the same linked root-session ownership as adoption credit. */
+export async function pendingAdoptedSummary(config: LocalConfig, sessionId: string): Promise<{ docIds: string[]; acknowledge: () => Promise<void> } | null> {
+  const target = indexLog(await readRecallLog(config)).rootOf(sessionId);
+  const votePath = path.join(getVotesDir(config), `${config.username}.yaml`);
+  const { pendingSummaryForSession, acknowledgeSummary } = await import('./votes.js');
+  const snapshot = await pendingSummaryForSession(votePath, target);
+  return snapshot ? { docIds: snapshot.docIds, acknowledge: () => acknowledgeSummary(votePath, target, snapshot) } : null;
+}
+
 /** Eligible docs from this session's settled, linked recall runs, keyed for voting. */
 export async function recalledDocsForSession(config: LocalConfig, sessionId: string): Promise<RecalledDoc[]> {
   const index = indexLog(await readRecallLog(config));

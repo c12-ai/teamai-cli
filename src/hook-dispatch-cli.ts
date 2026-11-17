@@ -18,11 +18,11 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Readable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 
 import { resolveCliEntry } from './builtin-hooks.js';
 import { captureTail } from './utils/exec.js';
-import { createDispatcher, type Dispatcher } from './hook-dispatch.js';
+import { createDispatcher, type Dispatcher, type DispatchResult } from './hook-dispatch.js';
 import { buildHandlerRegistry, filterHandlersForConfig } from './hook-handlers.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { windowsPowerShell } from './utils/powershell.js';
@@ -396,12 +396,29 @@ async function runDispatch(
   stdin: Record<string, unknown>,
   tool: string,
   mode: 'foreground' | 'background',
-): Promise<string | null> {
+): Promise<DispatchResult> {
   const result = await dispatcher.dispatch(event, matcher, stdin, tool, mode);
   for (const err of result.errors) {
     log.debug(`hook-dispatch: handler "${err.handlerName}" failed: ${err.error.message}`);
   }
-  return result.output;
+  return result;
+}
+
+/** Write the final hook payload before acknowledging any local pending notices. */
+export async function writeDispatchOutput(result: DispatchResult, stdout: Writable = process.stdout): Promise<void> {
+  if (!result.output) return;
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error);
+    stdout.once('error', onError);
+    stdout.write(result.output!, (error) => {
+      // Writable emits its error event after the callback: keep the listener
+      // attached on failure so EPIPE does not become an unhandled exception.
+      if (error) { reject(error); return; }
+      stdout.removeListener('error', onError);
+      resolve();
+    });
+  });
+  await result.acknowledgeOutput?.();
 }
 
 export { deriveDispatchSessionId };
@@ -541,11 +558,9 @@ export async function hookDispatchCli(
       settling = spawnBackground(event, tool, matcher, JSON.stringify(stdin), cwd);
     }
 
-    const output = await runDispatch(dispatcher, event, matcher, stdin, tool, 'foreground');
+    const result = await runDispatch(dispatcher, event, matcher, stdin, tool, 'foreground');
 
-    if (output) {
-      await new Promise<void>((resolve) => process.stdout.write(output, () => resolve()));
-    }
+    await writeDispatchOutput(result);
 
     // Started before the foreground pass, awaited after it: the Windows escape's
     // PowerShell startup overlaps that pass, and this process outlives the
