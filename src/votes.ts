@@ -72,7 +72,7 @@ interface UpvoteLedger {
   //    was refreshed — the entry ages out (and its dedup guarantee ends) a fixed
   //    window after the session started, not perpetually.
   //  - ts: last-updated, kept for observability only.
-  [sessionId: string]: { docIds: string[]; ts: string; firstTs: string };
+  [sessionId: string]: { docIds: string[]; pendingSummaryDocIds: string[]; ts: string; firstTs: string };
 }
 
 const LEDGER_TTL_MS = 24 * 60 * 60 * 1000; // 1 day
@@ -84,12 +84,14 @@ function readLedger(data: UserVotesV2): UpvoteLedger {
   // let a string `docIds` be iterated per-character. Drop malformed entries.
   const out: UpvoteLedger = {};
   for (const [sid, e] of Object.entries(raw as Record<string, unknown>)) {
-    const entry = e as { docIds?: unknown; ts?: unknown; firstTs?: unknown } | null;
+    const entry = e as { docIds?: unknown; pendingSummaryDocIds?: unknown; ts?: unknown; firstTs?: unknown } | null;
     if (entry && Array.isArray(entry.docIds) && typeof entry.ts === 'string') {
       // Back-compat: entries written before firstTs existed fall back to ts.
       const firstTs = typeof entry.firstTs === 'string' ? entry.firstTs : entry.ts;
       out[sid] = {
         docIds: entry.docIds.filter((d): d is string => typeof d === 'string'),
+        pendingSummaryDocIds: Array.isArray(entry.pendingSummaryDocIds)
+          ? [...new Set(entry.pendingSummaryDocIds.filter((d): d is string => typeof d === 'string' && (entry.docIds as unknown[]).includes(d)))] : [],
         ts: entry.ts,
         firstTs,
       };
@@ -137,6 +139,36 @@ export async function creditedDocIdsForSession(votePath: string, sessionId: stri
   } catch {
     return new Set();
   }
+}
+
+/** A local summary snapshot; firstTs prevents acknowledgement of a replacement ledger entry. */
+export interface PendingSummarySnapshot {
+  docIds: string[];
+  firstTs: string;
+}
+
+/** Read pending notices without consuming them or migrating a legacy file. */
+export async function pendingSummaryForSession(votePath: string, sessionId: string): Promise<PendingSummarySnapshot | null> {
+  const ledger = readLedger(await readUserVotes(votePath));
+  pruneLedger(ledger, Date.now());
+  const entry = ledger[sessionId];
+  return entry?.pendingSummaryDocIds.length ? { docIds: [...entry.pendingSummaryDocIds], firstTs: entry.firstTs } : null;
+}
+
+/** Acknowledge only a successfully emitted snapshot, preserving credits that arrived meanwhile. */
+export async function acknowledgeSummary(votePath: string, sessionId: string, snapshot: PendingSummarySnapshot): Promise<void> {
+  await withVotesLock(votePath, async () => {
+    const data = await loadUserVotes(votePath);
+    const ledger = readLedger(data);
+    const entry = ledger[sessionId];
+    if (!entry || entry.firstTs !== snapshot.firstTs) return;
+    const emitted = new Set(snapshot.docIds);
+    const remaining = entry.pendingSummaryDocIds.filter((id) => !emitted.has(id));
+    if (remaining.length === entry.pendingSummaryDocIds.length) return;
+    entry.pendingSummaryDocIds = remaining;
+    (data as unknown as { upvotedSessions: UpvoteLedger }).upvotedSessions = ledger;
+    await saveUserVotes(votePath, data);
+  });
 }
 
 /**
@@ -358,7 +390,11 @@ export async function incrementUpvoted(
       const prev = new Set(existing?.docIds ?? []);
       for (const id of toCredit) prev.add(id);
       // Preserve firstTs across turns so the TTL measures age from session start.
-      ledger[sessionId] = { docIds: [...prev], ts: now, firstTs: existing?.firstTs ?? now };
+      ledger[sessionId] = {
+        docIds: [...prev],
+        pendingSummaryDocIds: [...new Set([...(existing?.pendingSummaryDocIds ?? []), ...toCredit])],
+        ts: now, firstTs: existing?.firstTs ?? now,
+      };
       (data as unknown as { upvotedSessions: UpvoteLedger }).upvotedSessions = ledger;
     }
 

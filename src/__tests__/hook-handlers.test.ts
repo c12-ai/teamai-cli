@@ -153,9 +153,11 @@ vi.mock('../transcript-parser.js', () => ({
 // votes-sync's adoption comes from the recall-log reducer (#884); its own
 // behavior is covered end to end in recall-attribution.test.ts.
 const mockCreditAdoptedDocs = vi.hoisted(() => vi.fn());
+const { mockPendingSummary, mockSummaryAck } = vi.hoisted(() => ({ mockPendingSummary: vi.fn(), mockSummaryAck: vi.fn(async () => {}) }));
 vi.mock('../recall-adoption.js', () => ({
   recalledDocsForSession: vi.fn(async () => []),
   creditAdoptedDocs: mockCreditAdoptedDocs,
+  pendingAdoptedSummary: mockPendingSummary,
   recalledKeyOf: vi.fn(async () => () => undefined),
   // The judge backfills a missing `File:` path from the recall log; these tests
   // supply every path via the transcript, so the lookup is never consulted.
@@ -219,6 +221,7 @@ describe('hook-handlers registry', () => {
     mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
     mockIncrementUpvoted.mockImplementation(async (_p: string, docIds: string[]) => docIds);
     mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 0 });
+    mockPendingSummary.mockReset().mockResolvedValue(null);
     mockJudgeAdoption.mockResolvedValue([]);
     mockPackageManifestHash.mockResolvedValue('before-hash');
     mockTakePendingPackageHint.mockResolvedValue(null);
@@ -1184,6 +1187,7 @@ describe('hook-handlers registry', () => {
 
     // Tool-use adoption → show the summary of what was actually used.
     mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
 
     const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
@@ -1204,6 +1208,28 @@ describe('hook-handlers registry', () => {
 
     const result = await handler.execute({ session_id: 'sid-adopt-3', cwd: '/x' }, 'claude', scope);
     expect(result).toBeNull();
+  });
+
+  it('emits pending subagent credits even when this Stop credits nothing, acknowledging only after output', async () => {
+    const handler = buildHandlerRegistry().find((r) => r.event === 'stop' && r.handler.name === 'votes-sync')!.handler;
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 1 });
+    mockPendingSummary.mockResolvedValue({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
+    const completions: Array<() => Promise<void>> = [];
+    const output = await handler.execute({ session_id: 'parent', hook_event_name: 'Stop' }, 'codex', scope, (acknowledge) => completions.push(acknowledge));
+    expect(JSON.parse(output!)).toEqual({ systemMessage: '[teamai] Adopted team knowledge this session: doc-a' });
+    expect(mockSummaryAck).not.toHaveBeenCalled();
+    await completions[0]();
+    expect(mockSummaryAck).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a pending summary when the tool has no supported output transport', async () => {
+    const handler = buildHandlerRegistry().find((r) => r.event === 'stop' && r.handler.name === 'votes-sync')!.handler;
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 1 });
+    mockPendingSummary.mockResolvedValue({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
+    const register = vi.fn();
+    expect(await handler.execute({ session_id: 'parent', hook_event_name: 'Stop' }, 'codebuddy', scope, register)).toBeNull();
+    expect(register).not.toHaveBeenCalled();
+    expect(mockSummaryAck).not.toHaveBeenCalled();
   });
 
   it('votes-sync stays quiet when the votes file was busy', async () => {
@@ -1227,6 +1253,7 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
 
     const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
 
@@ -1580,7 +1607,7 @@ describe('hook-handlers registry', () => {
 
   // ── votes-sync adopted-summary is skipped for stdout-less tools ──
 
-  it.each(['codebuddy', 'codex'])('votes-sync stays silent (no summary) for %s whose Stop stdout is ignored', async (tool) => {
+  it.each(['codebuddy', 'workbuddy'])('votes-sync stays silent (no summary) for %s whose Stop stdout is ignored', async (tool) => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
@@ -1589,11 +1616,32 @@ describe('hook-handlers registry', () => {
     // Adoption happened, but the summary is a user-facing note we do not route
     // through the model context of stdout-less tools.
     mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-b'], recalled: 1 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-b'], acknowledge: mockSummaryAck });
 
     const result = await handler.execute({ session_id: 'sid-votes-stash', cwd: '/x' }, tool, scope);
     expect(result).toBeNull();
     // The upvote is still recorded.
     expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-votes-stash');
+  });
+
+  it.each(['codex', 'codex-internal', 'tcodex', 'Codex'])('votes-sync emits only systemMessage for %s and stays quiet on repeated Stop', async (tool) => {
+    const handler = buildHandlerRegistry().find((r) => r.event === 'stop' && r.handler.name === 'votes-sync')!.handler;
+    mockCreditAdoptedDocs.mockResolvedValueOnce({ credited: ['doc-a', 'doc-b'], recalled: 3 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-a', 'doc-b'], acknowledge: mockSummaryAck });
+    mockCreditAdoptedDocs.mockResolvedValueOnce({ credited: [], recalled: 3 });
+    const input = { session_id: 'sid-codex-summary', cwd: '/x', hook_event_name: 'Stop' };
+
+    const output = await handler.execute(input, tool, scope);
+    expect(JSON.parse(output!)).toEqual({ systemMessage: '[teamai] Adopted team knowledge this session: doc-a, doc-b' });
+    expect(await handler.execute(input, tool, scope)).toBeNull();
+    expect(mockTakePendingHint).not.toHaveBeenCalled();
+  });
+
+  it.each(['SubagentStop', 'SessionEnd'])('does not emit a Codex summary for %s', async (hook_event_name) => {
+    const handler = buildHandlerRegistry().find((r) => r.event === 'stop' && r.handler.name === 'votes-sync')!.handler;
+    mockCreditAdoptedDocs.mockResolvedValueOnce({ credited: ['doc-a'], recalled: 1 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
+    expect(await handler.execute({ session_id: 'sid-codex-summary', cwd: '/x', hook_event_name }, 'codex', scope)).toBeNull();
   });
 
   it('votes-sync returns the adopted summary via stdout for claude', async () => {
@@ -1603,6 +1651,7 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-c'], recalled: 1 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-c'], acknowledge: mockSummaryAck });
 
     const result = await handler.execute({ session_id: 'sid-votes-stdout', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
@@ -1611,6 +1660,7 @@ describe('hook-handlers registry', () => {
 
   it('stop dispatcher merges the adopted summary and the contribute hint', async () => {
     mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 1 });
+    mockPendingSummary.mockResolvedValueOnce({ docIds: ['doc-a'], acknowledge: mockSummaryAck });
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: 'CONTRIBUTE-HINT' });
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
 

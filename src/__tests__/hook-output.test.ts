@@ -1,6 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { formatStopHookOutput, relayWhenHidden, RELAY_TO_USER_PREFIX } from '../utils/hook-output.js';
+import { formatAdoptedSummaryOutput, formatStopHookOutput, relayWhenHidden, RELAY_TO_USER_PREFIX } from '../utils/hook-output.js';
 import { stopStdoutUnsupported } from '../utils/tool-names.js';
+
+describe('formatAdoptedSummaryOutput', () => {
+  it.each(['codex', 'codex-internal', 'tcodex', 'Codex', 'TCodex'])('uses only a user-facing notice for %s', (tool) => {
+    const message = '[teamai] Adopted team knowledge this session: doc-a';
+    expect(JSON.parse(formatAdoptedSummaryOutput(message, tool)!)).toEqual({ systemMessage: message });
+    expect(stopStdoutUnsupported(tool)).toBe(true);
+  });
+
+  it('preserves Claude output', () => {
+    expect(formatAdoptedSummaryOutput('notice', 'claude')).toBe(formatStopHookOutput('notice', 'claude'));
+  });
+
+  it('keeps unsupported non-Codex tools silent', () => {
+    expect(formatAdoptedSummaryOutput('notice', 'codebuddy')).toBeNull();
+  });
+});
 
 describe('formatStopHookOutput', () => {
   it('claude: returns hookSpecificOutput format', () => {

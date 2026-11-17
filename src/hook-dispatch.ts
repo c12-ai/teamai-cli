@@ -25,7 +25,10 @@ export interface HookHandler {
    * Handlers read their scope from it, never from the process cwd: the
    * dispatcher's chdir into the hook's cwd can fail (#752).
    */
-  execute(stdin: Record<string, unknown>, tool: string, config: LocalConfig | null): Promise<string | null>;
+  execute(
+    stdin: Record<string, unknown>, tool: string, config: LocalConfig | null,
+    afterOutputWritten?: (acknowledge: () => Promise<void>) => void,
+  ): Promise<string | null>;
 }
 
 export interface HandlerRegistration {
@@ -72,6 +75,8 @@ export interface DispatchError {
 }
 
 export interface DispatchResult {
+  /** Run only after stdout accepts the final output; never serialized to the host. */
+  acknowledgeOutput?: () => Promise<void>;
   /** Combined STDOUT output from all compatible output-producing handlers. */
   output: string | null;
   /** Errors from failed handlers (non-fatal — other handlers still ran). */
@@ -109,7 +114,33 @@ function asObject(value: unknown): JsonObject | null {
     : null;
 }
 
-/** Merge the two hook output schemas used by the supported hosts. */
+/** Whether a handler's informational text survived merging in its original transport field. */
+function retainsOutput(finalOutput: string | null, candidate: string): boolean {
+  if (finalOutput === null) return false;
+  if (finalOutput === candidate) return true;
+  try {
+    const original = asObject(JSON.parse(candidate));
+    const merged = asObject(JSON.parse(finalOutput));
+    if (!original || !merged) return false;
+    let hasText = false;
+    for (const field of ['systemMessage', 'followup_message']) {
+      if (typeof original[field] !== 'string') continue;
+      hasText = true;
+      if (typeof merged[field] !== 'string' || !merged[field].includes(original[field])) return false;
+    }
+    if (Object.hasOwn(original, 'hookSpecificOutput')) {
+      const before = asObject(original.hookSpecificOutput);
+      const after = asObject(merged.hookSpecificOutput);
+      if (!before || !after || before.hookEventName !== after.hookEventName
+        || typeof before.additionalContext !== 'string' || typeof after.additionalContext !== 'string'
+        || !after.additionalContext.includes(before.additionalContext)) return false;
+      hasText = true;
+    }
+    return hasText;
+  } catch { return false; }
+}
+
+/** Merge compatible hook output schemas used by the supported hosts. */
 export function mergeHookOutputs(outputs: string[]): string | null {
   if (outputs.length === 0) return null;
   if (outputs.length === 1) return outputs[0];
@@ -124,6 +155,46 @@ export function mergeHookOutputs(outputs: string[]): string | null {
   } catch {
     // Preserve the historical first-output behavior for unknown/plain schemas.
     return outputs[0];
+  }
+
+  if (parsed.some((value) => Object.hasOwn(value, 'systemMessage'))) {
+    // Only informational fields are combined. Unknown/control fields retain
+    // the historical first-output fallback rather than acquiring new semantics.
+    const messages: string[] = [];
+    const contexts: string[] = [];
+    const followups: string[] = [];
+    const eventNames = new Set<string>();
+    for (const value of parsed) {
+      if (Object.keys(value).some((key) => !['systemMessage', 'hookSpecificOutput', 'followup_message'].includes(key))) return outputs[0];
+      if (Object.hasOwn(value, 'systemMessage')) {
+        if (typeof value.systemMessage !== 'string') return outputs[0];
+        messages.push(value.systemMessage);
+      }
+      if (Object.hasOwn(value, 'followup_message')) {
+        if (typeof value.followup_message !== 'string') return outputs[0];
+        followups.push(value.followup_message);
+      }
+      if (Object.hasOwn(value, 'hookSpecificOutput')) {
+        const specific = asObject(value.hookSpecificOutput);
+        if (!specific || Object.keys(specific).some((key) => !['hookEventName', 'additionalContext'].includes(key))
+          || typeof specific.additionalContext !== 'string') return outputs[0];
+        if (Object.hasOwn(specific, 'hookEventName')) {
+          if (typeof specific.hookEventName !== 'string') return outputs[0];
+          eventNames.add(specific.hookEventName);
+        }
+        contexts.push(specific.additionalContext);
+      }
+    }
+    if (eventNames.size > 1) return outputs[0];
+    const [hookEventName] = eventNames;
+    return JSON.stringify({
+      systemMessage: messages.join('\n'),
+      ...followups.length > 0 ? { followup_message: followups.join('\n') } : {},
+      ...contexts.length > 0 ? { hookSpecificOutput: {
+        ...hookEventName !== undefined ? { hookEventName } : {},
+        additionalContext: contexts.join('\n'),
+      } } : {},
+    });
   }
 
   const followups = parsed.map((value) => value.followup_message);
@@ -197,14 +268,15 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       // Execute all matched handlers concurrently with isolation + per-handler timeout
       const timings: Array<{ handler: string; ms: number; outcome: string }> = [];
       const startedAt = Date.now();
+      const completions: Array<Array<() => Promise<void>>> = matched.map(() => []);
       const settled = await Promise.allSettled(
-        matched.map((reg) => {
+        matched.map((reg, index) => {
           const timeoutMs = reg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
           const handlerStartedAt = Date.now();
           const record = (outcome: string) => {
             timings.push({ handler: reg.handler.name, ms: Date.now() - handlerStartedAt, outcome });
           };
-          return withTimeout(reg.handler.execute(stdin, tool, config.localConfig), timeoutMs, reg.handler.name).then(
+          return withTimeout(reg.handler.execute(stdin, tool, config.localConfig, (acknowledge) => completions[index].push(acknowledge)), timeoutMs, reg.handler.name).then(
             (value) => {
               record('ok');
               return value;
@@ -233,7 +305,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       }
 
       // Collect results
-      const outputs: Array<{ reg: HandlerRegistration; value: string }> = [];
+      const outputs: Array<{ reg: HandlerRegistration; value: string; index: number }> = [];
       const errors: DispatchError[] = [];
 
       for (let i = 0; i < settled.length; i++) {
@@ -246,7 +318,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
             error: result.reason instanceof Error ? result.reason : new Error(String(result.reason)),
           });
         } else if (result.status === 'fulfilled' && result.value != null) {
-          outputs.push({ reg: matched[i], value: result.value });
+          outputs.push({ reg: matched[i], value: result.value, index: i });
         }
       }
 
@@ -262,7 +334,18 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
           log.debug(`[hook-dispatch] ${event}/${tool}: reply context is ${length} characters, over the ${CURSOR_HOOK_CONTEXT_LIMIT}-character limit even without ${yielded}; Cursor drops it`);
         }
       }
-      return { output, errors };
+      const acknowledgements = outputs.filter(({ value }) => retainsOutput(output, value))
+        .flatMap(({ index }) => completions[index]);
+      let acknowledged = false;
+      return { output, errors, ...acknowledgements.length > 0 ? { acknowledgeOutput: async () => {
+        if (acknowledged) return;
+        acknowledged = true;
+        for (const acknowledge of acknowledgements) {
+          try { await acknowledge(); } catch (error) {
+            log.debug(`hook-dispatch: output acknowledgement failed: ${String(error)}`);
+          }
+        }
+      } } : {} };
     },
   };
 }

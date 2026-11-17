@@ -19,9 +19,125 @@ function createHandler(name: string, output?: string): TestHandler {
 
 import {
   createDispatcher,
+  mergeHookOutputs,
+  type HookHandler,
 } from '../hook-dispatch.js';
 
 // ── Tests ───────────────────────────────────────────────
+
+describe('pending output completion', () => {
+  const notice = (acknowledge: () => Promise<void>, text = 'notice'): HookHandler => ({
+    name: 'notice',
+    async execute(_stdin, _tool, _config, afterOutputWritten) {
+      afterOutputWritten?.(acknowledge);
+      return JSON.stringify({ systemMessage: text });
+    },
+  });
+
+  it('defers acknowledgement until the final merged output is written', async () => {
+    const acknowledge = vi.fn(async () => {});
+    const dispatcher = createDispatcher({ localConfig: null, handlers: [
+      { event: 'stop', matcher: '*', handler: notice(acknowledge) },
+      { event: 'stop', matcher: '*', handler: createHandler('context', '{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"context"}}') },
+    ] });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'codex');
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(JSON.parse(result.output!)).toEqual({ systemMessage: 'notice', hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'context' } });
+    await result.acknowledgeOutput?.();
+    await result.acknowledgeOutput?.();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it('does not acknowledge notices discarded by merge fallback', async () => {
+    const acknowledge = vi.fn(async () => {});
+    const dispatcher = createDispatcher({ localConfig: null, handlers: [
+      { event: 'stop', matcher: '*', handler: createHandler('control', '{"decision":"block","reason":"continue"}') },
+      { event: 'stop', matcher: '*', handler: notice(acknowledge) },
+    ] });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'codex');
+    expect(JSON.parse(result.output!)).toEqual({ decision: 'block', reason: 'continue' });
+    await result.acknowledgeOutput?.();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it('does not acknowledge context dropped by the host context limit', async () => {
+    const acknowledge = vi.fn(async () => {});
+    const context = (text: string) => JSON.stringify({ hookSpecificOutput: { hookEventName: 'Stop', additionalContext: text } });
+    const yielding: HookHandler = { name: 'yielding', async execute(_stdin, _tool, _config, afterOutputWritten) {
+      afterOutputWritten?.(acknowledge);
+      return context('x'.repeat(10_000));
+    } };
+    const dispatcher = createDispatcher({ localConfig: null, handlers: [
+      { event: 'stop', matcher: '*', handler: yielding, yieldsToContextLimit: true },
+      { event: 'stop', matcher: '*', handler: createHandler('keep', context('keep')) },
+    ] });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'cursor');
+    expect(JSON.parse(result.output!).hookSpecificOutput.additionalContext).toBe('keep');
+    await result.acknowledgeOutput?.();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it('does not acknowledge a timed-out handler', async () => {
+    const acknowledge = vi.fn(async () => {});
+    const slow: HookHandler = { name: 'slow', async execute(_stdin, _tool, _config, afterOutputWritten) {
+      afterOutputWritten?.(acknowledge);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return '{"systemMessage":"late"}';
+    } };
+    const dispatcher = createDispatcher({ localConfig: null, handlers: [{ event: 'stop', matcher: '*', handler: slow, timeoutMs: 1 }] });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'codex');
+    expect(result.output).toBeNull();
+    expect(result.errors).toHaveLength(1);
+    await result.acknowledgeOutput?.();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+});
+
+describe('systemMessage merging', () => {
+  it('keeps notices in registration order without creating context', () => {
+    const output = mergeHookOutputs(['{"systemMessage":"first"}', '{"systemMessage":"second"}']);
+    expect(JSON.parse(output!)).toEqual({ systemMessage: 'first\nsecond' });
+  });
+
+  it.each([false, true])('retains independent context and followup fields (notice first: %s)', (noticeFirst) => {
+    const notice = JSON.stringify({ systemMessage: 'SUMMARY' });
+    const context = JSON.stringify({ hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CONTEXT' } });
+    const followup = JSON.stringify({ followup_message: 'FOLLOWUP' });
+    const output = mergeHookOutputs(noticeFirst ? [notice, context, followup] : [context, followup, notice]);
+    expect(JSON.parse(output!)).toEqual({
+      systemMessage: 'SUMMARY',
+      hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CONTEXT' },
+      followup_message: 'FOLLOWUP',
+    });
+  });
+
+  it('merges notices already accompanied by compatible context', () => {
+    const output = mergeHookOutputs([
+      JSON.stringify({ systemMessage: 'first', hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'a' } }),
+      JSON.stringify({ systemMessage: 'second', hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'b' } }),
+    ]);
+    expect(JSON.parse(output!)).toEqual({ systemMessage: 'first\nsecond', hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'a\nb' } });
+  });
+
+  it.each([
+    { continue: false, stopReason: 'stop' },
+    { decision: 'block', reason: 'continue' },
+    { unknown: 'value' },
+    { systemMessage: 12 },
+    { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'context', decision: 'block' } },
+  ])('retains the historical fallback for incompatible fields: %j', (other) => {
+    const notice = '{"systemMessage":"SUMMARY"}';
+    const incompatible = JSON.stringify(other);
+    expect(mergeHookOutputs([notice, incompatible])).toBe(notice);
+    expect(mergeHookOutputs([incompatible, notice])).toBe(incompatible);
+  });
+
+  it('does not merge conflicting hook events', () => {
+    const first = JSON.stringify({ systemMessage: 'SUMMARY', hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'a' } });
+    const second = JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'b' } });
+    expect(mergeHookOutputs([first, second])).toBe(first);
+  });
+});
 
 describe('hook-dispatch', () => {
   describe('routing', () => {
@@ -39,8 +155,8 @@ describe('hook-dispatch', () => {
 
       await dispatcher.dispatch('stop', '*', {}, 'claude');
 
-      expect(a.execute).toHaveBeenCalledWith({}, 'claude', localConfig);
-      expect(b.execute).toHaveBeenCalledWith({}, 'claude', localConfig);
+      expect(a.execute).toHaveBeenCalledWith({}, 'claude', localConfig, expect.any(Function));
+      expect(b.execute).toHaveBeenCalledWith({}, 'claude', localConfig, expect.any(Function));
     });
 
     it('dispatches to all handlers registered for the given event+matcher', async () => {
@@ -297,8 +413,8 @@ describe('hook-dispatch', () => {
       const stdin = { session_id: 'abc', cwd: '/project' };
       await dispatcher.dispatch('stop', '*', stdin, 'claude');
 
-      expect(handler1.execute).toHaveBeenCalledWith(stdin, 'claude', null);
-      expect(handler2.execute).toHaveBeenCalledWith(stdin, 'claude', null);
+      expect(handler1.execute).toHaveBeenCalledWith(stdin, 'claude', null, expect.any(Function));
+      expect(handler2.execute).toHaveBeenCalledWith(stdin, 'claude', null, expect.any(Function));
     });
   });
 

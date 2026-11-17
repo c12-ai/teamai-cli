@@ -48,6 +48,12 @@ teamai recall --check "API timeout"
 
 ### Recall adoption and upvotes
 
+When a session has newly credited documents awaiting a notice, the main Stop lists their IDs using the same text on Claude and Codex. The Codex family receives the notice as `systemMessage` for the UI/event stream, not `additionalContext` or a hint saved for the next prompt. Client display depends on its hook support.
+
+Newly credited IDs wait in the local per-session `pendingSummaryDocIds` list, including credits recorded by SubagentStop. The main Stop emits the pending list, then removes only that snapshot after stdout succeeds. Failed, discarded or unsupported output retains it for a later Stop; it is never replayed on the next prompt. The list is not uploaded with team votes and expires with the existing session ledger.
+
+Concurrent main Stop calls, or a crash or failed acknowledgement after stdout, can repeat a notice without increasing its adoption count. Stdout success does not prove the client displayed it.
+
 With `TEAMAI_UPVOTE_JUDGE=1`, the optional judge can also credit guidance used through a summary. Claude-family tools use their transcript; Codex, Muse and ZCode use the Stop payload's final reply and this session's settled recall log. Only eligible recalled docs can receive a vote, once per session.
 
 Opening a document that recall returned counts as one upvote for this session. You can also record it by hand:

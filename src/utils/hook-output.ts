@@ -1,3 +1,5 @@
+import { isCodexTool, stopStdoutUnsupported } from './tool-names.js';
+
 /**
  * Asks the model to relay a message the host will not show by itself.
  *
@@ -64,4 +66,10 @@ export function formatStopHookOutput(message: string, tool: string): string {
       additionalContext: message,
     },
   });
+}
+
+/** Return an adopted-knowledge notice without changing other Stop hints' delivery policy. */
+export function formatAdoptedSummaryOutput(message: string, tool: string): string | null {
+  if (isCodexTool(tool.toLowerCase())) return JSON.stringify({ systemMessage: message });
+  return stopStdoutUnsupported(tool) ? null : formatStopHookOutput(message, tool);
 }
